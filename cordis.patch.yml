@@ -33,6 +33,10 @@
         recallMaxChars: 600
         recallIncludeCurrentSession: false
         recallTimeoutMs: 3000
+        timezone: ''
+        timezoneCustom: ''
+        injectCurrentTime: true
+        relativeTime: true
         imageMode: caption
         captionPrompt: ''
         captionMaxTokens: 96

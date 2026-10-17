@@ -273,6 +273,172 @@ function asBool(value, fallback = false) {
   if (value === 'false' || value === 0 || value === '0') return false
   return fallback
 }
+
+// ---------------------------------------------------------------------------
+// 时区与时间格式化
+// ---------------------------------------------------------------------------
+
+/** 常见时区（设置页下拉用；值均为 IANA 名称）。 */
+const TIMEZONES = [
+  '',
+  'Asia/Shanghai',
+  'Asia/Hong_Kong',
+  'Asia/Taipei',
+  'Asia/Tokyo',
+  'Asia/Seoul',
+  'Asia/Singapore',
+  'Asia/Bangkok',
+  'Asia/Kolkata',
+  'Asia/Dubai',
+  'UTC',
+  'Europe/London',
+  'Europe/Paris',
+  'Europe/Berlin',
+  'Europe/Moscow',
+  'America/New_York',
+  'America/Chicago',
+  'America/Denver',
+  'America/Los_Angeles',
+  'America/Sao_Paulo',
+  'Australia/Perth',
+  'Australia/Sydney',
+  'Pacific/Auckland',
+]
+
+/** 校验 IANA 时区是否合法；非法返回 false。 */
+function isValidTimeZone(timeZone) {
+  if (!timeZone || typeof timeZone !== 'string') return false
+  try {
+    new Intl.DateTimeFormat('en-US', { timeZone }).format(new Date())
+    return true
+  } catch {
+    return false
+  }
+}
+
+/**
+ * 解析配置里的时区：'' 表示跟随服务器本地；'custom' 读取自定义输入；
+ * 非法值回退到服务器本地（返回 undefined）。
+ * @returns {string|undefined} 合法 IANA 时区，或 undefined（服务器本地）
+ */
+function resolveTimeZone(raw, custom) {
+  const value = String(raw ?? '').trim()
+  if (value === 'custom') {
+    const customValue = String(custom ?? '').trim()
+    return isValidTimeZone(customValue) ? customValue : undefined
+  }
+  if (value === '') return undefined
+  return isValidTimeZone(value) ? value : undefined
+}
+
+/** 取某个时间点在指定时区下的日期/时间分量。 */
+function timeZoneParts(ts, timeZone) {
+  if (!timeZone) {
+    const date = new Date(ts)
+    return {
+      year: date.getFullYear(),
+      month: date.getMonth() + 1,
+      day: date.getDate(),
+      hour: date.getHours(),
+      minute: date.getMinutes(),
+      second: date.getSeconds(),
+    }
+  }
+  const formatter = new Intl.DateTimeFormat('en-US', {
+    timeZone,
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+    hour: '2-digit',
+    minute: '2-digit',
+    second: '2-digit',
+    hour12: false,
+  })
+  const parts = {}
+  for (const part of formatter.formatToParts(new Date(ts))) {
+    if (part.type !== 'literal') parts[part.type] = part.value
+  }
+  return {
+    year: Number(parts.year),
+    month: Number(parts.month),
+    day: Number(parts.day),
+    hour: Number(parts.hour) % 24,
+    minute: Number(parts.minute),
+    second: Number(parts.second),
+  }
+}
+
+/** 指定时区相对 UTC 的偏移（毫秒）。 */
+function timeZoneOffsetMs(ts, timeZone) {
+  if (!timeZone) return -new Date(ts).getTimezoneOffset() * 60000
+  const parts = timeZoneParts(ts, timeZone)
+  const asUtc = Date.UTC(parts.year, parts.month - 1, parts.day, parts.hour, parts.minute, parts.second)
+  return asUtc - ts
+}
+
+/** 指定时区下“某一天 00:00”的 epoch 毫秒（处理 DST 用两次迭代）。 */
+function startOfDayMs(ts, timeZone) {
+  const parts = timeZoneParts(ts, timeZone)
+  const guess = Date.UTC(parts.year, parts.month - 1, parts.day)
+  let offset = timeZoneOffsetMs(guess, timeZone)
+  offset = timeZoneOffsetMs(guess - offset, timeZone)
+  return guess - offset
+}
+
+/**
+ * 按指定时区格式化时间：`YYYY-MM-DD HH:mm`。
+ * @param {number} ts epoch 毫秒
+ * @param {string|undefined} timeZone IANA 时区；空表示服务器本地
+ */
+function formatTimeInZone(ts, timeZone) {
+  const value = typeof ts === 'number' && Number.isFinite(ts) ? ts : Date.now()
+  const parts = timeZoneParts(value, timeZone)
+  const pad = (n) => String(n).padStart(2, '0')
+  return `${parts.year}-${pad(parts.month)}-${pad(parts.day)} ${pad(parts.hour)}:${pad(parts.minute)}`
+}
+
+/**
+ * 相对时间描述（中文）：刚刚 / N 分钟前 / N 小时前 / N 天前。
+ * @param {number} ts epoch 毫秒
+ * @param {number} [now] 当前时间
+ */
+function relativeTime(ts, now = Date.now()) {
+  const value = typeof ts === 'number' && Number.isFinite(ts) ? ts : now
+  const diff = Math.max(0, now - value)
+  const minute = 60000
+  const hour = 60 * minute
+  const day = 24 * hour
+  if (diff < minute) return '刚刚'
+  if (diff < hour) return `${Math.floor(diff / minute)} 分钟前`
+  if (diff < day) return `${Math.floor(diff / hour)} 小时前`
+  if (diff < 30 * day) return `${Math.floor(diff / day)} 天前`
+  return `${Math.floor(diff / (30 * day))} 个月前`
+}
+
+/** 计算“今天 / 近 7 天 / 近 30 天”的时间范围（按指定时区取自然日）。 */
+function rangeBounds(range, timeZone, now = Date.now()) {
+  const day = 86400000
+  if (range === 'today') {
+    const from = startOfDayMs(now, timeZone)
+    return { from, to: from + day - 1 }
+  }
+  if (range === '7d' || range === '30d') {
+    const days = range === '7d' ? 7 : 30
+    const startToday = startOfDayMs(now, timeZone)
+    const from = startToday - (days - 1) * day
+    return { from, to: startToday + day - 1 }
+  }
+  return { from: null, to: null }
+}
+
+/** 生成数据/管理界面上统一使用的时间元信息。 */
+function timeInfo(ts, timeZone, showRelative = true, now = Date.now()) {
+  const value = typeof ts === 'number' && Number.isFinite(ts) ? ts : now
+  return {
+    time: formatTimeInZone(value, timeZone),
+    relative: showRelative ? relativeTime(value, now) : '',
+  }
+}
 // ===== src/lib/config.js =====
 /**
  * dsh-memory 插件配置（v0.2）。
@@ -442,6 +608,28 @@ const Config = z.object({
     .max(20000)
     .volatile()
     .description('自动召回的超时时间（毫秒）；超时则本轮跳过召回'),
+
+  // -------------------- 时间与时区 --------------------
+  timezone: z
+    .string()
+    .default('')
+    .volatile()
+    .description('时间显示时区：留空=跟随服务器本地；可选常见 IANA 时区，或 custom 自定义'),
+  timezoneCustom: z
+    .string()
+    .default('')
+    .volatile()
+    .description('自定义 IANA 时区（当 timezone=custom 时生效），如 America/New_York'),
+  injectCurrentTime: z
+    .boolean()
+    .default(true)
+    .volatile()
+    .description('自动召回时在上下文里附带“当前时间”（按所选时区），便于模型判断记忆的新旧'),
+  relativeTime: z
+    .boolean()
+    .default(true)
+    .volatile()
+    .description('召回/列表中显示相对时间（如“3 天前”）'),
 
   // -------------------- 图片 --------------------
   imageMode: z
@@ -1212,6 +1400,29 @@ class MemoryService {
     }
   }
 
+  /** 时间与时区配置。 */
+  timeOptions() {
+    const cfg = this.cfg()
+    const timeZone = resolveTimeZone(cfg.timezone, cfg.timezoneCustom)
+    return {
+      timeZone,
+      timeZoneLabel: timeZone ?? '服务器本地',
+      injectCurrentTime: cfg.injectCurrentTime !== false,
+      relativeTime: cfg.relativeTime !== false,
+    }
+  }
+
+  /** 按配置时区格式化时间戳。 */
+  formatTs(ts) {
+    return timeInfo(ts, this.timeOptions().timeZone, false).time
+  }
+
+  /** 时间戳 → { time, relative }。 */
+  tsInfo(ts) {
+    const options = this.timeOptions()
+    return timeInfo(ts, options.timeZone, options.relativeTime)
+  }
+
   /** 当前 agent 的会话上下文（用于作用域过滤）。 */
   sessionContext(agentId) {
     const id = String(agentId ?? '')
@@ -1442,16 +1653,19 @@ class MemoryService {
       },
       { signal: options.signal },
     )
+    const timeOptions = this.timeOptions()
     const hits = points.map((point) => {
       const payload = point?.payload ?? {}
       const ts = Number(payload.ts) || 0
+      const info = timeInfo(ts, timeOptions.timeZone, timeOptions.relativeTime)
       return {
         id: String(point?.id ?? ''),
         score: Number(point?.score) || 0,
         text: String(payload.text ?? ''),
         kind: String(payload.kind ?? ''),
         ts,
-        time: formatTime(ts),
+        time: info.time,
+        relative: info.relative,
         sessionId: payload.sessionId ? String(payload.sessionId) : '',
         cwd: payload.cwd ? String(payload.cwd) : '',
         tags: Array.isArray(payload.tags) ? payload.tags.map(String) : [],
@@ -1475,13 +1689,18 @@ class MemoryService {
     })
     const filtered = hits.filter((hit) => hit.text.length > 0)
     if (filtered.length === 0) return { hits: [], block: '' }
+    const timeOptions = this.timeOptions()
     const lines = []
     for (const [index, hit] of filtered.entries()) {
       const kindLabel =
         hit.kind === 'image' ? '图片' : hit.kind === 'fact' ? '事实' : hit.kind === 'turn' ? '对话' : '记忆'
-      lines.push(`${index + 1}. [${hit.time}·${kindLabel}] ${truncate(hit.text, 220)}`)
+      const relative = hit.relative ? `·${hit.relative}` : ''
+      lines.push(`${index + 1}. [${hit.time}${relative}·${kindLabel}] ${truncate(hit.text, 220)}`)
     }
-    let block = `${RECALL_HEADER}\n以下是从过去会话中检索到的相关记忆，仅供参考；若与当前对话冲突，以当前对话为准：\n${lines.join('\n')}`
+    const timeLine = timeOptions.injectCurrentTime
+      ? `当前时间：${this.formatTs(Date.now())}（时区：${timeOptions.timeZoneLabel}；记忆时间均按此时区显示）\n`
+      : ''
+    let block = `${RECALL_HEADER}\n${timeLine}以下是从过去会话中检索到的相关记忆，仅供参考；若与当前对话冲突，以当前对话为准：\n${lines.join('\n')}`
     block = truncate(block, options.recallMaxChars)
     this.stats.lastRecallAt = Date.now()
     this.stats.lastRecallCount = filtered.length
@@ -1496,12 +1715,14 @@ class MemoryService {
   #pointToItem(point, score) {
     const payload = point?.payload ?? {}
     const ts = Number(payload.ts) || 0
+    const info = this.tsInfo(ts)
     return {
       id: String(point?.id ?? ''),
       text: String(payload.text ?? ''),
       kind: String(payload.kind ?? ''),
       ts,
-      time: formatTime(ts),
+      time: info.time,
+      relative: info.relative,
       sessionId: payload.sessionId ? String(payload.sessionId) : '',
       cwd: payload.cwd ? String(payload.cwd) : '',
       tags: Array.isArray(payload.tags) ? payload.tags.map(String) : [],
@@ -1511,7 +1732,7 @@ class MemoryService {
   }
 
   /** 记忆列表：带 query 走向量检索，否则按时间倒序滚动。 */
-  async listMemories({ query = '', limit = 20, offset = null, kind = '' } = {}) {
+  async listMemories({ query = '', limit = 20, offset = null, kind = '', range = '' } = {}) {
     const cleanQuery = cleanText(query)
     const pageSize = clampInt(limit, 20, 1, 100)
     if (cleanQuery) {
@@ -1521,7 +1742,13 @@ class MemoryService {
     await this.ensureReady()
     const qdrant = await this.qdrant()
     const storage = this.storage()
-    const filter = kind ? { must: [{ key: 'kind', match: { value: kind } }] } : undefined
+    const must = []
+    if (kind) must.push({ key: 'kind', match: { value: kind } })
+    if (range === 'today' || range === '7d' || range === '30d') {
+      const bounds = rangeBounds(range, this.timeOptions().timeZone)
+      if (bounds.from !== null) must.push({ key: 'ts', range: { gte: bounds.from, lte: bounds.to } })
+    }
+    const filter = must.length > 0 ? { must } : undefined
     const { points, nextOffset } = await qdrant.scroll(storage.collection, {
       limit: pageSize,
       offset: offset ?? undefined,
@@ -1733,9 +1960,19 @@ class MemoryService {
       ok: true,
       app: {
         name: 'dsh-memory',
-        version: '0.2.0',
+        version: '0.3.0',
         startedAt: this.stats.startedAt,
       },
+      time: (() => {
+        const options = this.timeOptions()
+        return {
+          timezone: options.timeZone ?? '',
+          timezoneLabel: options.timeZoneLabel,
+          injectCurrentTime: options.injectCurrentTime,
+          relativeTime: options.relativeTime,
+          now: this.formatTs(Date.now()),
+        }
+      })(),
       provider: {
         id: provider.id,
         name: provider.name,
@@ -1771,27 +2008,27 @@ class MemoryService {
         done: this.queue.done,
         failed: this.queue.failed,
         lastError: this.queue.lastError,
-        lastErrorTime: this.queue.lastErrorAt ? formatTime(this.queue.lastErrorAt) : '',
+        lastErrorTime: this.queue.lastErrorAt ? this.formatTs(this.queue.lastErrorAt) : '',
       },
       stats: {
         writes: this.stats.writes,
-        lastWriteTime: this.stats.lastWriteAt ? formatTime(this.stats.lastWriteAt) : '',
+        lastWriteTime: this.stats.lastWriteAt ? this.formatTs(this.stats.lastWriteAt) : '',
         lastWriteKind: this.stats.lastWriteKind,
-        lastRecallTime: this.stats.lastRecallAt ? formatTime(this.stats.lastRecallAt) : '',
+        lastRecallTime: this.stats.lastRecallAt ? this.formatTs(this.stats.lastRecallAt) : '',
         lastRecallCount: this.stats.lastRecallCount,
         recallChecks: this.stats.recallChecks,
         lastRecallQuery: this.stats.lastRecallQuery,
         lastRecallError: this.stats.lastRecallError,
-        lastRecallInjectTime: this.stats.lastRecallInjectAt ? formatTime(this.stats.lastRecallInjectAt) : '',
+        lastRecallInjectTime: this.stats.lastRecallInjectAt ? this.formatTs(this.stats.lastRecallInjectAt) : '',
         captions: this.stats.captions,
         startedAt: this.stats.startedAt,
-        lastMaintenanceTime: this.stats.lastMaintenanceAt ? formatTime(this.stats.lastMaintenanceAt) : '',
+        lastMaintenanceTime: this.stats.lastMaintenanceAt ? this.formatTs(this.stats.lastMaintenanceAt) : '',
         lastMaintenance: this.stats.lastMaintenance,
       },
       collectionState: {
         ok: this.collectionState.ok,
         error: this.collectionState.error,
-        checkedAt: this.collectionState.checkedAt ? formatTime(this.collectionState.checkedAt) : '',
+        checkedAt: this.collectionState.checkedAt ? this.formatTs(this.collectionState.checkedAt) : '',
       },
     }
     try {
@@ -2246,6 +2483,7 @@ function searchTool(service) {
                 text: { type: 'string' },
                 kind: { type: 'string' },
                 time: { type: 'string' },
+                relative: { type: 'string' },
                 score: { type: 'number' },
                 sessionId: { type: 'string' },
                 cwd: { type: 'string' },
@@ -2280,6 +2518,7 @@ function searchTool(service) {
           text: hit.text,
           kind: hit.kind,
           time: hit.time,
+          relative: hit.relative ?? '',
           score: Number(hit.score.toFixed(4)),
           sessionId: hit.sessionId,
           cwd: hit.cwd,
@@ -2507,6 +2746,7 @@ function registerHttpRoutes(ctx, service) {
             limit: Number(query.get('limit') ?? 20),
             offset: query.get('offset') ?? null,
             kind: query.get('kind') ?? '',
+            range: query.get('range') ?? '',
           })
           respond(res, 200, { ok: true, ...result })
           return
@@ -2668,6 +2908,7 @@ const PROMPT_SECTION = [
   '- 当用户透露值得长期记住的信息（偏好、身份、项目背景、重要决定、常用路径或命令、约定等）时，调用 memory_save 保存。每条记忆应当简洁、自包含（不要用“他/它/这个”等指代），一条一个事实；不要保存密码、密钥等敏感凭据。',
   '- 需要回忆过去的信息时，调用 memory_search 检索。不要凭空编造没有检索到的记忆。',
   '- 用户要求忘记某条记忆时，先用 memory_search 找到 id，再调用 memory_forget 删除。',
+  '- 记忆条目会带发生时间（按配置时区显示，可能附相对时间）；自动召回上下文里也可能给出“当前时间”。需要判断信息新旧或做时间推算时，使用这些时间，不要假设当前日期。',
 ].join('\n')
 
 /** 维护检查定时器间隔（毫秒）：每 5 分钟检查一次是否到维护时间。 */
@@ -2733,7 +2974,7 @@ function apply(ctx, config) {
 
   const provider = service.activeProvider()
   logger.info?.(
-    `[dsh-memory] 已加载 v0.2：provider=${provider.id}（${provider.embedModel}，${provider.dimensions} 维）→ Qdrant ${service.storage().qdrantUrl} / ${service.storage().collection}`,
+    `[dsh-memory] 已加载 v0.3：provider=${provider.id}（${provider.embedModel}，${provider.dimensions} 维）→ Qdrant ${service.storage().qdrantUrl} / ${service.storage().collection}`,
   )
 
   // 6) 启动自检：确保 collection 存在（失败只告警，不阻塞 DSH 启动）

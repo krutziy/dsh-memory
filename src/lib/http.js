@@ -100,6 +100,7 @@ export function registerHttpRoutes(ctx, service) {
             limit: Number(query.get('limit') ?? 20),
             offset: query.get('offset') ?? null,
             kind: query.get('kind') ?? '',
+            range: query.get('range') ?? '',
           })
           respond(res, 200, { ok: true, ...result })
           return

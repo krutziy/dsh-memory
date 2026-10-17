@@ -167,6 +167,28 @@ export const Config = z.object({
     .volatile()
     .description('自动召回的超时时间（毫秒）；超时则本轮跳过召回'),
 
+  // -------------------- 时间与时区 --------------------
+  timezone: z
+    .string()
+    .default('')
+    .volatile()
+    .description('时间显示时区：留空=跟随服务器本地；可选常见 IANA 时区，或 custom 自定义'),
+  timezoneCustom: z
+    .string()
+    .default('')
+    .volatile()
+    .description('自定义 IANA 时区（当 timezone=custom 时生效），如 America/New_York'),
+  injectCurrentTime: z
+    .boolean()
+    .default(true)
+    .volatile()
+    .description('自动召回时在上下文里附带“当前时间”（按所选时区），便于模型判断记忆的新旧'),
+  relativeTime: z
+    .boolean()
+    .default(true)
+    .volatile()
+    .description('召回/列表中显示相对时间（如“3 天前”）'),
+
   // -------------------- 图片 --------------------
   imageMode: z
     .union([z.const('caption'), z.const('placeholder'), z.const('off')])

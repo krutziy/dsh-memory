@@ -99,6 +99,34 @@ window.__ModuleLoader__.load({
       },
     ]
 
+    /** 设置页时区选项（IANA 名称）。 */
+    const TIMEZONE_OPTIONS = [
+      { value: '', label: '跟随服务器本地（自动）' },
+      { value: 'Asia/Shanghai', label: 'Asia/Shanghai（北京时间 UTC+8）' },
+      { value: 'Asia/Hong_Kong', label: 'Asia/Hong_Kong（香港 UTC+8）' },
+      { value: 'Asia/Taipei', label: 'Asia/Taipei（台北 UTC+8）' },
+      { value: 'Asia/Tokyo', label: 'Asia/Tokyo（东京 UTC+9）' },
+      { value: 'Asia/Seoul', label: 'Asia/Seoul（首尔 UTC+9）' },
+      { value: 'Asia/Singapore', label: 'Asia/Singapore（新加坡 UTC+8）' },
+      { value: 'Asia/Bangkok', label: 'Asia/Bangkok（曼谷 UTC+7）' },
+      { value: 'Asia/Kolkata', label: 'Asia/Kolkata（印度 UTC+5:30）' },
+      { value: 'Asia/Dubai', label: 'Asia/Dubai（迪拜 UTC+4）' },
+      { value: 'UTC', label: 'UTC（协调世界时）' },
+      { value: 'Europe/London', label: 'Europe/London（伦敦）' },
+      { value: 'Europe/Paris', label: 'Europe/Paris（巴黎）' },
+      { value: 'Europe/Berlin', label: 'Europe/Berlin（柏林）' },
+      { value: 'Europe/Moscow', label: 'Europe/Moscow（莫斯科）' },
+      { value: 'America/New_York', label: 'America/New_York（纽约）' },
+      { value: 'America/Chicago', label: 'America/Chicago（芝加哥）' },
+      { value: 'America/Denver', label: 'America/Denver（丹佛）' },
+      { value: 'America/Los_Angeles', label: 'America/Los_Angeles（洛杉矶）' },
+      { value: 'America/Sao_Paulo', label: 'America/Sao_Paulo（圣保罗）' },
+      { value: 'Australia/Perth', label: 'Australia/Perth（珀斯）' },
+      { value: 'Australia/Sydney', label: 'Australia/Sydney（悉尼）' },
+      { value: 'Pacific/Auckland', label: 'Pacific/Auckland（奥克兰）' },
+      { value: 'custom', label: '自定义 IANA 时区…' },
+    ]
+
     /** 标量配置字段（providers / activeProvider 由单独编辑器管理）。 */
     const SCALAR_FIELDS = [
       { key: 'qdrantUrl', type: 'text', tab: 'model' },
@@ -112,6 +140,10 @@ window.__ModuleLoader__.load({
       { key: 'recallMaxChars', type: 'number', tab: 'behavior' },
       { key: 'recallIncludeCurrentSession', type: 'switch', tab: 'behavior' },
       { key: 'recallTimeoutMs', type: 'number', tab: 'behavior' },
+      { key: 'timezone', type: 'select', tab: 'behavior', optionDefs: TIMEZONE_OPTIONS },
+      { key: 'timezoneCustom', type: 'text', tab: 'behavior' },
+      { key: 'injectCurrentTime', type: 'switch', tab: 'behavior' },
+      { key: 'relativeTime', type: 'switch', tab: 'behavior' },
       { key: 'imageMode', type: 'select', tab: 'behavior', options: ['caption', 'placeholder', 'off'] },
       { key: 'captionPrompt', type: 'textarea', tab: 'behavior' },
       { key: 'captionMaxTokens', type: 'number', tab: 'behavior' },
@@ -178,7 +210,7 @@ window.__ModuleLoader__.load({
         return field.float ? Math.round(number * 100) / 100 : Math.round(number)
       }
       if (field.type === 'select') {
-        if (text === '') throw new Error(t('required'))
+        // 部分 select 允许空值（例如时区留空=跟随服务器本地）
         return text
       }
       return text
@@ -268,6 +300,7 @@ window.__ModuleLoader__.load({
             nextOffset: null,
             query: '',
             kind: '',
+            range: '',
             error: null,
             loadingMore: false,
           },
@@ -720,6 +753,10 @@ window.__ModuleLoader__.load({
         this.patch({ memories: { ...this.state.memories, kind: String(kind ?? '') } })
       }
 
+      setMemoriesRange(range) {
+        this.patch({ memories: { ...this.state.memories, range: String(range ?? '') } })
+      }
+
       setMemoryAdd(field, value) {
         this.patch({ memoryAdd: { ...this.state.memoryAdd, [field]: value } })
       }
@@ -741,6 +778,7 @@ window.__ModuleLoader__.load({
           const params = new URLSearchParams()
           if (current.query) params.set('q', current.query)
           if (current.kind) params.set('kind', current.kind)
+          if (current.range) params.set('range', current.range)
           params.set('limit', '20')
           if (offset) params.set('offset', offset)
           const response = await fetch(`${API}/memories?${params.toString()}`, {
@@ -880,6 +918,7 @@ window.__ModuleLoader__.load({
           testProvider: (id) => this.testProvider(id),
           setMemoriesQuery: (query) => this.setMemoriesQuery(query),
           setMemoriesKind: (kind) => this.setMemoriesKind(kind),
+          setMemoriesRange: (range) => this.setMemoriesRange(range),
           setMemoryAdd: (field, value) => this.setMemoryAdd(field, value),
           loadMoreMemories: () => this.loadMemories({ reset: false }),
           refreshMemories: () => this.loadMemories({ reset: true }),
@@ -1107,10 +1146,12 @@ window.__ModuleLoader__.load({
         })
       }
       if (field.type === 'select') {
-        const options = field.options.map((option) => ({
-          value: option,
-          label: t('option.' + key + '.' + option),
-        }))
+        const options =
+          field.optionDefs ??
+          field.options.map((option) => ({
+            value: option,
+            label: t('option.' + key + '.' + option),
+          }))
         return h(
           Field,
           { label, hint },
@@ -1319,6 +1360,16 @@ window.__ModuleLoader__.load({
             { className: 'dsm-statusRow', key: 'scope' },
             h('span', { className: 'dsm-statusLabel' }, t('statusScope')),
             h('span', { className: 'dsm-statusValue' }, t('option.memoryScope.' + (behavior.memoryScope ?? 'global'))),
+          ),
+          h(
+            'div',
+            { className: 'dsm-statusRow', key: 'timezone' },
+            h('span', { className: 'dsm-statusLabel' }, t('statusTimezone')),
+            h(
+              'span',
+              { className: 'dsm-statusValue' },
+              `${data.time?.timezoneLabel ?? '服务器本地'}${data.time?.now ? ' · ' + data.time.now : ''}`,
+            ),
           ),
           h(
             'div',
@@ -1616,6 +1667,29 @@ window.__ModuleLoader__.load({
             toolKeys.map((key) => h(ScalarField, { key, field: SCALAR_BY_KEY.get(key), state, actions, t, disabled })),
           ),
         ),
+        h(
+          'section',
+          { className: 'dsm-card' },
+          h('h3', { className: 'dsm-cardTitle' }, t('sectionTime')),
+          h(
+            'p',
+            { className: 'dsm-hint' },
+            t('sectionTimeHint', {
+              tz: state.status?.data?.time?.timezoneLabel ?? '服务器本地',
+              now: state.status?.data?.time?.now ?? '',
+            }),
+          ),
+          h(
+            'div',
+            { className: 'dsm-grid2' },
+            h(ScalarField, { field: SCALAR_BY_KEY.get('timezone'), state, actions, t, disabled }),
+            state.drafts.timezone === 'custom'
+              ? h(ScalarField, { field: SCALAR_BY_KEY.get('timezoneCustom'), state, actions, t, disabled })
+              : null,
+            h(ScalarField, { field: SCALAR_BY_KEY.get('injectCurrentTime'), state, actions, t, disabled }),
+            h(ScalarField, { field: SCALAR_BY_KEY.get('relativeTime'), state, actions, t, disabled }),
+          ),
+        ),
       )
     }
 
@@ -1645,6 +1719,7 @@ window.__ModuleLoader__.load({
               { className: 'dsm-memMeta' },
               h(Badge, null, t('kind.' + (item.kind || 'note'))),
               h('span', null, item.time),
+              item.relative ? h('span', null, `(${item.relative})`) : null,
               item.score !== undefined ? h('span', null, t('memoryScore', { score: item.score.toFixed(3) })) : null,
               item.cwd ? h('span', { title: item.cwd }, item.cwd) : null,
             ),
@@ -1697,6 +1772,18 @@ window.__ModuleLoader__.load({
               options: kindOptions,
               disabled,
               onChange: actions.setMemoriesKind,
+            }),
+            h(SelectField, {
+              id: 'dsm-memory-range',
+              value: memories.range ?? '',
+              options: [
+                { value: '', label: t('rangeAll') },
+                { value: 'today', label: t('rangeToday') },
+                { value: '7d', label: t('range7d') },
+                { value: '30d', label: t('range30d') },
+              ],
+              disabled,
+              onChange: actions.setMemoriesRange,
             }),
             h('button', { type: 'button', className: 'dsm-btn', disabled: disabled || memories.phase === 'loading', onClick: actions.searchMemories }, t('memorySearch')),
             h('button', { type: 'button', className: 'dsm-btn dsm-btnGhost', disabled, onClick: actions.refreshMemories }, t('refresh')),
@@ -1897,6 +1984,7 @@ window.__ModuleLoader__.load({
         testProvider: props.testProvider,
         setMemoriesQuery: props.setMemoriesQuery,
         setMemoriesKind: props.setMemoriesKind,
+        setMemoriesRange: props.setMemoriesRange,
         setMemoryAdd: props.setMemoryAdd,
         loadMoreMemories: props.loadMoreMemories,
         refreshMemories: props.refreshMemories,
@@ -1982,6 +2070,7 @@ window.__ModuleLoader__.load({
       statusPoints: '{count} 条记忆',
       statusNotCreated: '尚未创建',
       statusScope: '记忆范围',
+      statusTimezone: '时区',
       statusTools: '模型工具',
       statusToolsOn: '已启用',
       statusToolsOff: '已禁用',
@@ -2057,6 +2146,12 @@ window.__ModuleLoader__.load({
       sectionImageHint: '图片只生成一句话概览入库，永不保存原图（概览模式下图片会发送给当前 provider）。',
       sectionTools: '模型工具',
       sectionToolsHint: '控制是否允许模型调用 memory_search / memory_save / memory_forget。',
+      sectionTime: '时间与时区',
+      sectionTimeHint: '当前：{tz} {now}。记忆的显示时间、相对时间、召回上下文中的“当前时间”都按此时区；留空跟随服务器本地，也可选择常见时区或填自定义 IANA 名称。',
+      rangeAll: '全部时间',
+      rangeToday: '今天',
+      range7d: '近 7 天',
+      range30d: '近 30 天',
       sectionMemories: '记忆列表',
       memoryTotal: '共 {total} 条',
       memorySearchPlaceholder: '语义搜索记忆，例如：用户喜欢什么咖啡',
@@ -2125,6 +2220,14 @@ window.__ModuleLoader__.load({
       'field.recallIncludeCurrentSessionHint': '默认只召回其他会话，避免重复注入当前对话',
       'field.recallTimeoutMs': '召回超时（毫秒）',
       'field.recallTimeoutMsHint': '超时则本轮跳过召回，避免拖慢回复',
+      'field.timezone': '时区',
+      'field.timezoneHint': '记忆显示与“当前时间”使用的时区；留空跟随服务器本地',
+      'field.timezoneCustom': '自定义 IANA 时区',
+      'field.timezoneCustomHint': '仅当上面选择“自定义”时生效，如 America/New_York',
+      'field.injectCurrentTime': '召回时附带当前时间',
+      'field.injectCurrentTimeHint': '在自动召回上下文里写明当前时间（按所选时区），便于模型判断记忆新旧',
+      'field.relativeTime': '显示相对时间',
+      'field.relativeTimeHint': '在召回内容与记忆列表中显示“3 小时前 / 2 天前”等相对时间',
       'field.imageMode': '图片记忆方式',
       'field.imageModeHint': '图片只生成一句话概览入库，永不保存原图',
       'field.captionPrompt': '图片概览提示词',
@@ -2201,6 +2304,7 @@ window.__ModuleLoader__.load({
       statusPoints: '{count} memories',
       statusNotCreated: 'not created yet',
       statusScope: 'Memory scope',
+      statusTimezone: 'Timezone',
       statusTools: 'Model tools',
       statusToolsOn: 'enabled',
       statusToolsOff: 'disabled',
@@ -2276,6 +2380,12 @@ window.__ModuleLoader__.load({
       sectionImageHint: 'Images become one-sentence summaries; the original image is never stored (in caption mode the image is sent to the active provider).',
       sectionTools: 'Model tools',
       sectionToolsHint: 'Controls whether the model may call memory_search / memory_save / memory_forget.',
+      sectionTime: 'Time & timezone',
+      sectionTimeHint: 'Current: {tz} {now}. Memory display times, relative labels and the recall context "current time" all use this timezone. Leave blank to follow the server; pick a common zone or enter a custom IANA name.',
+      rangeAll: 'All time',
+      rangeToday: 'Today',
+      range7d: 'Last 7 days',
+      range30d: 'Last 30 days',
       sectionMemories: 'Memories',
       memoryTotal: '{total} total',
       memorySearchPlaceholder: 'Semantic search, e.g. what coffee does the user like',
@@ -2344,6 +2454,14 @@ window.__ModuleLoader__.load({
       'field.recallIncludeCurrentSessionHint': 'By default only other sessions are recalled',
       'field.recallTimeoutMs': 'Recall timeout (ms)',
       'field.recallTimeoutMsHint': 'Skip recall for this turn when timed out',
+      'field.timezone': 'Timezone',
+      'field.timezoneHint': 'Timezone used for memory times and "current time"; blank follows the server',
+      'field.timezoneCustom': 'Custom IANA timezone',
+      'field.timezoneCustomHint': 'Used when "custom" is selected above, e.g. America/New_York',
+      'field.injectCurrentTime': 'Include current time in recall',
+      'field.injectCurrentTimeHint': 'Add the current time (in the selected timezone) to the recall context so the model can judge recency',
+      'field.relativeTime': 'Show relative times',
+      'field.relativeTimeHint': 'Show "3 hours ago / 2 days ago" in recall content and the memory list',
       'field.imageMode': 'Image memory mode',
       'field.imageModeHint': 'Images become one-sentence summaries; originals are never stored',
       'field.captionPrompt': 'Image summary prompt',

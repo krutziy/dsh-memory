@@ -21,12 +21,14 @@ import {
   clampNumber,
   cleanText,
   errorText,
-  formatTime,
   memoryPointId,
   normalizeUrl,
   providerIdToEnv,
+  rangeBounds,
   readConfig,
   redactSecrets,
+  resolveTimeZone,
+  timeInfo,
   toDataUri,
   truncate,
 } from './util.js'
@@ -308,6 +310,29 @@ export class MemoryService {
     }
   }
 
+  /** 时间与时区配置。 */
+  timeOptions() {
+    const cfg = this.cfg()
+    const timeZone = resolveTimeZone(cfg.timezone, cfg.timezoneCustom)
+    return {
+      timeZone,
+      timeZoneLabel: timeZone ?? '服务器本地',
+      injectCurrentTime: cfg.injectCurrentTime !== false,
+      relativeTime: cfg.relativeTime !== false,
+    }
+  }
+
+  /** 按配置时区格式化时间戳。 */
+  formatTs(ts) {
+    return timeInfo(ts, this.timeOptions().timeZone, false).time
+  }
+
+  /** 时间戳 → { time, relative }。 */
+  tsInfo(ts) {
+    const options = this.timeOptions()
+    return timeInfo(ts, options.timeZone, options.relativeTime)
+  }
+
   /** 当前 agent 的会话上下文（用于作用域过滤）。 */
   sessionContext(agentId) {
     const id = String(agentId ?? '')
@@ -538,16 +563,19 @@ export class MemoryService {
       },
       { signal: options.signal },
     )
+    const timeOptions = this.timeOptions()
     const hits = points.map((point) => {
       const payload = point?.payload ?? {}
       const ts = Number(payload.ts) || 0
+      const info = timeInfo(ts, timeOptions.timeZone, timeOptions.relativeTime)
       return {
         id: String(point?.id ?? ''),
         score: Number(point?.score) || 0,
         text: String(payload.text ?? ''),
         kind: String(payload.kind ?? ''),
         ts,
-        time: formatTime(ts),
+        time: info.time,
+        relative: info.relative,
         sessionId: payload.sessionId ? String(payload.sessionId) : '',
         cwd: payload.cwd ? String(payload.cwd) : '',
         tags: Array.isArray(payload.tags) ? payload.tags.map(String) : [],
@@ -571,13 +599,18 @@ export class MemoryService {
     })
     const filtered = hits.filter((hit) => hit.text.length > 0)
     if (filtered.length === 0) return { hits: [], block: '' }
+    const timeOptions = this.timeOptions()
     const lines = []
     for (const [index, hit] of filtered.entries()) {
       const kindLabel =
         hit.kind === 'image' ? '图片' : hit.kind === 'fact' ? '事实' : hit.kind === 'turn' ? '对话' : '记忆'
-      lines.push(`${index + 1}. [${hit.time}·${kindLabel}] ${truncate(hit.text, 220)}`)
+      const relative = hit.relative ? `·${hit.relative}` : ''
+      lines.push(`${index + 1}. [${hit.time}${relative}·${kindLabel}] ${truncate(hit.text, 220)}`)
     }
-    let block = `${RECALL_HEADER}\n以下是从过去会话中检索到的相关记忆，仅供参考；若与当前对话冲突，以当前对话为准：\n${lines.join('\n')}`
+    const timeLine = timeOptions.injectCurrentTime
+      ? `当前时间：${this.formatTs(Date.now())}（时区：${timeOptions.timeZoneLabel}；记忆时间均按此时区显示）\n`
+      : ''
+    let block = `${RECALL_HEADER}\n${timeLine}以下是从过去会话中检索到的相关记忆，仅供参考；若与当前对话冲突，以当前对话为准：\n${lines.join('\n')}`
     block = truncate(block, options.recallMaxChars)
     this.stats.lastRecallAt = Date.now()
     this.stats.lastRecallCount = filtered.length
@@ -592,12 +625,14 @@ export class MemoryService {
   #pointToItem(point, score) {
     const payload = point?.payload ?? {}
     const ts = Number(payload.ts) || 0
+    const info = this.tsInfo(ts)
     return {
       id: String(point?.id ?? ''),
       text: String(payload.text ?? ''),
       kind: String(payload.kind ?? ''),
       ts,
-      time: formatTime(ts),
+      time: info.time,
+      relative: info.relative,
       sessionId: payload.sessionId ? String(payload.sessionId) : '',
       cwd: payload.cwd ? String(payload.cwd) : '',
       tags: Array.isArray(payload.tags) ? payload.tags.map(String) : [],
@@ -607,7 +642,7 @@ export class MemoryService {
   }
 
   /** 记忆列表：带 query 走向量检索，否则按时间倒序滚动。 */
-  async listMemories({ query = '', limit = 20, offset = null, kind = '' } = {}) {
+  async listMemories({ query = '', limit = 20, offset = null, kind = '', range = '' } = {}) {
     const cleanQuery = cleanText(query)
     const pageSize = clampInt(limit, 20, 1, 100)
     if (cleanQuery) {
@@ -617,7 +652,13 @@ export class MemoryService {
     await this.ensureReady()
     const qdrant = await this.qdrant()
     const storage = this.storage()
-    const filter = kind ? { must: [{ key: 'kind', match: { value: kind } }] } : undefined
+    const must = []
+    if (kind) must.push({ key: 'kind', match: { value: kind } })
+    if (range === 'today' || range === '7d' || range === '30d') {
+      const bounds = rangeBounds(range, this.timeOptions().timeZone)
+      if (bounds.from !== null) must.push({ key: 'ts', range: { gte: bounds.from, lte: bounds.to } })
+    }
+    const filter = must.length > 0 ? { must } : undefined
     const { points, nextOffset } = await qdrant.scroll(storage.collection, {
       limit: pageSize,
       offset: offset ?? undefined,
@@ -829,9 +870,19 @@ export class MemoryService {
       ok: true,
       app: {
         name: 'dsh-memory',
-        version: '0.2.0',
+        version: '0.3.0',
         startedAt: this.stats.startedAt,
       },
+      time: (() => {
+        const options = this.timeOptions()
+        return {
+          timezone: options.timeZone ?? '',
+          timezoneLabel: options.timeZoneLabel,
+          injectCurrentTime: options.injectCurrentTime,
+          relativeTime: options.relativeTime,
+          now: this.formatTs(Date.now()),
+        }
+      })(),
       provider: {
         id: provider.id,
         name: provider.name,
@@ -867,27 +918,27 @@ export class MemoryService {
         done: this.queue.done,
         failed: this.queue.failed,
         lastError: this.queue.lastError,
-        lastErrorTime: this.queue.lastErrorAt ? formatTime(this.queue.lastErrorAt) : '',
+        lastErrorTime: this.queue.lastErrorAt ? this.formatTs(this.queue.lastErrorAt) : '',
       },
       stats: {
         writes: this.stats.writes,
-        lastWriteTime: this.stats.lastWriteAt ? formatTime(this.stats.lastWriteAt) : '',
+        lastWriteTime: this.stats.lastWriteAt ? this.formatTs(this.stats.lastWriteAt) : '',
         lastWriteKind: this.stats.lastWriteKind,
-        lastRecallTime: this.stats.lastRecallAt ? formatTime(this.stats.lastRecallAt) : '',
+        lastRecallTime: this.stats.lastRecallAt ? this.formatTs(this.stats.lastRecallAt) : '',
         lastRecallCount: this.stats.lastRecallCount,
         recallChecks: this.stats.recallChecks,
         lastRecallQuery: this.stats.lastRecallQuery,
         lastRecallError: this.stats.lastRecallError,
-        lastRecallInjectTime: this.stats.lastRecallInjectAt ? formatTime(this.stats.lastRecallInjectAt) : '',
+        lastRecallInjectTime: this.stats.lastRecallInjectAt ? this.formatTs(this.stats.lastRecallInjectAt) : '',
         captions: this.stats.captions,
         startedAt: this.stats.startedAt,
-        lastMaintenanceTime: this.stats.lastMaintenanceAt ? formatTime(this.stats.lastMaintenanceAt) : '',
+        lastMaintenanceTime: this.stats.lastMaintenanceAt ? this.formatTs(this.stats.lastMaintenanceAt) : '',
         lastMaintenance: this.stats.lastMaintenance,
       },
       collectionState: {
         ok: this.collectionState.ok,
         error: this.collectionState.error,
-        checkedAt: this.collectionState.checkedAt ? formatTime(this.collectionState.checkedAt) : '',
+        checkedAt: this.collectionState.checkedAt ? this.formatTs(this.collectionState.checkedAt) : '',
       },
     }
     try {
