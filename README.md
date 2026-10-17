@@ -87,6 +87,8 @@ dsh plugin --profile web add /absolute/path/to/dsh-memory
 | 召回时附带当前时间 | 开 | 自动召回时在上下文里写明当前时间（含时区），便于模型判断记忆新旧 |
 | 显示相对时间 | 开 | 在召回内容与记忆列表中显示“3 小时前 / 2 天前” |
 
+![时间与时区](docs/screenshots/time-timezone.png)
+
 ### 记忆管理
 记忆列表（语义搜索/时间筛选/分页/删除）、手动添加、导出 JSON、定期维护与保留策略、重建集合。
 
