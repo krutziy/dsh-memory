@@ -1,0 +1,47 @@
+# dsh-memory: 长期记忆插件（v0.2，多 provider）。
+# 插入一行 Host 插件；client 半通过 package.json 的 dsh.client 声明，
+# 设置页会出现在 Settings → 长期记忆。
+- insert:
+    - id: memory
+      name: dsh-memory
+      config:
+        activeProvider: siliconflow
+        providers:
+          - id: siliconflow
+            name: 硅基流动 SiliconFlow
+            protocol: openai
+            baseUrl: https://api.siliconflow.cn/v1
+            embedModel: Qwen/Qwen3-VL-Embedding-8B
+            dimensions: 1024
+            apiKeyEnv: SILICONFLOW_API_KEY
+            sendDimensions: true
+            visionModel: Qwen/Qwen3-VL-8B-Instruct
+            visionBaseUrl: ''
+            visionApiKeyEnv: ''
+        qdrantUrl: http://127.0.0.1:6333
+        collection: dsh_memory
+        qdrantApiKeyEnv: ''
+        autoCapture: true
+        captureUserChars: 400
+        captureAssistantChars: 400
+        captureMinChars: 12
+        includeSubagents: false
+        autoRecall: true
+        memoryScope: global
+        recallTopK: 3
+        recallMinScore: 0.42
+        recallMaxChars: 600
+        recallIncludeCurrentSession: false
+        recallTimeoutMs: 3000
+        imageMode: caption
+        captionPrompt: ''
+        captionMaxTokens: 96
+        toolsEnabled: true
+        toolSearchLimit: 5
+        retentionDays: 0
+        maxMemories: 0
+        maintenanceIntervalHours: 6
+        maintenanceDedupe: true
+        dedupeThreshold: 0.96
+        dedupeMaxScan: 100
+        debug: false

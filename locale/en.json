@@ -1,0 +1,4 @@
+{
+  "title": "Long-term Memory",
+  "description": "Persistent memory for DSH with multiple OpenAI-compatible embedding providers (SiliconFlow/OpenAI/DashScope/Zhipu/Ark/Jina/Voyage/custom) and Qdrant: auto-capture, auto-recall, memory management and periodic maintenance."
+}
