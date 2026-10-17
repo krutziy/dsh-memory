@@ -870,7 +870,7 @@ export class MemoryService {
       ok: true,
       app: {
         name: 'dsh-memory',
-        version: '0.3.0',
+        version: '0.3.1',
         startedAt: this.stats.startedAt,
       },
       time: (() => {
