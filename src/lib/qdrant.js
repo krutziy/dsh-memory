@@ -178,6 +178,16 @@ export class QdrantClient {
     return { points, nextOffset: payload?.result?.next_page_offset ?? null }
   }
 
+  /** 给指定 id 覆盖/合并 payload 字段（用于迁移与增强记忆到期标记）。 */
+  async setPayload(collection, payload, ids, { signal } = {}) {
+    return this.request(
+      'POST',
+      `/collections/${encodeURIComponent(collection)}/points/payload?wait=true`,
+      { payload, points: ids },
+      { signal },
+    )
+  }
+
   /** 删除指定 id 的 points。 */
   async deletePoints(collection, ids, { signal } = {}) {
     return this.request(

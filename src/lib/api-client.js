@@ -140,6 +140,35 @@ export class OpenAICompatClient {
     }
   }
 
+  /**
+   * 通用对话补全（用于记忆整理/摘要）。
+   * @param {object} options
+   * @param {Array<{role:string,content:string}>} options.messages
+   * @param {string} [options.model] 覆盖默认模型（整理模型）
+   * @param {number} [options.maxTokens]
+   * @param {number} [options.temperature]
+   */
+  async chat({ messages, model, maxTokens = 1024, temperature = 0.3, signal, timeoutMs = 120000 }) {
+    const chatModel = String(model ?? this.visionModel ?? '').trim()
+    if (!chatModel) throw new Error(`${this.label} 未配置整理/对话模型`)
+    if (!this.baseUrl || !this.apiKey) throw new Error(`${this.label} 的接口配置不完整`)
+    const startedAt = Date.now()
+    const body = {
+      model: chatModel,
+      messages,
+      max_tokens: Math.max(16, Math.min(8192, Number(maxTokens) || 1024)),
+      temperature,
+      stream: false,
+    }
+    const payload = await this.#post(`${this.baseUrl}/chat/completions`, this.apiKey, body, { signal, timeoutMs })
+    return {
+      text: contentText(payload?.choices?.[0]?.message?.content).trim(),
+      usage: payload?.usage ?? null,
+      latencyMs: Date.now() - startedAt,
+      model: chatModel,
+    }
+  }
+
   /** 用视觉对话模型给图片生成一句话概览。 */
   async captionImage(dataUri, { signal, timeoutMs = 60000, prompt, maxTokens = 96 } = {}) {
     if (!this.captionConfigured) {

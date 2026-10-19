@@ -269,6 +269,157 @@ export const Config = z.object({
     .volatile()
     .description('每次维护最多检查多少条最近记忆以寻找重复'),
 
+  // -------------------- 睡眠整理 / 记忆巩固 --------------------
+  consolidationEnabled: z
+    .boolean()
+    .default(false)
+    .volatile()
+    .description('开启“睡眠整理”：按天压缩原始记忆，并按任务列表在 7/30 天后继续压缩（默认关闭）'),
+  sleepAt: z
+    .string()
+    .default('00:00')
+    .volatile()
+    .description('睡眠开始时间 HH:mm（按所选时区；默认 00:00）'),
+  sleepRetryMinutes: z
+    .number()
+    .default(15)
+    .step(1)
+    .min(1)
+    .max(240)
+    .volatile()
+    .description('用户忙碌时每隔多少分钟重试入睡'),
+  idleMinutes: z
+    .number()
+    .default(60)
+    .step(1)
+    .min(1)
+    .max(1440)
+    .volatile()
+    .description('最近多少分钟内没有人类消息、且没有运行中的会话，才算空闲可以睡'),
+  consolidationProviderId: z
+    .string()
+    .default('')
+    .volatile()
+    .description('整理模型使用的 provider id；留空表示使用当前激活 provider'),
+  consolidationModel: z
+    .string()
+    .default('Qwen/Qwen2.5-7B-Instruct')
+    .volatile()
+    .description('整理（摘要/提炼）使用的对话模型；留空或调用失败时回退纯规则整理'),
+  consolidationInputMaxChars: z
+    .number()
+    .default(12000)
+    .step(100)
+    .min(1000)
+    .max(200000)
+    .volatile()
+    .description('单个批次最多送入模型的字符数（超出会分块映射后再合并）'),
+  consolidationPrompt: z
+    .string()
+    .default('')
+    .volatile()
+    .description('整理提示词；留空使用内置提示词'),
+  level1Ratio: z
+    .number()
+    .default(0.2)
+    .step(0.01)
+    .min(0.01)
+    .max(1)
+    .volatile()
+    .description('第 1 级（按天）压缩后保留条数比例（默认 0.2，即 100 条→约 20 条）'),
+  level1MaxItems: z
+    .number()
+    .default(30)
+    .step(1)
+    .min(1)
+    .max(200)
+    .volatile()
+    .description('第 1 级压缩后的最大条数'),
+  level2AfterDays: z
+    .number()
+    .default(7)
+    .step(1)
+    .min(0)
+    .max(3650)
+    .volatile()
+    .description('第 1 级批次创建后多少天进行第 2 级压缩'),
+  level2Ratio: z
+    .number()
+    .default(0.25)
+    .step(0.01)
+    .min(0.01)
+    .max(1)
+    .volatile()
+    .description('第 2 级压缩后保留条数比例'),
+  level2MaxItems: z
+    .number()
+    .default(12)
+    .step(1)
+    .min(1)
+    .max(200)
+    .volatile()
+    .description('第 2 级压缩后的最大条数'),
+  level3AfterDays: z
+    .number()
+    .default(30)
+    .step(1)
+    .min(0)
+    .max(3650)
+    .volatile()
+    .description('第 2 级批次创建后多少天进行第 3 级压缩'),
+  level3Ratio: z
+    .number()
+    .default(0.4)
+    .step(0.01)
+    .min(0.01)
+    .max(1)
+    .volatile()
+    .description('第 3 级压缩后保留条数比例'),
+  level3MaxItems: z
+    .number()
+    .default(6)
+    .step(1)
+    .min(1)
+    .max(200)
+    .volatile()
+    .description('第 3 级压缩后的最大条数'),
+
+  // -------------------- 实验性功能 --------------------
+  experimentalEventMergeEnabled: z
+    .boolean()
+    .default(false)
+    .volatile()
+    .description('实验性：整理时用嵌入向量在库中检索相似/同事件记忆，只把相关簇交给模型合并（默认关闭）'),
+  experimentalEventMergeThreshold: z
+    .number()
+    .default(0.85)
+    .step(0.01)
+    .min(0.5)
+    .max(1)
+    .volatile()
+    .description('事件合并的相似度阈值'),
+  experimentalEventMergeMaxCandidates: z
+    .number()
+    .default(30)
+    .step(1)
+    .min(1)
+    .max(200)
+    .volatile()
+    .description('事件合并每次最多带入多少条相关记忆作为参考'),
+  experimentalEnhancementEnabled: z
+    .boolean()
+    .default(false)
+    .volatile()
+    .description('实验性：额外保留整理后的 1 级记忆若干天，不再继续整理，仅供事件召回/按需搜索使用'),
+  experimentalEnhancementDays: z
+    .number()
+    .default(7)
+    .step(1)
+    .min(1)
+    .max(365)
+    .volatile()
+    .description('增强记忆的保留天数（到期自动删除）'),
+
   // -------------------- 其他 --------------------
   debug: z.boolean().default(false).volatile().description('在 DSH 日志中输出插件调试信息'),
 })

@@ -10,16 +10,18 @@
  */
 import { Config } from './lib/config.js'
 import { CaptureController } from './lib/capture.js'
+import { ConsolidationEngine } from './lib/consolidation.js'
 import { registerHttpRoutes } from './lib/http.js'
 import { RecallController } from './lib/recall.js'
 import { MemoryService } from './lib/service.js'
+import { SleepController } from './lib/sleep.js'
 import { registerMemoryTools } from './lib/tools.js'
 import { errorText } from './lib/util.js'
 
 export const name = 'dsh-memory'
 
 /** 需要的 Host 服务；缺任意一个时插件保持未激活，而不是报错。 */
-export const inject = ['tools', 'systemPrompt', 'webServer', 'credentials', 'attachments', 'sessions']
+export const inject = ['tools', 'systemPrompt', 'webServer', 'credentials', 'attachments', 'sessions', 'timer', 'agents']
 
 export { Config }
 
@@ -45,6 +47,12 @@ export function apply(ctx, config) {
   const service = new MemoryService(ctx, config)
   const logger = service.logger
 
+  // 0) 睡眠整理引擎 + 控制器（v0.4）
+  const consolidation = new ConsolidationEngine(service)
+  const sleep = new SleepController(service, consolidation)
+  service.consolidation = consolidation
+  service.sleep = sleep
+
   // 1) 系统提示词说明
   ctx.effect(
     () =>
@@ -65,6 +73,10 @@ export function apply(ctx, config) {
   // 4) 自动记录 + 自动召回
   new CaptureController(service).start()
   new RecallController(service).start()
+
+  // 4.5) 睡眠控制器（定时器 + 用户活动监听）
+  consolidation.load().catch((error) => logger.warn?.(`[dsh-memory] 读取整理任务列表失败：${errorText(error)}`))
+  sleep.start()
 
   // 5) 定期维护：启动后延迟执行一次，之后按 maintenanceIntervalHours 触发
   let maintenanceTimer
@@ -97,14 +109,15 @@ export function apply(ctx, config) {
 
   const provider = service.activeProvider()
   logger.info?.(
-    `[dsh-memory] 已加载 v0.3.1：provider=${provider.id}（${provider.embedModel}，${provider.dimensions} 维）→ Qdrant ${service.storage().qdrantUrl} / ${service.storage().collection}`,
+    `[dsh-memory] 已加载 v0.4.0：provider=${provider.id}（${provider.embedModel}，${provider.dimensions} 维）→ Qdrant ${service.storage().qdrantUrl} / ${service.storage().collection}`,
   )
 
-  // 6) 启动自检：确保 collection 存在（失败只告警，不阻塞 DSH 启动）
+  // 6) 启动自检：确保 collection 存在（失败只告警，不阻塞 DSH 启动），并补齐旧记忆标签
   Promise.resolve()
     .then(() => service.ensureReady())
     .then((info) => {
       if (info?.created) logger.info?.(`[dsh-memory] 已创建 Qdrant 集合 ${service.storage().collection}`)
+      return service.migrateLegacyMemories()
     })
     .catch((error) => {
       logger.warn?.(`[dsh-memory] 启动自检失败：${errorText(error)}`)

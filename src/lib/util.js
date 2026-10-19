@@ -2,6 +2,8 @@
  * 通用小工具：配置解包、截断、哈希、UUID、data URI、超时。
  */
 import { createHash } from 'node:crypto'
+import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs'
+import { dirname, join } from 'node:path'
 
 /** 配置字段可能是 volatile 包装（Ref），统一解包。 */
 export function val(value) {
@@ -294,7 +296,7 @@ function timeZoneParts(ts, timeZone) {
 }
 
 /** 指定时区相对 UTC 的偏移（毫秒）。 */
-function timeZoneOffsetMs(ts, timeZone) {
+export function timeZoneOffsetMs(ts, timeZone) {
   if (!timeZone) return -new Date(ts).getTimezoneOffset() * 60000
   const parts = timeZoneParts(ts, timeZone)
   const asUtc = Date.UTC(parts.year, parts.month - 1, parts.day, parts.hour, parts.minute, parts.second)
@@ -363,4 +365,168 @@ export function timeInfo(ts, timeZone, showRelative = true, now = Date.now()) {
     time: formatTimeInZone(value, timeZone),
     relative: showRelative ? relativeTime(value, now) : '',
   }
+}
+
+// ---------------------------------------------------------------------------
+// 文件 / 任务批次 / 日程时间辅助
+// ---------------------------------------------------------------------------
+
+/** DSH harness home（默认 ~/.dsh）。 */
+export function dshHome() {
+  const env = process.env.DSH_HOME
+  if (env && env.trim()) return env.trim()
+  const home = process.env.HOME || '/root'
+  return join(home, '.dsh')
+}
+
+/** 读取 JSON 文件；不存在或损坏时返回 fallback。 */
+export function readJsonFile(path, fallback) {
+  try {
+    if (!existsSync(path)) return fallback
+    return JSON.parse(readFileSync(path, 'utf8'))
+  } catch {
+    return fallback
+  }
+}
+
+/** 原子写入 JSON 文件（先写临时文件再 rename）。 */
+export function writeJsonFileAtomic(path, value) {
+  const dir = dirname(path)
+  if (!existsSync(dir)) mkdirSync(dir, { recursive: true })
+  const tmp = `${path}.${process.pid}.tmp`
+  writeFileSync(tmp, JSON.stringify(value, null, 2), 'utf8')
+  renameSync(tmp, path)
+}
+
+/** 指定时区下的日期 key：YYYY-MM-DD。 */
+export function dayKey(ts, timeZone) {
+  const parts = timeZoneParts(typeof ts === 'number' ? ts : Date.now(), timeZone)
+  const pad = (n) => String(n).padStart(2, '0')
+  return `${parts.year}-${pad(parts.month)}-${pad(parts.day)}`
+}
+
+/** 指定时区下某一天的起止 epoch（毫秒）。 */
+export function dayBoundsFromKey(key, timeZone) {
+  const [year, month, day] = String(key).split('-').map(Number)
+  const guess = Date.UTC(year, month - 1, day)
+  let offset = timeZoneOffsetMs(guess, timeZone)
+  offset = timeZoneOffsetMs(guess - offset, timeZone)
+  const from = guess - offset
+  return { from, to: from + 86400000 - 1 }
+}
+
+/** 指定时间点的时区日边界。 */
+export function dayBoundsOf(ts, timeZone) {
+  const key = dayKey(ts, timeZone)
+  return { key, ...dayBoundsFromKey(key, timeZone) }
+}
+
+/** 前一天/后一天的日期 key。 */
+export function shiftDayKey(key, deltaDays) {
+  const [year, month, day] = String(key).split('-').map(Number)
+  const date = new Date(Date.UTC(year, month - 1, day + deltaDays))
+  const pad = (n) => String(n).padStart(2, '0')
+  return `${date.getUTCFullYear()}-${pad(date.getUTCMonth() + 1)}-${pad(date.getUTCDate())}`
+}
+
+/** 当前本地时间是否已经到达/超过 HH:mm。 */
+export function isAtOrAfterTime(hhmm, timeZone, now = Date.now()) {
+  const match = /^(\d{1,2}):(\d{2})$/.exec(String(hhmm ?? '').trim())
+  if (!match) return false
+  const target = Number(match[1]) * 60 + Number(match[2])
+  const parts = timeZoneParts(now, timeZone)
+  const current = parts.hour * 60 + parts.minute
+  return current >= target
+}
+
+/** 解析 HH:mm，返回分钟数（非法返回 null）。 */
+export function parseHhMm(hhmm) {
+  const match = /^(\d{1,2}):(\d{2})$/.exec(String(hhmm ?? '').trim())
+  if (!match) return null
+  const hour = Number(match[1])
+  const minute = Number(match[2])
+  if (hour > 23 || minute > 59) return null
+  return hour * 60 + minute
+}
+
+/** 给人看的时长：1h 2m / 35s。 */
+export function formatDuration(ms) {
+  const value = Math.max(0, Number(ms) || 0)
+  if (value < 1000) return `${Math.round(value)}ms`
+  if (value < 60000) return `${Math.round(value / 1000)}s`
+  const minutes = Math.floor(value / 60000)
+  const seconds = Math.round((value % 60000) / 1000)
+  if (minutes < 60) return `${minutes}m ${seconds}s`
+  const hours = Math.floor(minutes / 60)
+  return `${hours}h ${minutes % 60}m`
+}
+
+/** 生成一个尚未在 pending 集合里的随机 5 位批次编号。 */
+export function nextBatchId(pendingIds) {
+  const taken = pendingIds instanceof Set ? pendingIds : new Set(pendingIds ?? [])
+  for (let attempt = 0; attempt < 500; attempt += 1) {
+    const id = String(10000 + Math.floor(Math.random() * 90000))
+    if (!taken.has(id)) return id
+  }
+  // 极端情况下顺序找空位
+  for (let id = 10000; id <= 99999; id += 1) {
+    const text = String(id)
+    if (!taken.has(text)) return text
+  }
+  return String(Date.now()).slice(-5)
+}
+
+/** 把条目列表按字符预算切成若干块。 */
+export function chunkByChars(items, maxChars, render) {
+  const chunks = []
+  let current = []
+  let size = 0
+  for (const item of items) {
+    const text = render ? render(item) : String(item)
+    if (size + text.length > maxChars && current.length > 0) {
+      chunks.push(current)
+      current = []
+      size = 0
+    }
+    current.push(item)
+    size += text.length + 1
+  }
+  if (current.length > 0) chunks.push(current)
+  return chunks
+}
+
+/** 从模型输出中提取 JSON（容忍 ```json 围栏与前后说明文字）。 */
+export function extractJson(text) {
+  const raw = String(text ?? '').trim()
+  if (!raw) return null
+  const fenced = /```(?:json)?\s*([\s\S]*?)```/i.exec(raw)
+  const candidate = fenced ? fenced[1].trim() : raw
+  try {
+    return JSON.parse(candidate)
+  } catch {
+    /* continue */
+  }
+  const start = candidate.indexOf('{')
+  const end = candidate.lastIndexOf('}')
+  if (start >= 0 && end > start) {
+    try {
+      return JSON.parse(candidate.slice(start, end + 1))
+    } catch {
+      return null
+    }
+  }
+  return null
+}
+
+/** 截断长文本列表的渲染文本到预算。 */
+export function renderMemoryLines(items, maxChars, formatter) {
+  const lines = []
+  let size = 0
+  for (const item of items) {
+    const line = formatter ? formatter(item) : String(item)
+    if (size + line.length > maxChars && lines.length > 0) break
+    lines.push(line)
+    size += line.length + 1
+  }
+  return lines.join('\n')
 }

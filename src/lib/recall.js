@@ -65,6 +65,18 @@ export class RecallController {
   }
 
   async augment(payload, decision) {
+    // 睡眠整理期间：不召回，改为让模型只回复 zzzZZ，并把用户原话排队到睡醒后继续处理
+    const sleep = this.service.sleep
+    if (sleep?.isSleeping?.()) {
+      if (payload?.step !== 1) return decision
+      if (payload?.signal?.aborted) return decision
+      if (decision?.kind !== 'enter') return decision
+      const intercepted = sleep.interceptPreStep(payload, decision)
+      if (intercepted?.message) {
+        return { ...decision, messages: [...decision.messages, intercepted.message] }
+      }
+      return decision
+    }
     const options = this.service.recallOptions()
     if (!options.autoRecall) return decision
     const agentId = String(payload?.agent?.id ?? '')

@@ -1,11 +1,10 @@
 // ⚠️ 本文件由 build.mjs 从 src/ 生成，请修改 src/ 下的源码后重新构建。
 // 生成命令：node build.mjs
 
-import { createHash } from 'node:crypto'
+import { createHash, randomUUID } from 'node:crypto'
+import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs'
 import { createRequire } from 'node:module'
 import { dirname, join } from 'node:path'
-import { existsSync } from 'node:fs'
-import { randomUUID } from 'node:crypto'
 
 // ===== src/lib/schemastery.js =====
 /**
@@ -76,6 +75,8 @@ const z = loadSchemastery()
 /**
  * 通用小工具：配置解包、截断、哈希、UUID、data URI、超时。
  */
+
+
 
 
 /** 配置字段可能是 volatile 包装（Ref），统一解包。 */
@@ -439,6 +440,170 @@ function timeInfo(ts, timeZone, showRelative = true, now = Date.now()) {
     relative: showRelative ? relativeTime(value, now) : '',
   }
 }
+
+// ---------------------------------------------------------------------------
+// 文件 / 任务批次 / 日程时间辅助
+// ---------------------------------------------------------------------------
+
+/** DSH harness home（默认 ~/.dsh）。 */
+function dshHome() {
+  const env = process.env.DSH_HOME
+  if (env && env.trim()) return env.trim()
+  const home = process.env.HOME || '/root'
+  return join(home, '.dsh')
+}
+
+/** 读取 JSON 文件；不存在或损坏时返回 fallback。 */
+function readJsonFile(path, fallback) {
+  try {
+    if (!existsSync(path)) return fallback
+    return JSON.parse(readFileSync(path, 'utf8'))
+  } catch {
+    return fallback
+  }
+}
+
+/** 原子写入 JSON 文件（先写临时文件再 rename）。 */
+function writeJsonFileAtomic(path, value) {
+  const dir = dirname(path)
+  if (!existsSync(dir)) mkdirSync(dir, { recursive: true })
+  const tmp = `${path}.${process.pid}.tmp`
+  writeFileSync(tmp, JSON.stringify(value, null, 2), 'utf8')
+  renameSync(tmp, path)
+}
+
+/** 指定时区下的日期 key：YYYY-MM-DD。 */
+function dayKey(ts, timeZone) {
+  const parts = timeZoneParts(typeof ts === 'number' ? ts : Date.now(), timeZone)
+  const pad = (n) => String(n).padStart(2, '0')
+  return `${parts.year}-${pad(parts.month)}-${pad(parts.day)}`
+}
+
+/** 指定时区下某一天的起止 epoch（毫秒）。 */
+function dayBoundsFromKey(key, timeZone) {
+  const [year, month, day] = String(key).split('-').map(Number)
+  const guess = Date.UTC(year, month - 1, day)
+  let offset = timeZoneOffsetMs(guess, timeZone)
+  offset = timeZoneOffsetMs(guess - offset, timeZone)
+  const from = guess - offset
+  return { from, to: from + 86400000 - 1 }
+}
+
+/** 指定时间点的时区日边界。 */
+function dayBoundsOf(ts, timeZone) {
+  const key = dayKey(ts, timeZone)
+  return { key, ...dayBoundsFromKey(key, timeZone) }
+}
+
+/** 前一天/后一天的日期 key。 */
+function shiftDayKey(key, deltaDays) {
+  const [year, month, day] = String(key).split('-').map(Number)
+  const date = new Date(Date.UTC(year, month - 1, day + deltaDays))
+  const pad = (n) => String(n).padStart(2, '0')
+  return `${date.getUTCFullYear()}-${pad(date.getUTCMonth() + 1)}-${pad(date.getUTCDate())}`
+}
+
+/** 当前本地时间是否已经到达/超过 HH:mm。 */
+function isAtOrAfterTime(hhmm, timeZone, now = Date.now()) {
+  const match = /^(\d{1,2}):(\d{2})$/.exec(String(hhmm ?? '').trim())
+  if (!match) return false
+  const target = Number(match[1]) * 60 + Number(match[2])
+  const parts = timeZoneParts(now, timeZone)
+  const current = parts.hour * 60 + parts.minute
+  return current >= target
+}
+
+/** 解析 HH:mm，返回分钟数（非法返回 null）。 */
+function parseHhMm(hhmm) {
+  const match = /^(\d{1,2}):(\d{2})$/.exec(String(hhmm ?? '').trim())
+  if (!match) return null
+  const hour = Number(match[1])
+  const minute = Number(match[2])
+  if (hour > 23 || minute > 59) return null
+  return hour * 60 + minute
+}
+
+/** 给人看的时长：1h 2m / 35s。 */
+function formatDuration(ms) {
+  const value = Math.max(0, Number(ms) || 0)
+  if (value < 1000) return `${Math.round(value)}ms`
+  if (value < 60000) return `${Math.round(value / 1000)}s`
+  const minutes = Math.floor(value / 60000)
+  const seconds = Math.round((value % 60000) / 1000)
+  if (minutes < 60) return `${minutes}m ${seconds}s`
+  const hours = Math.floor(minutes / 60)
+  return `${hours}h ${minutes % 60}m`
+}
+
+/** 生成一个尚未在 pending 集合里的随机 5 位批次编号。 */
+function nextBatchId(pendingIds) {
+  const taken = pendingIds instanceof Set ? pendingIds : new Set(pendingIds ?? [])
+  for (let attempt = 0; attempt < 500; attempt += 1) {
+    const id = String(10000 + Math.floor(Math.random() * 90000))
+    if (!taken.has(id)) return id
+  }
+  // 极端情况下顺序找空位
+  for (let id = 10000; id <= 99999; id += 1) {
+    const text = String(id)
+    if (!taken.has(text)) return text
+  }
+  return String(Date.now()).slice(-5)
+}
+
+/** 把条目列表按字符预算切成若干块。 */
+function chunkByChars(items, maxChars, render) {
+  const chunks = []
+  let current = []
+  let size = 0
+  for (const item of items) {
+    const text = render ? render(item) : String(item)
+    if (size + text.length > maxChars && current.length > 0) {
+      chunks.push(current)
+      current = []
+      size = 0
+    }
+    current.push(item)
+    size += text.length + 1
+  }
+  if (current.length > 0) chunks.push(current)
+  return chunks
+}
+
+/** 从模型输出中提取 JSON（容忍 ```json 围栏与前后说明文字）。 */
+function extractJson(text) {
+  const raw = String(text ?? '').trim()
+  if (!raw) return null
+  const fenced = /```(?:json)?\s*([\s\S]*?)```/i.exec(raw)
+  const candidate = fenced ? fenced[1].trim() : raw
+  try {
+    return JSON.parse(candidate)
+  } catch {
+    /* continue */
+  }
+  const start = candidate.indexOf('{')
+  const end = candidate.lastIndexOf('}')
+  if (start >= 0 && end > start) {
+    try {
+      return JSON.parse(candidate.slice(start, end + 1))
+    } catch {
+      return null
+    }
+  }
+  return null
+}
+
+/** 截断长文本列表的渲染文本到预算。 */
+function renderMemoryLines(items, maxChars, formatter) {
+  const lines = []
+  let size = 0
+  for (const item of items) {
+    const line = formatter ? formatter(item) : String(item)
+    if (size + line.length > maxChars && lines.length > 0) break
+    lines.push(line)
+    size += line.length + 1
+  }
+  return lines.join('\n')
+}
 // ===== src/lib/config.js =====
 /**
  * dsh-memory 插件配置（v0.2）。
@@ -711,6 +876,157 @@ const Config = z.object({
     .volatile()
     .description('每次维护最多检查多少条最近记忆以寻找重复'),
 
+  // -------------------- 睡眠整理 / 记忆巩固 --------------------
+  consolidationEnabled: z
+    .boolean()
+    .default(false)
+    .volatile()
+    .description('开启“睡眠整理”：按天压缩原始记忆，并按任务列表在 7/30 天后继续压缩（默认关闭）'),
+  sleepAt: z
+    .string()
+    .default('00:00')
+    .volatile()
+    .description('睡眠开始时间 HH:mm（按所选时区；默认 00:00）'),
+  sleepRetryMinutes: z
+    .number()
+    .default(15)
+    .step(1)
+    .min(1)
+    .max(240)
+    .volatile()
+    .description('用户忙碌时每隔多少分钟重试入睡'),
+  idleMinutes: z
+    .number()
+    .default(60)
+    .step(1)
+    .min(1)
+    .max(1440)
+    .volatile()
+    .description('最近多少分钟内没有人类消息、且没有运行中的会话，才算空闲可以睡'),
+  consolidationProviderId: z
+    .string()
+    .default('')
+    .volatile()
+    .description('整理模型使用的 provider id；留空表示使用当前激活 provider'),
+  consolidationModel: z
+    .string()
+    .default('Qwen/Qwen2.5-7B-Instruct')
+    .volatile()
+    .description('整理（摘要/提炼）使用的对话模型；留空或调用失败时回退纯规则整理'),
+  consolidationInputMaxChars: z
+    .number()
+    .default(12000)
+    .step(100)
+    .min(1000)
+    .max(200000)
+    .volatile()
+    .description('单个批次最多送入模型的字符数（超出会分块映射后再合并）'),
+  consolidationPrompt: z
+    .string()
+    .default('')
+    .volatile()
+    .description('整理提示词；留空使用内置提示词'),
+  level1Ratio: z
+    .number()
+    .default(0.2)
+    .step(0.01)
+    .min(0.01)
+    .max(1)
+    .volatile()
+    .description('第 1 级（按天）压缩后保留条数比例（默认 0.2，即 100 条→约 20 条）'),
+  level1MaxItems: z
+    .number()
+    .default(30)
+    .step(1)
+    .min(1)
+    .max(200)
+    .volatile()
+    .description('第 1 级压缩后的最大条数'),
+  level2AfterDays: z
+    .number()
+    .default(7)
+    .step(1)
+    .min(0)
+    .max(3650)
+    .volatile()
+    .description('第 1 级批次创建后多少天进行第 2 级压缩'),
+  level2Ratio: z
+    .number()
+    .default(0.25)
+    .step(0.01)
+    .min(0.01)
+    .max(1)
+    .volatile()
+    .description('第 2 级压缩后保留条数比例'),
+  level2MaxItems: z
+    .number()
+    .default(12)
+    .step(1)
+    .min(1)
+    .max(200)
+    .volatile()
+    .description('第 2 级压缩后的最大条数'),
+  level3AfterDays: z
+    .number()
+    .default(30)
+    .step(1)
+    .min(0)
+    .max(3650)
+    .volatile()
+    .description('第 2 级批次创建后多少天进行第 3 级压缩'),
+  level3Ratio: z
+    .number()
+    .default(0.4)
+    .step(0.01)
+    .min(0.01)
+    .max(1)
+    .volatile()
+    .description('第 3 级压缩后保留条数比例'),
+  level3MaxItems: z
+    .number()
+    .default(6)
+    .step(1)
+    .min(1)
+    .max(200)
+    .volatile()
+    .description('第 3 级压缩后的最大条数'),
+
+  // -------------------- 实验性功能 --------------------
+  experimentalEventMergeEnabled: z
+    .boolean()
+    .default(false)
+    .volatile()
+    .description('实验性：整理时用嵌入向量在库中检索相似/同事件记忆，只把相关簇交给模型合并（默认关闭）'),
+  experimentalEventMergeThreshold: z
+    .number()
+    .default(0.85)
+    .step(0.01)
+    .min(0.5)
+    .max(1)
+    .volatile()
+    .description('事件合并的相似度阈值'),
+  experimentalEventMergeMaxCandidates: z
+    .number()
+    .default(30)
+    .step(1)
+    .min(1)
+    .max(200)
+    .volatile()
+    .description('事件合并每次最多带入多少条相关记忆作为参考'),
+  experimentalEnhancementEnabled: z
+    .boolean()
+    .default(false)
+    .volatile()
+    .description('实验性：额外保留整理后的 1 级记忆若干天，不再继续整理，仅供事件召回/按需搜索使用'),
+  experimentalEnhancementDays: z
+    .number()
+    .default(7)
+    .step(1)
+    .min(1)
+    .max(365)
+    .volatile()
+    .description('增强记忆的保留天数（到期自动删除）'),
+
   // -------------------- 其他 --------------------
   debug: z.boolean().default(false).volatile().description('在 DSH 日志中输出插件调试信息'),
 })
@@ -854,6 +1170,35 @@ class OpenAICompatClient {
       vector: this.#vectorOf(payload),
       usage: payload?.usage ?? null,
       latencyMs: Date.now() - startedAt,
+    }
+  }
+
+  /**
+   * 通用对话补全（用于记忆整理/摘要）。
+   * @param {object} options
+   * @param {Array<{role:string,content:string}>} options.messages
+   * @param {string} [options.model] 覆盖默认模型（整理模型）
+   * @param {number} [options.maxTokens]
+   * @param {number} [options.temperature]
+   */
+  async chat({ messages, model, maxTokens = 1024, temperature = 0.3, signal, timeoutMs = 120000 }) {
+    const chatModel = String(model ?? this.visionModel ?? '').trim()
+    if (!chatModel) throw new Error(`${this.label} 未配置整理/对话模型`)
+    if (!this.baseUrl || !this.apiKey) throw new Error(`${this.label} 的接口配置不完整`)
+    const startedAt = Date.now()
+    const body = {
+      model: chatModel,
+      messages,
+      max_tokens: Math.max(16, Math.min(8192, Number(maxTokens) || 1024)),
+      temperature,
+      stream: false,
+    }
+    const payload = await this.#post(`${this.baseUrl}/chat/completions`, this.apiKey, body, { signal, timeoutMs })
+    return {
+      text: contentText(payload?.choices?.[0]?.message?.content).trim(),
+      usage: payload?.usage ?? null,
+      latencyMs: Date.now() - startedAt,
+      model: chatModel,
     }
   }
 
@@ -1069,6 +1414,16 @@ class QdrantClient {
     return { points, nextOffset: payload?.result?.next_page_offset ?? null }
   }
 
+  /** 给指定 id 覆盖/合并 payload 字段（用于迁移与增强记忆到期标记）。 */
+  async setPayload(collection, payload, ids, { signal } = {}) {
+    return this.request(
+      'POST',
+      `/collections/${encodeURIComponent(collection)}/points/payload?wait=true`,
+      { payload, points: ids },
+      { signal },
+    )
+  }
+
   /** 删除指定 id 的 points。 */
   async deletePoints(collection, ids, { signal } = {}) {
     return this.request(
@@ -1229,6 +1584,9 @@ class MemoryService {
       checkedAt: 0,
       info: null,
     }
+    /** 由 index.js 注入的睡眠控制器与整理引擎（避免循环依赖）。 */
+    this.sleep = null
+    this.consolidation = null
   }
 
   // ------------------------------------------------------------------
@@ -1534,7 +1892,8 @@ class MemoryService {
     await this.ensureReady()
     const qdrant = await this.qdrant()
     const storage = this.storage()
-    const id = memoryPointId(`${kind}|${body}`)
+    const { idSeed, ...payloadMeta } = meta ?? {}
+    const id = memoryPointId(idSeed ? `${kind}|${idSeed}|${body}` : `${kind}|${body}`)
     const payload = sanitizeMeta({
       text: body,
       kind,
@@ -1542,7 +1901,9 @@ class MemoryService {
       provider: provider.id,
       model: provider.embedModel,
       dimensions: provider.dimensions,
-      ...meta,
+      level: 0,
+      batch: '',
+      ...payloadMeta,
     })
     await qdrant.upsert(storage.collection, [{ id, vector: embedded.vector, payload }], { signal })
     this.stats.writes += 1
@@ -1670,6 +2031,9 @@ class MemoryService {
         cwd: payload.cwd ? String(payload.cwd) : '',
         tags: Array.isArray(payload.tags) ? payload.tags.map(String) : [],
         provider: payload.provider ? String(payload.provider) : '',
+        level: Number(payload.level) || 0,
+        batch: payload.batch ? String(payload.batch) : '',
+        enhanced: payload.enhanced === true,
       }
     })
     return { hits, query: text, usage: embedded.usage }
@@ -1687,7 +2051,7 @@ class MemoryService {
       includeCurrentSession: options.recallIncludeCurrentSession,
       signal,
     })
-    const filtered = hits.filter((hit) => hit.text.length > 0)
+    const filtered = hits.filter((hit) => hit.text.length > 0 && hit.enhanced !== true)
     if (filtered.length === 0) return { hits: [], block: '' }
     const timeOptions = this.timeOptions()
     const lines = []
@@ -1727,23 +2091,34 @@ class MemoryService {
       cwd: payload.cwd ? String(payload.cwd) : '',
       tags: Array.isArray(payload.tags) ? payload.tags.map(String) : [],
       provider: payload.provider ? String(payload.provider) : '',
+      level: Number(payload.level) || 0,
+      batch: payload.batch ? String(payload.batch) : '',
+      enhanced: payload.enhanced === true,
       ...(Number.isFinite(score) ? { score } : {}),
     }
   }
 
   /** 记忆列表：带 query 走向量检索，否则按时间倒序滚动。 */
-  async listMemories({ query = '', limit = 20, offset = null, kind = '', range = '' } = {}) {
+  async listMemories({ query = '', limit = 20, offset = null, kind = '', range = '', level = '', batch = '' } = {}) {
     const cleanQuery = cleanText(query)
     const pageSize = clampInt(limit, 20, 1, 100)
+    const levelFilter = String(level ?? '').trim()
+    const batchFilter = String(batch ?? '').trim()
     if (cleanQuery) {
-      const { hits } = await this.search(cleanQuery, { limit: pageSize, kind })
-      return { items: hits, nextOffset: null, total: hits.length, query: cleanQuery }
+      const { hits } = await this.search(cleanQuery, { limit: Math.min(100, pageSize * 3), kind })
+      const filtered = hits
+        .filter((hit) => !levelFilter || String(hit.level ?? 0) === levelFilter)
+        .filter((hit) => !batchFilter || String(hit.batch ?? '') === batchFilter)
+        .slice(0, pageSize)
+      return { items: filtered, nextOffset: null, total: filtered.length, query: cleanQuery }
     }
     await this.ensureReady()
     const qdrant = await this.qdrant()
     const storage = this.storage()
     const must = []
     if (kind) must.push({ key: 'kind', match: { value: kind } })
+    if (levelFilter !== '') must.push({ key: 'level', match: { value: Number(levelFilter) } })
+    if (batchFilter) must.push({ key: 'batch', match: { value: batchFilter } })
     if (range === 'today' || range === '7d' || range === '30d') {
       const bounds = rangeBounds(range, this.timeOptions().timeZone)
       if (bounds.from !== null) must.push({ key: 'ts', range: { gte: bounds.from, lte: bounds.to } })
@@ -1814,6 +2189,201 @@ class MemoryService {
       info: result.info ?? null,
     }
     return result
+  }
+
+  // ------------------------------------------------------------------
+  // 记忆整理 / 睡眠 支撑
+  // ------------------------------------------------------------------
+
+  /** 按 level 统计条数（0=原始，1/2/3=整理级别）。 */
+  async countByLevel() {
+    const counts = { 0: 0, 1: 0, 2: 0, 3: 0 }
+    try {
+      await this.ensureReady()
+      const qdrant = await this.qdrant()
+      const storage = this.storage()
+      for (const level of [0, 1, 2, 3]) {
+        try {
+          counts[level] = await qdrant.count(storage.collection, {
+            filter: { must: [{ key: 'level', match: { value: level } }] },
+            exact: true,
+          })
+        } catch {
+          /* ignore */
+        }
+      }
+    } catch {
+      /* collection 不可用时保持 0 */
+    }
+    return counts
+  }
+
+  /**
+   * 滚动收集符合过滤条件的记忆（含向量，供整理/事件合并使用）。
+   * @returns {Promise<Array<{id:string, vector:number[]|null, payload:object}>>}
+   */
+  async collectMemories({ filter, withVector = false, maxItems = 2000, orderBy } = {}) {
+    await this.ensureReady()
+    const qdrant = await this.qdrant()
+    const storage = this.storage()
+    const items = []
+    let offset
+    for (let page = 0; page < 200 && items.length < maxItems; page += 1) {
+      const { points, nextOffset } = await qdrant.scroll(storage.collection, {
+        limit: Math.min(256, maxItems - items.length),
+        offset,
+        orderBy,
+        filter,
+        withPayload: true,
+        withVector,
+      })
+      for (const point of points) {
+        items.push({
+          id: String(point.id),
+          vector: Array.isArray(point.vector) ? point.vector : (point.vector?.default ?? null),
+          payload: point.payload ?? {},
+        })
+      }
+      if (!nextOffset || points.length === 0) break
+      offset = nextOffset
+    }
+    return items
+  }
+
+  /** 收集某一天（按配置时区）的原始记忆（level=0）。 */
+  async collectRawForDay(dayStart, dayEnd, { withVector = false, maxItems = 2000 } = {}) {
+    return this.collectMemories({
+      filter: {
+        must: [
+          { key: 'level', match: { value: 0 } },
+          { key: 'ts', range: { gte: dayStart, lte: dayEnd } },
+        ],
+      },
+      withVector,
+      maxItems,
+      orderBy: { key: 'ts', direction: 'asc' },
+    })
+  }
+
+  /** 收集某个批次产出的记忆。 */
+  async collectBatchMemories(batch, { withVector = false, maxItems = 2000 } = {}) {
+    return this.collectMemories({
+      filter: { must: [{ key: 'batch', match: { value: String(batch) } }] },
+      withVector,
+      maxItems,
+      orderBy: { key: 'ts', direction: 'asc' },
+    })
+  }
+
+  /** 批量删除记忆（整理后清理原文）。 */
+  async deleteMemoryIds(ids) {
+    const list = (ids ?? []).map(String).filter(Boolean)
+    if (list.length === 0) return 0
+    await this.ensureReady()
+    const qdrant = await this.qdrant()
+    const storage = this.storage()
+    for (let index = 0; index < list.length; index += 200) {
+      await qdrant.deletePoints(storage.collection, list.slice(index, index + 200))
+    }
+    return list.length
+  }
+
+  /** 批量更新记忆 payload（迁移/增强到期等）。 */
+  async updateMemoryPayload(ids, payload) {
+    const list = (ids ?? []).map(String).filter(Boolean)
+    if (list.length === 0) return 0
+    await this.ensureReady()
+    const qdrant = await this.qdrant()
+    const storage = this.storage()
+    for (let index = 0; index < list.length; index += 200) {
+      await qdrant.setPayload(storage.collection, payload, list.slice(index, index + 200))
+    }
+    return list.length
+  }
+
+  /** 列出已到期的增强记忆 id。 */
+  async listExpiredEnhanced(now = Date.now()) {
+    const items = await this.collectMemories({
+      filter: {
+        must: [
+          { key: 'enhanced', match: { value: true } },
+          { key: 'expiresAt', range: { lt: now } },
+        ],
+      },
+      withVector: false,
+      maxItems: 5000,
+    })
+    return items.map((item) => item.id)
+  }
+
+  /** 向量相似检索（供事件合并使用）。 */
+  async searchSimilar(vector, { limit = 5, threshold = 0.85, excludeIds = [] } = {}) {
+    await this.ensureReady()
+    const qdrant = await this.qdrant()
+    const storage = this.storage()
+    const exclude = new Set((excludeIds ?? []).map(String))
+    const points = await qdrant.search(storage.collection, {
+      vector,
+      limit: Math.max(limit + exclude.size, limit),
+      scoreThreshold: threshold,
+      withPayload: true,
+    })
+    return points
+      .filter((point) => !exclude.has(String(point.id)))
+      .slice(0, limit)
+      .map((point) => ({
+        id: String(point.id),
+        score: Number(point.score) || 0,
+        text: String(point.payload?.text ?? ''),
+        kind: String(point.payload?.kind ?? ''),
+        ts: Number(point.payload?.ts) || 0,
+        level: Number(point.payload?.level) || 0,
+        batch: point.payload?.batch ? String(point.payload.batch) : '',
+        enhanced: point.payload?.enhanced === true,
+      }))
+  }
+
+  /** 整理用的 LLM 客户端（provider 可单独配置，模型名覆盖）。 */
+  async consolidationClient() {
+    const cfg = this.cfg()
+    const provider =
+      (cfg.consolidationProviderId && this.providerById(cfg.consolidationProviderId)) || this.activeProvider()
+    const model = String(cfg.consolidationModel ?? '').trim()
+    if (!model) return null
+    const client = await this.clientFor(provider)
+    return { client, provider, model }
+  }
+
+  /** 迁移：给旧记忆补 level=0 / batch=''（只对缺失 level 的记录处理一次）。 */
+  async migrateLegacyMemories() {
+    try {
+      await this.ensureReady()
+      const qdrant = await this.qdrant()
+      const storage = this.storage()
+      const legacy = []
+      let offset
+      for (let page = 0; page < 100; page += 1) {
+        const { points, nextOffset } = await qdrant.scroll(storage.collection, {
+          limit: 256,
+          offset,
+          withPayload: true,
+          withVector: false,
+        })
+        for (const point of points) {
+          if (point.payload === undefined || point.payload?.level === undefined) legacy.push(String(point.id))
+        }
+        if (!nextOffset || points.length === 0) break
+        offset = nextOffset
+      }
+      if (legacy.length > 0) {
+        await this.updateMemoryPayload(legacy, { level: 0, batch: '' })
+        this.logger.info?.(`[dsh-memory] 已为 ${legacy.length} 条旧记忆补齐整理标签`)
+      }
+      return legacy.length
+    } catch (error) {
+      this.logger.warn?.(`[dsh-memory] 旧记忆迁移失败：${errorText(error)}`)
+      return 0
+    }
   }
 
   // ------------------------------------------------------------------
@@ -1960,7 +2530,7 @@ class MemoryService {
       ok: true,
       app: {
         name: 'dsh-memory',
-        version: '0.3.1',
+        version: '0.4.0',
         startedAt: this.stats.startedAt,
       },
       time: (() => {
@@ -2010,6 +2580,9 @@ class MemoryService {
         lastError: this.queue.lastError,
         lastErrorTime: this.queue.lastErrorAt ? this.formatTs(this.queue.lastErrorAt) : '',
       },
+      sleep: this.sleep?.status?.() ?? null,
+      consolidation: this.consolidation?.summary?.() ?? null,
+      levels: await this.countByLevel(),
       stats: {
         writes: this.stats.writes,
         lastWriteTime: this.stats.lastWriteAt ? this.formatTs(this.stats.lastWriteAt) : '',
@@ -2155,6 +2728,1116 @@ class MemoryService {
   }
 
 }
+// ===== src/lib/consolidation.js =====
+/**
+ * 睡眠整理引擎（v0.4）。
+ *
+ * 把记忆压缩成“批次”，用任务列表调度多级压缩：
+ *   L1：每天把原始记忆（level=0）压缩成一个 5 位编号的批次（默认保留约 20% 条数）
+ *   L2：L1 批次创建 level2AfterDays 天后，再压缩为 L2 批次（L1 原文删除）
+ *   L3：L2 批次创建 level3AfterDays 天后，再压缩为 L3 批次（最终长期摘要）
+ *
+ * 任务列表持久化在 $DSH_HOME/storages/dsh-memory/consolidation.json，
+ * 批次编号是随机 5 位数；只要求“待处理/处理中”的编号唯一，完成后的编号可回收复用。
+ *
+ * 实验功能（默认关闭）：
+ * - 事件合并：整理时用嵌入向量在全库检索相似记忆，只把相关小簇作为参考交给 LLM，
+ *   并生成 kind='event' 的事件摘要（不会被整库塞给 LLM）。
+ * - 增强记忆：额外保留一份 L1 产物 enhancementDays 天，不参与后续整理，
+ *   仅供事件合并/按需搜索使用，到期自动删除。
+ */
+
+
+
+
+/** 整理状态文件版本。 */
+const STATE_VERSION = 1
+
+/** 内置整理提示词。 */
+const DEFAULT_PROMPT = [
+  '你是长期记忆整理助手，模拟人类睡眠中的记忆巩固。',
+  '输入：某个时间单元内的若干条记忆（可能来自对话、事实、偏好、图片概览）。',
+  '任务：合并、去重、压缩，提炼出最重要的信息；删除寒暄与重复，不编造不存在的内容。',
+  '输出必须是严格 JSON（不要输出代码围栏之外的解释）：',
+  '{"summary":"一段简短的整体摘要","facts":[{"text":"一条自包含的事实","kind":"fact|preference|project|note","tags":["可选标签"]}],"event":{"summary":"可选：如果这些记忆构成同一事件，写一句事件摘要","tags":["可选"]}}',
+  '要求：',
+  '- facts 条数不要超过给定的上限；每条自包含，不要用“他/它/这个”等指代。',
+  '- 保留关键事实、偏好、决定、时间、人名、项目名；丢弃噪音。',
+  '- summary 与 facts 用中文（除非原文主要是其他语言）。',
+].join('\n')
+
+/** 一个批次的简易视图（给状态/历史用）。 */
+function batchView(batch) {
+  return {
+    id: batch.id,
+    level: batch.level,
+    status: batch.status,
+    createdAt: batch.createdAt,
+    dueAt: batch.dueAt,
+    sourceCount: batch.inputCount ?? 0,
+    outputCount: batch.outputCount ?? 0,
+    dayKey: batch.dayKey ?? '',
+    sourceBatchIds: batch.sourceBatchIds ?? [],
+    error: batch.error ?? null,
+  }
+}
+
+class ConsolidationEngine {
+  /**
+   * @param {import('./service.js').MemoryService} service
+   */
+  constructor(service) {
+    this.service = service
+    this.ctx = service.ctx
+    this.logger = service.logger
+    this.statePath = join(dshHome(), 'storages', 'dsh-memory', 'consolidation.json')
+    this.state = { version: STATE_VERSION, batches: [], history: [], lastRun: null }
+    this.loaded = false
+    this.running = null
+  }
+
+  /** 配置级别定义（level1 为每日原始记忆压缩，level2/3 为后续批次压缩）。 */
+  stages() {
+    const cfg = this.service.cfg()
+    const clampNumber = (value, fallback, min, max) => {
+      const n = Number.isFinite(Number(value)) ? Number(value) : fallback
+      return Math.min(max, Math.max(min, n))
+    }
+    return [
+      {
+        level: 1,
+        ratio: clampNumber(cfg.level1Ratio, 0.2, 0.01, 1),
+        maxItems: Math.max(1, Math.round(clampNumber(cfg.level1MaxItems, 30, 1, 200))),
+        afterDays: 0,
+      },
+      {
+        level: 2,
+        ratio: clampNumber(cfg.level2Ratio, 0.25, 0.01, 1),
+        maxItems: Math.max(1, Math.round(clampNumber(cfg.level2MaxItems, 12, 1, 200))),
+        afterDays: Math.max(0, Math.round(clampNumber(cfg.level2AfterDays, 7, 0, 3650))),
+      },
+      {
+        level: 3,
+        ratio: clampNumber(cfg.level3Ratio, 0.4, 0.01, 1),
+        maxItems: Math.max(1, Math.round(clampNumber(cfg.level3MaxItems, 6, 1, 200))),
+        afterDays: Math.max(0, Math.round(clampNumber(cfg.level3AfterDays, 30, 0, 3650))),
+      },
+    ]
+  }
+
+  stage(level) {
+    return this.stages().find((item) => item.level === level) ?? null
+  }
+
+  nextStage(level) {
+    return this.stages().find((item) => item.level === level + 1) ?? null
+  }
+
+  // ------------------------------------------------------------------
+  // 任务列表持久化
+  // ------------------------------------------------------------------
+
+  async load() {
+    if (this.loaded) return this.state
+    const data = readJsonFile(this.statePath, null)
+    if (data && typeof data === 'object' && Array.isArray(data.batches)) {
+      this.state = {
+        version: STATE_VERSION,
+        batches: data.batches,
+        history: Array.isArray(data.history) ? data.history : [],
+        lastRun: data.lastRun ?? null,
+      }
+    }
+    this.loaded = true
+    return this.state
+  }
+
+  async save() {
+    // 只保留最近 600 个批次与 40 条历史，避免状态文件无限膨胀
+    if (this.state.batches.length > 600) {
+      const finished = this.state.batches.filter((b) => b.status !== 'pending' && b.status !== 'processing')
+      const active = this.state.batches.filter((b) => b.status === 'pending' || b.status === 'processing')
+      const keepFinished = finished.slice(-Math.max(0, 600 - active.length))
+      this.state.batches = [...keepFinished, ...active].sort((a, b) => a.createdAt - b.createdAt)
+    }
+    if (this.state.history.length > 40) this.state.history = this.state.history.slice(-40)
+    writeJsonFileAtomic(this.statePath, this.state)
+  }
+
+  /** 待处理/处理中批次占用的编号集合。 */
+  pendingIds() {
+    return new Set(
+      this.state.batches
+        .filter((batch) => batch.status === 'pending' || batch.status === 'processing')
+        .map((batch) => String(batch.id)),
+    )
+  }
+
+  batchById(id) {
+    return this.state.batches.find((batch) => String(batch.id) === String(id)) ?? null
+  }
+
+  /** 状态/历史摘要。 */
+  summary() {
+    const batches = this.state.batches ?? []
+    const pending = batches.filter((batch) => batch.status === 'pending' || batch.status === 'processing')
+    const byLevel = {}
+    for (const batch of pending) byLevel[batch.level] = (byLevel[batch.level] ?? 0) + 1
+    const nextDue = pending
+      .filter((batch) => Number.isFinite(batch.dueAt))
+      .sort((a, b) => a.dueAt - b.dueAt)[0]
+    return {
+      enabled: this.service.cfg().consolidationEnabled === true,
+      pendingTotal: pending.length,
+      pendingByLevel: byLevel,
+      nextDueAt: nextDue?.dueAt ?? null,
+      nextDueTime: nextDue?.dueAt ? this.service.formatTs(nextDue.dueAt) : '',
+      batches: batches.slice(-15).map(batchView),
+      history: (this.state.history ?? []).slice(-6).map((entry) => ({
+        at: entry.at,
+        time: entry.at ? this.service.formatTs(entry.at) : '',
+        manual: entry.manual === true,
+        durationMs: entry.durationMs ?? 0,
+        levels: entry.levels ?? {},
+        errors: entry.errors ?? [],
+      })),
+      lastRun: this.state.lastRun,
+      statePath: this.statePath,
+    }
+  }
+
+  // ------------------------------------------------------------------
+  // 运行整理
+  // ------------------------------------------------------------------
+
+  /** 是否正在整理。 */
+  get busy() {
+    return this.running !== null
+  }
+
+  /**
+   * 执行一轮整理（睡醒前调用）。同一时间只允许一个 run。
+   * @param {{manual?:boolean, reason?:string}} options
+   */
+  async run(options = {}) {
+    await this.load()
+    if (this.running) return this.running
+    this.running = this.#runInner({ manual: options.manual === true, reason: options.reason ?? 'sleep' })
+      .finally(() => {
+        this.running = null
+      })
+    return this.running
+  }
+
+  async #runInner({ manual, reason }) {
+    const startedAt = Date.now()
+    const cfg = this.service.cfg()
+    const tz = this.service.timeOptions().timeZone
+    const today = dayKey(Date.now(), tz)
+    const stages = this.stages()
+    const result = {
+      ok: true,
+      manual,
+      reason,
+      startedAt,
+      finishedAt: 0,
+      durationMs: 0,
+      levels: {},
+      batches: [],
+      deleted: 0,
+      errors: [],
+      maintenance: null,
+    }
+
+    try {
+      await this.service.ensureReady()
+
+      // ---------- L1：把“今天之前”的原始记忆按天压缩 ----------
+      const raw = await this.service.collectMemories({
+        filter: { must: [{ key: 'level', match: { value: 0 } }] },
+        withVector: cfg.experimentalEventMergeEnabled === true,
+        maxItems: 5000,
+        orderBy: { key: 'ts', direction: 'asc' },
+      })
+      const byDay = new Map()
+      for (const item of raw) {
+        const key = dayKey(Number(item.payload?.ts) || 0, tz)
+        if (key >= today) continue
+        if (!byDay.has(key)) byDay.set(key, [])
+        byDay.get(key).push(item)
+      }
+      const dayKeys = [...byDay.keys()].sort()
+      for (const key of dayKeys) {
+        const items = byDay.get(key)
+        const stage1 = stages.find((item) => item.level === 1)
+        const outcome = await this.#compress({
+          level: 1,
+          stage: stage1,
+          sources: items,
+          dayKey: key,
+          sourceBatchIds: [],
+          meta: { dayRange: dayBoundsFromKey(key, tz) },
+        })
+        result.batches.push(outcome.view)
+        if (outcome.error) result.errors.push(outcome.error)
+        this.#mergeLevelStats(result, 1, outcome)
+      }
+
+      // ---------- L2/L3：处理到期批次 ----------
+      for (const stage of stages.filter((item) => item.level >= 2)) {
+        const due = this.state.batches
+          .filter(
+            (batch) =>
+              batch.level === stage.level - 1 &&
+              batch.status === 'pending' &&
+              Number(batch.dueAt) > 0 &&
+              Number(batch.dueAt) <= Date.now(),
+          )
+          .sort((a, b) => a.dueAt - b.dueAt)
+        for (const sourceBatch of due) {
+          const sources = await this.service.collectBatchMemories(sourceBatch.id, {
+            withVector: cfg.experimentalEventMergeEnabled === true,
+            maxItems: 5000,
+          })
+          if (sources.length === 0) {
+            sourceBatch.status = 'done'
+            sourceBatch.updatedAt = Date.now()
+            sourceBatch.error = 'empty-batch'
+            await this.save()
+            continue
+          }
+          const outcome = await this.#compress({
+            level: stage.level,
+            stage,
+            sources,
+            dayKey: sourceBatch.dayKey ?? '',
+            sourceBatchIds: [sourceBatch.id],
+            meta: { dayRange: sourceBatch.dayRange ?? null },
+          })
+          result.batches.push(outcome.view)
+          if (outcome.error) result.errors.push(outcome.error)
+          this.#mergeLevelStats(result, stage.level, outcome)
+          if (!outcome.error) {
+            sourceBatch.status = 'done'
+            sourceBatch.updatedAt = Date.now()
+            sourceBatch.outputBatchId = outcome.view.id
+          } else {
+            sourceBatch.attempts = (sourceBatch.attempts ?? 0) + 1
+            sourceBatch.error = outcome.error
+          }
+          await this.save()
+        }
+      }
+
+      // ---------- 增强记忆到期清理 ----------
+      try {
+        const expired = await this.service.listExpiredEnhanced(Date.now())
+        if (expired.length > 0) {
+          await this.service.deleteMemoryIds(expired)
+          result.deleted += expired.length
+        }
+      } catch (error) {
+        result.errors.push(`enhanced-expiry: ${errorText(error)}`)
+      }
+
+      // ---------- 整理后自动维护（去重/过期/索引） ----------
+      try {
+        result.maintenance = await this.service.maintenance({ force: false })
+      } catch (error) {
+        result.errors.push(`maintenance: ${errorText(error)}`)
+      }
+    } catch (error) {
+      result.ok = false
+      result.errors.push(errorText(error))
+    }
+
+    result.finishedAt = Date.now()
+    result.durationMs = result.finishedAt - startedAt
+    result.ok = result.ok && result.errors.length === 0
+    this.state.lastRun = {
+      at: result.finishedAt,
+      manual,
+      durationMs: result.durationMs,
+      ok: result.ok,
+      levels: result.levels,
+      deleted: result.deleted,
+      errors: result.errors,
+    }
+    this.state.history.push({
+      at: result.startedAt,
+      manual,
+      durationMs: result.durationMs,
+      levels: result.levels,
+      currentLevels: this.summaryLevels(),
+      errors: result.errors,
+    })
+    await this.save()
+    const levelText = Object.entries(result.levels)
+      .map(([level, stat]) => `L${level}:${stat.batches}批/${stat.input}→${stat.output}`)
+      .join(' ')
+    this.service.debugLog(`睡眠整理完成 ${formatDuration(result.durationMs)} ${levelText} 删除原文 ${result.deleted} 条`)
+    return result
+  }
+
+  summaryLevels() {
+    const counts = {}
+    for (const batch of this.state.batches) counts[batch.level] = (counts[batch.level] ?? 0) + 1
+    return counts
+  }
+
+  #mergeLevelStats(result, level, outcome) {
+    if (!result.levels[level]) result.levels[level] = { batches: 0, input: 0, output: 0 }
+    result.levels[level].batches += 1
+    result.levels[level].input += outcome.inputCount ?? 0
+    result.levels[level].output += outcome.outputCount ?? 0
+    result.deleted += outcome.deleted ?? 0
+  }
+
+  /**
+   * 压缩一个批次：调 LLM（或规则回退）生成摘要+事实，写入新记忆，删除原文，登记任务。
+   */
+  async #compress({ level, stage, sources, dayKey: key, sourceBatchIds, meta }) {
+    const cfg = this.service.cfg()
+    const nextStage = this.nextStage(level)
+    const batchId = nextBatchId(this.pendingIds())
+    const cleanSources = (sources ?? []).filter((item) => item.payload?.text)
+    const inputCount = cleanSources.length
+    const emptyView = {
+      id: batchId,
+      level,
+      status: nextStage ? 'pending' : 'final',
+      createdAt: Date.now(),
+      dueAt: nextStage ? Date.now() + nextStage.afterDays * 86400000 : null,
+      sourceCount: inputCount,
+      outputCount: 0,
+      sourceBatchIds,
+      dayKey: key || '',
+      error: 'no-source',
+    }
+    if (inputCount === 0) return { view: emptyView, inputCount: 0, outputCount: 0, deleted: 0, error: null }
+
+    try {
+      // ---------- 实验：事件合并（只取相似记忆作为参考） ----------
+      let related = []
+      if (cfg.experimentalEventMergeEnabled === true) {
+        related = await this.#findRelated(cleanSources)
+      }
+
+      // ---------- LLM / 规则压缩 ----------
+      const rendered = this.#renderSources(cleanSources, level)
+      const chunks = chunkByChars(cleanSources, Math.max(1000, Number(cfg.consolidationInputMaxChars) || 12000))
+      let combined = null
+      let llmCalls = 0
+      let latencyMs = 0
+      try {
+        const llm = await this.service.consolidationClient()
+        if (!llm) throw new Error('no-consolidation-model')
+        const partials = []
+        for (const chunk of chunks) {
+          const partial = await this.#callLLM(llm, {
+            level,
+            stage,
+            items: chunk,
+            rendered: this.#renderSources(chunk, level),
+            related,
+            isFirst: partials.length === 0,
+          })
+          partials.push(partial)
+          llmCalls += 1
+          latencyMs += partial.latencyMs ?? 0
+        }
+        combined = partials.length === 1 ? partials[0].data : await this.#mergePartials(llm, partials, stage)
+        if (partials.length > 1) {
+          llmCalls += 1
+          latencyMs += combined?.latencyMs ?? 0
+        }
+      } catch (error) {
+        // 回退：纯规则压缩（保证睡眠不中断；内容可能粗糙）
+        this.service.debugLog(`整理 LLM 不可用，回退规则压缩：${errorText(error)}`)
+        combined = this.#ruleCompress(chunks, stage)
+        combined = combined.data
+        combined.fallback = true
+        combined.fallbackReason = errorText(error)
+      }
+
+      const summary = String(combined?.summary ?? '').trim()
+      const facts = Array.isArray(combined?.facts) ? combined.facts : []
+      const event = combined?.event && typeof combined.event === 'object' ? combined.event : null
+
+      // 控制输出条数：summary + facts 的总量不超过「压缩比目标」与 maxItems 的较小者，
+      // 从而保证每一级都在真正减少条数（100 → 约 20 → 约 5 …）。
+      const maxItems = Math.max(1, stage.maxItems ?? 20)
+      const targetTotal = Math.max(1, Math.min(maxItems, Math.ceil(inputCount * (stage.ratio ?? 0.25))))
+      const factLimit = Math.max(0, targetTotal - (summary ? 1 : 0))
+      const selectedFacts = facts
+        .filter((fact) => fact && typeof fact.text === 'string' && fact.text.trim())
+        .slice(0, factLimit)
+        .map((fact) => ({
+          text: String(fact.text).trim(),
+          kind: ['fact', 'preference', 'project', 'note', 'event'].includes(fact.kind) ? fact.kind : 'fact',
+          tags: Array.isArray(fact.tags) ? fact.tags.map(String).slice(0, 8) : [],
+        }))
+
+      const entries = []
+      if (summary) entries.push({ text: summary, kind: 'summary', tags: ['summary'] })
+      for (const fact of selectedFacts) entries.push(fact)
+      if (entries.length === 0) entries.push({ text: rendered.slice(0, Math.max(80, Math.min(400, rendered.length))), kind: 'note', tags: ['fallback'] })
+      if (event?.summary && String(event.summary).trim()) {
+        entries.push({
+          text: String(event.summary).trim(),
+          kind: 'event',
+          tags: Array.isArray(event.tags) ? event.tags.map(String).slice(0, 8) : ['event'],
+        })
+      }
+
+      // 压缩比统计：输入条数 → 输出条数（source 删除，目标比例仅作为提示）
+      const now = Date.now()
+      const sourceIds = cleanSources.map((item) => item.id)
+      const baseMeta = {
+        level,
+        batch: batchId,
+        batchCreatedAt: now,
+        sourceCount: inputCount,
+        sourceBatchIds,
+        dayRange: meta?.dayRange ?? null,
+        consolidatedAt: now,
+        relatedCount: related.length,
+      }
+
+      const written = []
+      try {
+        for (const entry of entries) {
+          const saved = await this.service.addMemory({
+            kind: entry.kind === 'summary' ? 'summary' : entry.kind,
+            text: entry.text,
+            meta: {
+              ...baseMeta,
+              tags: entry.tags,
+            },
+          })
+          written.push(saved)
+        }
+        // 实验：增强记忆副本（不进入整理链，仅事件/按需召回使用）
+        if (cfg.experimentalEnhancementEnabled === true && level === 1) {
+          const days = Math.max(1, Number(cfg.experimentalEnhancementDays) || 7)
+          for (const saved of written) {
+            await this.service.addMemory({
+              kind: saved.kind ?? 'summary',
+              text: `（增强记忆）${saved.text}`,
+              meta: {
+                level: 1,
+                enhanced: true,
+                expiresAt: now + days * 86400000,
+                sourceCount: inputCount,
+                sourceBatchIds,
+                consolidatedAt: now,
+                idSeed: `enhanced-${batchId}`,
+              },
+            })
+          }
+        }
+      } catch (error) {
+        return {
+          view: { ...emptyView, error: `write-failed: ${errorText(error)}` },
+          inputCount,
+          outputCount: 0,
+          deleted: 0,
+          error: `write-failed: ${errorText(error)}`,
+        }
+      }
+
+      // 写入成功后删除原文
+      let deleted = 0
+      try {
+        deleted = await this.service.deleteMemoryIds(sourceIds)
+      } catch (error) {
+        return {
+          view: { ...emptyView, error: `delete-failed: ${errorText(error)}` },
+          inputCount,
+          outputCount: written.length,
+          deleted: 0,
+          error: `delete-failed: ${errorText(error)}`,
+        }
+      }
+
+      const batchRow = {
+        id: batchId,
+        level,
+        status: nextStage ? 'pending' : 'final',
+        createdAt: now,
+        updatedAt: now,
+        dueAt: nextStage ? now + nextStage.afterDays * 86400000 : null,
+        dayKey: key || '',
+        dayRange: meta?.dayRange ?? null,
+        sourceBatchIds,
+        sourceIdsCount: sourceIds.length,
+        inputCount,
+        outputCount: written.length,
+        levelRatioTarget: stage.ratio,
+        maxItems,
+        llmCalls,
+        latencyMs,
+        fallback: combined?.fallback === true,
+        fallbackReason: combined?.fallbackReason ?? null,
+        error: null,
+      }
+      this.state.batches.push(batchRow)
+      await this.save()
+      return {
+        view: batchView(batchRow),
+        inputCount,
+        outputCount: written.length,
+        deleted,
+        error: null,
+      }
+    } catch (error) {
+      return {
+        view: { ...emptyView, error: errorText(error) },
+        inputCount,
+        outputCount: 0,
+        deleted: 0,
+        error: errorText(error),
+      }
+    }
+  }
+
+  /** 渲染记忆条目给模型。 */
+  #renderSources(items, level) {
+    return items
+      .map((item) => {
+        const payload = item.payload ?? {}
+        const time = this.service.formatTs(Number(payload.ts) || 0)
+        const kind = payload.kind ?? 'note'
+        const batch = payload.batch ? ` #${payload.batch}` : ''
+        return `- [${time}·${kind}${batch}] ${String(payload.text ?? '').trim()}`
+      })
+      .join('\n')
+  }
+
+  /** 在全库检索相似记忆（事件合并参考），绝不加载全库到内存。 */
+  async #findRelated(sources) {
+    const cfg = this.service.cfg()
+    const threshold = Math.min(1, Math.max(0.5, Number(cfg.experimentalEventMergeThreshold) || 0.85))
+    const maxCandidates = Math.max(1, Math.min(200, Number(cfg.experimentalEventMergeMaxCandidates) || 30))
+    const ownIds = new Set(sources.map((item) => item.id))
+    const related = new Map()
+    // 只探测最多 20 条源记忆，控制查询次数
+    for (const source of sources.slice(0, 20)) {
+      const vector = source.vector
+      if (!Array.isArray(vector)) continue
+      try {
+        const hits = await this.service.searchSimilar(vector, {
+          limit: 5,
+          threshold,
+          excludeIds: [...ownIds, ...related.keys()],
+        })
+        for (const hit of hits) {
+          if (!related.has(hit.id)) related.set(hit.id, hit)
+          if (related.size >= maxCandidates) break
+        }
+      } catch {
+        /* 忽略单条检索失败 */
+      }
+      if (related.size >= maxCandidates) break
+    }
+    return [...related.values()].slice(0, maxCandidates)
+  }
+
+  /** 调一次整理 LLM。 */
+  async #callLLM(llm, { level, stage, items, rendered, related, isFirst }) {
+    const cfg = this.service.cfg()
+    const maxFacts = Math.max(1, (stage?.maxItems ?? 20) - 1)
+    const relatedText = isFirst && related.length > 0
+      ? `\n\n【可能相关的其他事件记忆（仅参考，不要删除/编造，可合并同一事件的信息）】\n${renderMemoryLines(related, 6000, (item) => `- [${this.service.formatTs(item.ts)}·${item.kind}${item.batch ? ' #' + item.batch : ''}] ${item.text.slice(0, 500)}`)}`
+      : ''
+    const customPrompt = String(cfg.consolidationPrompt ?? '').trim()
+    const system = customPrompt || DEFAULT_PROMPT
+    const user = [
+      `这是第 ${level} 级记忆整理。本批共 ${items.length} 条记忆。`,
+      `请输出 JSON：summary、facts（最多 ${maxFacts} 条）、可选 event。`,
+      '',
+      '【本批记忆】',
+      rendered,
+      relatedText,
+    ].join('\n')
+    const startedAt = Date.now()
+    const response = await llm.client.chat({
+      model: llm.model,
+      messages: [
+        { role: 'system', content: system },
+        { role: 'user', content: user },
+      ],
+      maxTokens: level >= 3 ? 2048 : level === 2 ? 1536 : 1024,
+      temperature: 0.2,
+    })
+    const parsed = extractJson(response.text)
+    if (!parsed || typeof parsed !== 'object') {
+      throw new Error(`整理模型未返回可解析 JSON：${String(response.text).slice(0, 200)}`)
+    }
+    return {
+      data: {
+        summary: typeof parsed.summary === 'string' ? parsed.summary : '',
+        facts: Array.isArray(parsed.facts) ? parsed.facts : [],
+        event: parsed.event && typeof parsed.event === 'object' ? parsed.event : null,
+      },
+      latencyMs: response.latencyMs ?? Date.now() - startedAt,
+      raw: response.text,
+      usage: response.usage ?? null,
+    }
+  }
+
+  /** 多块结果合并。 */
+  async #mergePartials(llm, partials, stage) {
+    const summaries = partials.map((partial, index) => `## 分块 ${index + 1}\n${JSON.stringify(partial.data)}`).join('\n\n')
+    const startedAt = Date.now()
+    try {
+      const response = await llm.client.chat({
+        model: llm.model,
+        messages: [
+          {
+            role: 'system',
+            content:
+              '你在合并多个记忆整理分块的结果。请合并去重，输出同样格式的严格 JSON：{"summary":"...","facts":[...],"event":{...}}；facts 不要超过上限。',
+          },
+          {
+            role: 'user',
+            content: `facts 上限 ${Math.max(1, (stage?.maxItems ?? 20) - 1)}。\n\n${summaries}`,
+          },
+        ],
+        maxTokens: 2048,
+        temperature: 0.2,
+      })
+      const parsed = extractJson(response.text)
+      if (!parsed || typeof parsed !== 'object') throw new Error('merge-no-json')
+      return {
+        data: {
+          summary: typeof parsed.summary === 'string' ? parsed.summary : '',
+          facts: Array.isArray(parsed.facts) ? parsed.facts : [],
+          event: parsed.event && typeof parsed.event === 'object' ? parsed.event : null,
+        },
+        latencyMs: response.latencyMs ?? Date.now() - startedAt,
+      }
+    } catch {
+      // 合并失败：简单拼接（去重）
+      const facts = []
+      const seen = new Set()
+      for (const partial of partials) {
+        for (const fact of partial.data.facts ?? []) {
+          const text = String(fact?.text ?? '').trim()
+          if (!text || seen.has(text)) continue
+          seen.add(text)
+          facts.push(fact)
+        }
+      }
+      return {
+        data: {
+          summary: partials.map((partial) => partial.data.summary).filter(Boolean).join('；'),
+          facts,
+          event: null,
+        },
+        latencyMs: 0,
+      }
+    }
+  }
+
+  /** 纯规则压缩（LLM 不可用时的回退）。 */
+  #ruleCompress(chunks, stage) {
+    const maxItems = Math.max(1, stage?.maxItems ?? 12)
+    const facts = []
+    const seen = new Set()
+    for (const chunk of chunks) {
+      for (const item of chunk) {
+        const text = String(item.payload?.text ?? '').trim()
+        if (!text) continue
+        const normalized = text.slice(0, 80)
+        if (seen.has(normalized)) continue
+        seen.add(normalized)
+        facts.push({
+          text,
+          kind: item.payload?.kind === 'summary' || item.payload?.kind === 'event' ? 'note' : (item.payload?.kind ?? 'note'),
+        })
+        if (facts.length >= Math.max(1, maxItems - 1)) break
+      }
+      if (facts.length >= Math.max(1, maxItems - 1)) break
+    }
+    const summary = facts
+      .slice(0, 3)
+      .map((fact) => fact.text.slice(0, 80))
+      .join('；')
+    return {
+      data: {
+        summary: summary ? `规则整理：${summary}` : '',
+        facts,
+        event: null,
+        fallback: true,
+        fallbackReason: 'no-llm',
+      },
+      latencyMs: 0,
+    }
+  }
+}
+// ===== src/lib/sleep.js =====
+/**
+ * 睡眠控制器（v0.4）。
+ *
+ * - 每个配置的睡眠时间（默认 00:00，按用户时区）检查一次；
+ * - 最近 idleMinutes 分钟内没有人类消息、且没有运行中的会话，才开始“睡觉”；
+ * - 忙则每 sleepRetryMinutes 分钟重试，直到能睡（不设截止时间）；
+ * - 睡觉期间用户发消息：自动召回阶段拦截，让对方只回复 zzzZZ，
+ *   并把用户原话排队；整理完成后用 agent.followup 继续处理；
+ * - 睡觉期间自动记录会跳过 zzzZZ 轮次，避免污染记忆。
+ */
+
+
+
+/** 睡眠/唤醒期间使用的上下文注入消息 source kind。 */
+const SLEEP_SOURCE = 'dsh-memory-sleep'
+const WAKE_SOURCE = 'dsh-memory-wake'
+
+/** 构造一条 source.kind 为指定值的 user 消息。 */
+function contextMessage(kind, id, text) {
+  return {
+    id: `${id}-${randomUUID()}`,
+    role: 'user',
+    content: [{ type: 'text', text }],
+    source: { kind },
+  }
+}
+
+/** 从消息列表取出最后一条真实人类消息文本。 */
+function lastHumanText(messages) {
+  if (!Array.isArray(messages)) return ''
+  for (let index = messages.length - 1; index >= 0; index -= 1) {
+    const message = messages[index]
+    if (!message || message.role !== 'user') continue
+    if (message.source?.kind !== 'user') continue
+    const parts = []
+    for (const block of message.content ?? []) {
+      if (block?.type === 'text' && typeof block.text === 'string') parts.push(block.text)
+    }
+    const text = parts.join('\n').trim()
+    if (text) return text
+  }
+  return ''
+}
+
+class SleepController {
+  /**
+   * @param {import('./service.js').MemoryService} service
+   * @param {import('./consolidation.js').ConsolidationEngine} engine
+   */
+  constructor(service, engine) {
+    this.service = service
+    this.engine = engine
+    this.ctx = service.ctx
+    this.logger = service.logger
+    this.disposed = false
+
+    this.sleeping = false
+    this.sleepingSince = 0
+    this.lastActivityAt = Date.now()
+    this.lastSleepDayKey = ''
+    this.nextAttemptAt = 0
+    this.lastSkipReason = ''
+    this.lastError = ''
+    this.lastResult = null
+    this.pending = []
+    this.runningSessions = new Set()
+    this.timer = null
+    this.startedAt = Date.now()
+  }
+
+  /** 注册事件监听与定时器（由插件 effect 持有）。 */
+  start() {
+    this.ctx.effect(
+      () =>
+        this.ctx.on('api-session/activity', (sessionId, updatedAt) => {
+          try {
+            this.touch(updatedAt)
+          } catch {
+            /* ignore */
+          }
+        }),
+      'dsh-memory: sleep activity',
+    )
+    this.ctx.effect(
+      () =>
+        this.ctx.on('api-session/status', (sessionId, running) => {
+          if (running) this.runningSessions.add(String(sessionId))
+          else this.runningSessions.delete(String(sessionId))
+        }),
+      'dsh-memory: sleep session status',
+    )
+    this.ctx.effect(
+      () =>
+        this.ctx.on('agent/status', (payload) => {
+          const id = String(payload?.agent?.id ?? '')
+          if (!id) return
+          if (payload?.status === 'running') this.runningSessions.add(id)
+          else this.runningSessions.delete(id)
+        }),
+      'dsh-memory: sleep agent status',
+    )
+    this.ctx.effect(
+      () =>
+        this.ctx.on('session/event', (session, event) => {
+          try {
+            if (event?.type === 'user/message' && event.data?.source?.kind === 'user') {
+              this.touch(Date.now())
+            }
+          } catch {
+            /* ignore */
+          }
+        }),
+      'dsh-memory: sleep user activity',
+    )
+    this.ctx.effect(
+      () => () => {
+        this.disposed = true
+        if (this.timer) {
+          try {
+            this.timer()
+          } catch {
+            /* ignore */
+          }
+          this.timer = null
+        }
+      },
+      'dsh-memory: sleep dispose',
+    )
+    try {
+      if (typeof this.ctx.interval === 'function') {
+        this.timer = this.ctx.interval(() => this.tick(), 30000)
+      } else {
+        this.timer = () => {}
+        const handle = setInterval(() => this.tick(), 30000)
+        handle.unref?.()
+        this.timer = () => clearInterval(handle)
+      }
+    } catch (error) {
+      this.logger.warn?.(`[dsh-memory] 睡眠定时器启动失败：${error?.message ?? error}`)
+    }
+    // 启动后 15 秒做一次补检查（允许错过睡眠点的 DSH 启动后补睡）
+    const kickoff = setTimeout(() => this.tick(), 15000)
+    kickoff.unref?.()
+    this.service.debugLog('[dsh-memory] 睡眠控制器已启动')
+  }
+
+  /** 用户活动时间戳。 */
+  touch(ts) {
+    const value = Number(ts) > 0 ? Number(ts) : Date.now()
+    if (value > this.lastActivityAt) this.lastActivityAt = value
+    this.lastSkipReason = ''
+  }
+
+  /** 睡眠配置。 */
+  options() {
+    const cfg = this.service.cfg()
+    const time = this.service.timeOptions()
+    return {
+      enabled: cfg.consolidationEnabled === true,
+      sleepAt: String(cfg.sleepAt ?? '00:00'),
+      sleepMinutes: parseHhMm(cfg.sleepAt) ?? 0,
+      retryMs: Math.max(1, Number(cfg.sleepRetryMinutes) || 15) * 60000,
+      idleMs: Math.max(1, Number(cfg.idleMinutes) || 60) * 60000,
+      timeZone: time.timeZone,
+      timeZoneLabel: time.timeZoneLabel,
+    }
+  }
+
+  /** 当前是否在睡觉（整理中）。 */
+  isSleeping() {
+    return this.sleeping
+  }
+
+  /** 是否空闲：没有运行中的会话，且最近 idle 分钟没有人类消息。 */
+  isIdle(now = Date.now()) {
+    const options = this.options()
+    if (this.runningSessions.size > 0) return false
+    return now - this.lastActivityAt >= options.idleMs
+  }
+
+  /** 定时检查（每 30 秒）。 */
+  tick() {
+    if (this.disposed) return
+    const options = this.options()
+    if (!options.enabled) return
+    if (this.sleeping) return
+    const now = Date.now()
+    const tz = options.timeZone
+    const today = dayKey(now, tz)
+    if (this.lastSleepDayKey === today) return
+    if (!isAtOrAfterTime(options.sleepAt, tz, now)) return
+    if (now < this.nextAttemptAt) return
+    if (this.runningSessions.size > 0) {
+      this.lastSkipReason = '有会话正在运行'
+      this.nextAttemptAt = now + options.retryMs
+      return
+    }
+    if (!this.isIdle(now)) {
+      const idleMinutes = Math.round((now - this.lastActivityAt) / 60000)
+      this.lastSkipReason = `用户最近 ${idleMinutes} 分钟内有会话，等待空闲`
+      this.nextAttemptAt = now + options.retryMs
+      return
+    }
+    this.startSleep({ manual: false, reason: 'schedule' })
+  }
+
+  /**
+   * 开始睡觉并执行整理。手动触发时忽略空闲检测。
+   * @param {{manual?:boolean, reason?:string}} options
+   */
+  async startSleep({ manual = false, reason = 'schedule' } = {}) {
+    if (this.disposed) return { ok: false, reason: 'disposed' }
+    if (this.sleeping) return { ok: false, reason: 'already-sleeping' }
+    if (this.engine.busy) return { ok: false, reason: 'engine-busy' }
+    this.sleeping = true
+    this.sleepingSince = Date.now()
+    this.lastError = ''
+    this.lastSkipReason = ''
+    this.service.debugLog(`[dsh-memory] 开始睡觉整理（${manual ? '手动' : '定时'}）`)
+    try {
+      const result = await this.engine.run({ manual, reason })
+      this.lastResult = result
+      if (!result.ok && result.errors?.length > 0) this.lastError = result.errors[0]
+    } catch (error) {
+      this.lastError = error?.message ?? String(error)
+      this.lastResult = { ok: false, errors: [this.lastError] }
+      this.logger.warn?.(`[dsh-memory] 睡眠整理失败：${this.lastError}`)
+    } finally {
+      const options = this.options()
+      this.lastSleepDayKey = dayKey(this.sleepingSince, options.timeZone)
+      this.sleeping = false
+      this.nextAttemptAt = 0
+      this.service.debugLog(
+        `[dsh-memory] 睡醒，时长 ${formatDuration(Date.now() - this.sleepingSince)}${this.lastError ? `（有错误：${this.lastError}）` : ''}`,
+      )
+      await this.flushPending()
+    }
+    return this.lastResult ?? { ok: true }
+  }
+
+  /** 手动请求（HTTP 用：立即返回 accepted，后台执行）。 */
+  requestManual() {
+    if (this.sleeping) return { ok: false, reason: 'already-sleeping' }
+    if (this.engine.busy) return { ok: false, reason: 'engine-busy' }
+    this.startSleep({ manual: true, reason: 'manual' })
+    return { ok: true, started: true }
+  }
+
+  /**
+   * 睡觉期间的消息拦截（由 recall 控制器调用）。
+   * @returns {null | {queued:boolean, message?:object}}
+   */
+  interceptPreStep(payload, decision) {
+    if (!this.sleeping) return null
+    if (payload?.step !== 1) return { queued: false }
+    if (decision?.kind !== 'enter') return { queued: false }
+    const text = lastHumanText(decision.messages) || lastHumanText(payload.messages)
+    if (!text) return { queued: false }
+    this.queueMessage({
+      agent: payload?.agent,
+      sessionId: String(payload?.agent?.id ?? ''),
+      text,
+    })
+    this.service.stats.sleepReplies = (this.service.stats.sleepReplies ?? 0) + 1
+    return {
+      queued: true,
+      message: contextMessage(
+        SLEEP_SOURCE,
+        'memory-sleep',
+        `【记忆整理中】AI 正在睡觉整理长期记忆，稍后醒来会自动继续处理你刚才的消息。\n现在请只回复：zzzZZ（可以带一两个 Zzz 或 💤，不要回复任何其他内容，不要调用工具）。`,
+      ),
+    }
+  }
+
+  /** 排队一条睡眠期间的用户消息。 */
+  queueMessage({ agent, sessionId, text }) {
+    const clean = String(text ?? '').trim()
+    if (!clean) return
+    const id = String(agent?.id ?? sessionId ?? '')
+    if (!id) return
+    this.pending.push({ agent, sessionId: id, text: clean, at: Date.now() })
+    if (this.pending.length > 20) this.pending = this.pending.slice(-20)
+  }
+
+  /** 醒来后继续处理排队消息。 */
+  async flushPending() {
+    if (this.pending.length === 0) return
+    const bySession = new Map()
+    for (const item of this.pending) {
+      const id = item.sessionId
+      if (!bySession.has(id)) bySession.set(id, { agent: item.agent, texts: [] })
+      bySession.get(id).texts.push(item.text)
+    }
+    this.pending = []
+    for (const [sessionId, group] of bySession) {
+      const text = group.texts.map((item, index) => `${index + 1}. ${item}`).join('\n')
+      const content = `【记忆整理完成】AI 已睡醒。请继续处理用户在睡觉期间发来的消息：\n${text}`
+      try {
+        const agent = group.agent
+        if (agent && typeof agent.followup === 'function') {
+          agent.followup(contextMessage(WAKE_SOURCE, 'memory-wake', content))
+          this.service.debugLog(`[dsh-memory] 睡醒后继续处理 ${sessionId} 的排队消息`)
+          continue
+        }
+        const live = this.ctx.agents?.get?.(sessionId)
+        if (live && typeof live.followup === 'function') {
+          live.followup(contextMessage(WAKE_SOURCE, 'memory-wake', content))
+          continue
+        }
+        this.logger.warn?.(`[dsh-memory] 会话 ${sessionId} 已不在运行，跳过排队消息`)
+      } catch (error) {
+        this.logger.warn?.(`[dsh-memory] 睡醒后继续处理失败：${error?.message ?? error}`)
+      }
+    }
+  }
+
+  /** 状态视图（给 /status 与 GUI）。 */
+  status() {
+    const options = this.options()
+    const now = Date.now()
+    return {
+      enabled: options.enabled,
+      sleeping: this.sleeping,
+      sleepingSince: this.sleepingSince,
+      sleepingSinceTime: this.sleepingSince ? this.service.formatTs(this.sleepingSince) : '',
+      sleepAt: options.sleepAt,
+      retryMinutes: Math.round(options.retryMs / 60000),
+      idleMinutes: Math.round(options.idleMs / 60000),
+      timezone: options.timeZoneLabel,
+      lastActivityAt: this.lastActivityAt,
+      lastActivityTime: this.service.formatTs(this.lastActivityAt),
+      idleForMinutes: Math.max(0, Math.floor((now - this.lastActivityAt) / 60000)),
+      nextAttemptAt: this.nextAttemptAt,
+      nextAttemptTime: this.nextAttemptAt ? this.service.formatTs(this.nextAttemptAt) : '',
+      lastSleepDayKey: this.lastSleepDayKey,
+      lastSkipReason: this.lastSkipReason,
+      lastError: this.lastError,
+      lastResult: this.lastResult
+        ? {
+            ok: this.lastResult.ok,
+            startedAt: this.lastResult.startedAt,
+            finishedAt: this.lastResult.finishedAt,
+            durationMs: this.lastResult.durationMs,
+            levels: this.lastResult.levels ?? {},
+            batches: (this.lastResult.batches ?? []).slice(-10),
+            deleted: this.lastResult.deleted ?? 0,
+            errors: (this.lastResult.errors ?? []).slice(0, 5),
+          }
+        : null,
+      pendingCount: this.pending.length,
+      pendingPreview: this.pending.slice(-5).map((item) => ({
+        sessionId: item.sessionId,
+        text: item.text.slice(0, 120),
+        at: item.at,
+        time: this.service.formatTs(item.at),
+      })),
+      runningSessions: this.runningSessions.size,
+      engine: this.engine.summary?.() ?? null,
+    }
+  }
+}
 // ===== src/lib/capture.js =====
 /**
  * 自动记录：监听 session/event，在每轮结束时把“用户要点 + 助手回答要点”
@@ -2211,6 +3894,8 @@ class CaptureController {
   }
 
   observe(session, event) {
+    // 睡眠整理期间不记录（避免把 zzzZZ 对话写进长期记忆）
+    if (this.service.sleep?.isSleeping?.()) return
     const options = this.service.captureOptions()
     if (!options.autoCapture) return
     const sessionId = String(session?.id ?? '')
@@ -2376,6 +4061,18 @@ class RecallController {
   }
 
   async augment(payload, decision) {
+    // 睡眠整理期间：不召回，改为让模型只回复 zzzZZ，并把用户原话排队到睡醒后继续处理
+    const sleep = this.service.sleep
+    if (sleep?.isSleeping?.()) {
+      if (payload?.step !== 1) return decision
+      if (payload?.signal?.aborted) return decision
+      if (decision?.kind !== 'enter') return decision
+      const intercepted = sleep.interceptPreStep(payload, decision)
+      if (intercepted?.message) {
+        return { ...decision, messages: [...decision.messages, intercepted.message] }
+      }
+      return decision
+    }
     const options = this.service.recallOptions()
     if (!options.autoRecall) return decision
     const agentId = String(payload?.agent?.id ?? '')
@@ -2655,6 +4352,9 @@ function registerMemoryTools(service) {
  *   POST /__dsh_memory__/memories/delete     删除记忆 {ids:[...]}
  *   POST /__dsh_memory__/recreate            重建集合（需要 confirm:"DELETE"）
  *   POST /__dsh_memory__/maintenance         立即执行一次维护
+ *   GET  /__dsh_memory__/sleep               睡眠状态 + 整理任务列表摘要
+ *   POST /__dsh_memory__/sleep/run           手动触发一次睡眠整理
+ *   GET  /__dsh_memory__/consolidation       整理任务列表与历史
  *
  * POST 请求要求自定义头 x-dsh-memory: 1，避免跨站请求伪造（跨域预检会拦下）。
  */
@@ -2747,6 +4447,8 @@ function registerHttpRoutes(ctx, service) {
             offset: query.get('offset') ?? null,
             kind: query.get('kind') ?? '',
             range: query.get('range') ?? '',
+            level: query.get('level') ?? '',
+            batch: query.get('batch') ?? '',
           })
           respond(res, 200, { ok: true, ...result })
           return
@@ -2864,6 +4566,64 @@ function registerHttpRoutes(ctx, service) {
       }
     },
   }
+  const sleepRoute = {
+    kind: 'exact',
+    path: '/__dsh_memory__/sleep',
+    handler: async (req, res) => {
+      if (req.method !== 'GET') {
+        respond(res, 405, { ok: false, error: 'method not allowed' })
+        return
+      }
+      if (!service.sleep || !service.consolidation) {
+        respond(res, 503, { ok: false, error: '睡眠整理组件未加载' })
+        return
+      }
+      respond(res, 200, {
+        ok: true,
+        sleep: service.sleep.status(),
+        consolidation: service.consolidation.summary(),
+      })
+    },
+  }
+  const sleepRunRoute = {
+    kind: 'exact',
+    path: '/__dsh_memory__/sleep/run',
+    handler: async (req, res) => {
+      if (!trustedPost(req)) {
+        respond(res, 403, { ok: false, error: 'forbidden' })
+        return
+      }
+      if (!service.sleep) {
+        respond(res, 503, { ok: false, error: '睡眠整理组件未加载' })
+        return
+      }
+      try {
+        const body = await readJsonBody(req)
+        if (body?.confirm === 'run') {
+          respond(res, 200, service.sleep.requestManual())
+          return
+        }
+        respond(res, 200, service.sleep.requestManual())
+      } catch (error) {
+        respond(res, 500, { ok: false, error: errorText(error) })
+      }
+    },
+  }
+  const consolidationRoute = {
+    kind: 'exact',
+    path: '/__dsh_memory__/consolidation',
+    handler: async (req, res) => {
+      if (req.method !== 'GET') {
+        respond(res, 405, { ok: false, error: 'method not allowed' })
+        return
+      }
+      if (!service.consolidation) {
+        respond(res, 503, { ok: false, error: '整理引擎未加载' })
+        return
+      }
+      respond(res, 200, { ok: true, ...service.consolidation.summary() })
+    },
+  }
   const routes = [
     statusRoute,
     memoriesRoute,
@@ -2872,6 +4632,9 @@ function registerHttpRoutes(ctx, service) {
     testRoute,
     recreateRoute,
     maintenanceRoute,
+    sleepRoute,
+    sleepRunRoute,
+    consolidationRoute,
   ]
   return routes.map((route) => ctx.effect(() => ctx.webServer.register(route), `dsh-memory: route ${route.path}`))
 }
@@ -2894,10 +4657,12 @@ function registerHttpRoutes(ctx, service) {
 
 
 
+
+
 const name = 'dsh-memory'
 
 /** 需要的 Host 服务；缺任意一个时插件保持未激活，而不是报错。 */
-const inject = ['tools', 'systemPrompt', 'webServer', 'credentials', 'attachments', 'sessions']
+const inject = ['tools', 'systemPrompt', 'webServer', 'credentials', 'attachments', 'sessions', 'timer', 'agents']
 
 
 /** 注入系统提示词的长期记忆使用说明。 */
@@ -2922,6 +4687,12 @@ function apply(ctx, config) {
   const service = new MemoryService(ctx, config)
   const logger = service.logger
 
+  // 0) 睡眠整理引擎 + 控制器（v0.4）
+  const consolidation = new ConsolidationEngine(service)
+  const sleep = new SleepController(service, consolidation)
+  service.consolidation = consolidation
+  service.sleep = sleep
+
   // 1) 系统提示词说明
   ctx.effect(
     () =>
@@ -2942,6 +4713,10 @@ function apply(ctx, config) {
   // 4) 自动记录 + 自动召回
   new CaptureController(service).start()
   new RecallController(service).start()
+
+  // 4.5) 睡眠控制器（定时器 + 用户活动监听）
+  consolidation.load().catch((error) => logger.warn?.(`[dsh-memory] 读取整理任务列表失败：${errorText(error)}`))
+  sleep.start()
 
   // 5) 定期维护：启动后延迟执行一次，之后按 maintenanceIntervalHours 触发
   let maintenanceTimer
@@ -2974,14 +4749,15 @@ function apply(ctx, config) {
 
   const provider = service.activeProvider()
   logger.info?.(
-    `[dsh-memory] 已加载 v0.3.1：provider=${provider.id}（${provider.embedModel}，${provider.dimensions} 维）→ Qdrant ${service.storage().qdrantUrl} / ${service.storage().collection}`,
+    `[dsh-memory] 已加载 v0.4.0：provider=${provider.id}（${provider.embedModel}，${provider.dimensions} 维）→ Qdrant ${service.storage().qdrantUrl} / ${service.storage().collection}`,
   )
 
-  // 6) 启动自检：确保 collection 存在（失败只告警，不阻塞 DSH 启动）
+  // 6) 启动自检：确保 collection 存在（失败只告警，不阻塞 DSH 启动），并补齐旧记忆标签
   Promise.resolve()
     .then(() => service.ensureReady())
     .then((info) => {
       if (info?.created) logger.info?.(`[dsh-memory] 已创建 Qdrant 集合 ${service.storage().collection}`)
+      return service.migrateLegacyMemories()
     })
     .catch((error) => {
       logger.warn?.(`[dsh-memory] 启动自检失败：${errorText(error)}`)

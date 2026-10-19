@@ -1,4 +1,4 @@
 {
   "title": "长期记忆",
-  "description": "多 provider 的持久化长期记忆（OpenAI 兼容嵌入 + Qdrant）：自动记录与召回、记忆管理、时区与时间感知、定期维护。"
+  "description": "多 provider 的持久化长期记忆（OpenAI 兼容嵌入 + Qdrant）：自动记录与召回、记忆管理、时区与时间感知、睡眠整理与分级压缩、定期维护。"
 }

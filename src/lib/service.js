@@ -139,6 +139,9 @@ export class MemoryService {
       checkedAt: 0,
       info: null,
     }
+    /** 由 index.js 注入的睡眠控制器与整理引擎（避免循环依赖）。 */
+    this.sleep = null
+    this.consolidation = null
   }
 
   // ------------------------------------------------------------------
@@ -444,7 +447,8 @@ export class MemoryService {
     await this.ensureReady()
     const qdrant = await this.qdrant()
     const storage = this.storage()
-    const id = memoryPointId(`${kind}|${body}`)
+    const { idSeed, ...payloadMeta } = meta ?? {}
+    const id = memoryPointId(idSeed ? `${kind}|${idSeed}|${body}` : `${kind}|${body}`)
     const payload = sanitizeMeta({
       text: body,
       kind,
@@ -452,7 +456,9 @@ export class MemoryService {
       provider: provider.id,
       model: provider.embedModel,
       dimensions: provider.dimensions,
-      ...meta,
+      level: 0,
+      batch: '',
+      ...payloadMeta,
     })
     await qdrant.upsert(storage.collection, [{ id, vector: embedded.vector, payload }], { signal })
     this.stats.writes += 1
@@ -580,6 +586,9 @@ export class MemoryService {
         cwd: payload.cwd ? String(payload.cwd) : '',
         tags: Array.isArray(payload.tags) ? payload.tags.map(String) : [],
         provider: payload.provider ? String(payload.provider) : '',
+        level: Number(payload.level) || 0,
+        batch: payload.batch ? String(payload.batch) : '',
+        enhanced: payload.enhanced === true,
       }
     })
     return { hits, query: text, usage: embedded.usage }
@@ -597,7 +606,7 @@ export class MemoryService {
       includeCurrentSession: options.recallIncludeCurrentSession,
       signal,
     })
-    const filtered = hits.filter((hit) => hit.text.length > 0)
+    const filtered = hits.filter((hit) => hit.text.length > 0 && hit.enhanced !== true)
     if (filtered.length === 0) return { hits: [], block: '' }
     const timeOptions = this.timeOptions()
     const lines = []
@@ -637,23 +646,34 @@ export class MemoryService {
       cwd: payload.cwd ? String(payload.cwd) : '',
       tags: Array.isArray(payload.tags) ? payload.tags.map(String) : [],
       provider: payload.provider ? String(payload.provider) : '',
+      level: Number(payload.level) || 0,
+      batch: payload.batch ? String(payload.batch) : '',
+      enhanced: payload.enhanced === true,
       ...(Number.isFinite(score) ? { score } : {}),
     }
   }
 
   /** 记忆列表：带 query 走向量检索，否则按时间倒序滚动。 */
-  async listMemories({ query = '', limit = 20, offset = null, kind = '', range = '' } = {}) {
+  async listMemories({ query = '', limit = 20, offset = null, kind = '', range = '', level = '', batch = '' } = {}) {
     const cleanQuery = cleanText(query)
     const pageSize = clampInt(limit, 20, 1, 100)
+    const levelFilter = String(level ?? '').trim()
+    const batchFilter = String(batch ?? '').trim()
     if (cleanQuery) {
-      const { hits } = await this.search(cleanQuery, { limit: pageSize, kind })
-      return { items: hits, nextOffset: null, total: hits.length, query: cleanQuery }
+      const { hits } = await this.search(cleanQuery, { limit: Math.min(100, pageSize * 3), kind })
+      const filtered = hits
+        .filter((hit) => !levelFilter || String(hit.level ?? 0) === levelFilter)
+        .filter((hit) => !batchFilter || String(hit.batch ?? '') === batchFilter)
+        .slice(0, pageSize)
+      return { items: filtered, nextOffset: null, total: filtered.length, query: cleanQuery }
     }
     await this.ensureReady()
     const qdrant = await this.qdrant()
     const storage = this.storage()
     const must = []
     if (kind) must.push({ key: 'kind', match: { value: kind } })
+    if (levelFilter !== '') must.push({ key: 'level', match: { value: Number(levelFilter) } })
+    if (batchFilter) must.push({ key: 'batch', match: { value: batchFilter } })
     if (range === 'today' || range === '7d' || range === '30d') {
       const bounds = rangeBounds(range, this.timeOptions().timeZone)
       if (bounds.from !== null) must.push({ key: 'ts', range: { gte: bounds.from, lte: bounds.to } })
@@ -724,6 +744,201 @@ export class MemoryService {
       info: result.info ?? null,
     }
     return result
+  }
+
+  // ------------------------------------------------------------------
+  // 记忆整理 / 睡眠 支撑
+  // ------------------------------------------------------------------
+
+  /** 按 level 统计条数（0=原始，1/2/3=整理级别）。 */
+  async countByLevel() {
+    const counts = { 0: 0, 1: 0, 2: 0, 3: 0 }
+    try {
+      await this.ensureReady()
+      const qdrant = await this.qdrant()
+      const storage = this.storage()
+      for (const level of [0, 1, 2, 3]) {
+        try {
+          counts[level] = await qdrant.count(storage.collection, {
+            filter: { must: [{ key: 'level', match: { value: level } }] },
+            exact: true,
+          })
+        } catch {
+          /* ignore */
+        }
+      }
+    } catch {
+      /* collection 不可用时保持 0 */
+    }
+    return counts
+  }
+
+  /**
+   * 滚动收集符合过滤条件的记忆（含向量，供整理/事件合并使用）。
+   * @returns {Promise<Array<{id:string, vector:number[]|null, payload:object}>>}
+   */
+  async collectMemories({ filter, withVector = false, maxItems = 2000, orderBy } = {}) {
+    await this.ensureReady()
+    const qdrant = await this.qdrant()
+    const storage = this.storage()
+    const items = []
+    let offset
+    for (let page = 0; page < 200 && items.length < maxItems; page += 1) {
+      const { points, nextOffset } = await qdrant.scroll(storage.collection, {
+        limit: Math.min(256, maxItems - items.length),
+        offset,
+        orderBy,
+        filter,
+        withPayload: true,
+        withVector,
+      })
+      for (const point of points) {
+        items.push({
+          id: String(point.id),
+          vector: Array.isArray(point.vector) ? point.vector : (point.vector?.default ?? null),
+          payload: point.payload ?? {},
+        })
+      }
+      if (!nextOffset || points.length === 0) break
+      offset = nextOffset
+    }
+    return items
+  }
+
+  /** 收集某一天（按配置时区）的原始记忆（level=0）。 */
+  async collectRawForDay(dayStart, dayEnd, { withVector = false, maxItems = 2000 } = {}) {
+    return this.collectMemories({
+      filter: {
+        must: [
+          { key: 'level', match: { value: 0 } },
+          { key: 'ts', range: { gte: dayStart, lte: dayEnd } },
+        ],
+      },
+      withVector,
+      maxItems,
+      orderBy: { key: 'ts', direction: 'asc' },
+    })
+  }
+
+  /** 收集某个批次产出的记忆。 */
+  async collectBatchMemories(batch, { withVector = false, maxItems = 2000 } = {}) {
+    return this.collectMemories({
+      filter: { must: [{ key: 'batch', match: { value: String(batch) } }] },
+      withVector,
+      maxItems,
+      orderBy: { key: 'ts', direction: 'asc' },
+    })
+  }
+
+  /** 批量删除记忆（整理后清理原文）。 */
+  async deleteMemoryIds(ids) {
+    const list = (ids ?? []).map(String).filter(Boolean)
+    if (list.length === 0) return 0
+    await this.ensureReady()
+    const qdrant = await this.qdrant()
+    const storage = this.storage()
+    for (let index = 0; index < list.length; index += 200) {
+      await qdrant.deletePoints(storage.collection, list.slice(index, index + 200))
+    }
+    return list.length
+  }
+
+  /** 批量更新记忆 payload（迁移/增强到期等）。 */
+  async updateMemoryPayload(ids, payload) {
+    const list = (ids ?? []).map(String).filter(Boolean)
+    if (list.length === 0) return 0
+    await this.ensureReady()
+    const qdrant = await this.qdrant()
+    const storage = this.storage()
+    for (let index = 0; index < list.length; index += 200) {
+      await qdrant.setPayload(storage.collection, payload, list.slice(index, index + 200))
+    }
+    return list.length
+  }
+
+  /** 列出已到期的增强记忆 id。 */
+  async listExpiredEnhanced(now = Date.now()) {
+    const items = await this.collectMemories({
+      filter: {
+        must: [
+          { key: 'enhanced', match: { value: true } },
+          { key: 'expiresAt', range: { lt: now } },
+        ],
+      },
+      withVector: false,
+      maxItems: 5000,
+    })
+    return items.map((item) => item.id)
+  }
+
+  /** 向量相似检索（供事件合并使用）。 */
+  async searchSimilar(vector, { limit = 5, threshold = 0.85, excludeIds = [] } = {}) {
+    await this.ensureReady()
+    const qdrant = await this.qdrant()
+    const storage = this.storage()
+    const exclude = new Set((excludeIds ?? []).map(String))
+    const points = await qdrant.search(storage.collection, {
+      vector,
+      limit: Math.max(limit + exclude.size, limit),
+      scoreThreshold: threshold,
+      withPayload: true,
+    })
+    return points
+      .filter((point) => !exclude.has(String(point.id)))
+      .slice(0, limit)
+      .map((point) => ({
+        id: String(point.id),
+        score: Number(point.score) || 0,
+        text: String(point.payload?.text ?? ''),
+        kind: String(point.payload?.kind ?? ''),
+        ts: Number(point.payload?.ts) || 0,
+        level: Number(point.payload?.level) || 0,
+        batch: point.payload?.batch ? String(point.payload.batch) : '',
+        enhanced: point.payload?.enhanced === true,
+      }))
+  }
+
+  /** 整理用的 LLM 客户端（provider 可单独配置，模型名覆盖）。 */
+  async consolidationClient() {
+    const cfg = this.cfg()
+    const provider =
+      (cfg.consolidationProviderId && this.providerById(cfg.consolidationProviderId)) || this.activeProvider()
+    const model = String(cfg.consolidationModel ?? '').trim()
+    if (!model) return null
+    const client = await this.clientFor(provider)
+    return { client, provider, model }
+  }
+
+  /** 迁移：给旧记忆补 level=0 / batch=''（只对缺失 level 的记录处理一次）。 */
+  async migrateLegacyMemories() {
+    try {
+      await this.ensureReady()
+      const qdrant = await this.qdrant()
+      const storage = this.storage()
+      const legacy = []
+      let offset
+      for (let page = 0; page < 100; page += 1) {
+        const { points, nextOffset } = await qdrant.scroll(storage.collection, {
+          limit: 256,
+          offset,
+          withPayload: true,
+          withVector: false,
+        })
+        for (const point of points) {
+          if (point.payload === undefined || point.payload?.level === undefined) legacy.push(String(point.id))
+        }
+        if (!nextOffset || points.length === 0) break
+        offset = nextOffset
+      }
+      if (legacy.length > 0) {
+        await this.updateMemoryPayload(legacy, { level: 0, batch: '' })
+        this.logger.info?.(`[dsh-memory] 已为 ${legacy.length} 条旧记忆补齐整理标签`)
+      }
+      return legacy.length
+    } catch (error) {
+      this.logger.warn?.(`[dsh-memory] 旧记忆迁移失败：${errorText(error)}`)
+      return 0
+    }
   }
 
   // ------------------------------------------------------------------
@@ -870,7 +1085,7 @@ export class MemoryService {
       ok: true,
       app: {
         name: 'dsh-memory',
-        version: '0.3.1',
+        version: '0.4.0',
         startedAt: this.stats.startedAt,
       },
       time: (() => {
@@ -920,6 +1135,9 @@ export class MemoryService {
         lastError: this.queue.lastError,
         lastErrorTime: this.queue.lastErrorAt ? this.formatTs(this.queue.lastErrorAt) : '',
       },
+      sleep: this.sleep?.status?.() ?? null,
+      consolidation: this.consolidation?.summary?.() ?? null,
+      levels: await this.countByLevel(),
       stats: {
         writes: this.stats.writes,
         lastWriteTime: this.stats.lastWriteAt ? this.formatTs(this.stats.lastWriteAt) : '',

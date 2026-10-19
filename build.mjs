@@ -23,6 +23,8 @@ const ORDER = [
   'lib/api-client.js',
   'lib/qdrant.js',
   'lib/service.js',
+  'lib/consolidation.js',
+  'lib/sleep.js',
   'lib/capture.js',
   'lib/recall.js',
   'lib/tools.js',
@@ -58,19 +60,37 @@ function transform(code) {
 const header = `// ⚠️ 本文件由 build.mjs 从 src/ 生成，请修改 src/ 下的源码后重新构建。
 // 生成命令：node build.mjs
 `
-const nodeImports = new Set()
+const nodeImportsByName = new Map()
+const nodeImportsOther = new Set()
 const chunks = []
 for (const relative of ORDER) {
   const file = join(src, relative)
   const source = readFileSync(file, 'utf8')
   const { code, nodeImports: imports } = transform(source)
-  for (const line of imports) nodeImports.add(line)
+  for (const line of imports) {
+    const match = /^import\s+\{([^}]*)\}\s+from\s+['"]((?:node:)[^'"]+)['"];?$/.exec(line)
+    if (match) {
+      const names = nodeImportsByName.get(match[2]) ?? new Set()
+      for (const raw of match[1].split(',')) {
+        const name = raw.trim()
+        if (name) names.add(name)
+      }
+      nodeImportsByName.set(match[2], names)
+    } else {
+      nodeImportsOther.add(line)
+    }
+  }
   chunks.push(`// ===== src/${relative} =====\n${code}`)
 }
 
+const mergedNodeImports = [...nodeImportsByName.entries()]
+  .sort((a, b) => a[0].localeCompare(b[0]))
+  .map(([specifier, names]) => `import { ${[...names].sort().join(', ')} } from '${specifier}'`)
+
 const output = [
   header,
-  ...[...nodeImports].sort(),
+  ...mergedNodeImports,
+  ...[...nodeImportsOther].sort(),
   '',
   ...chunks,
   '',

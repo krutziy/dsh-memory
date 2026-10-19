@@ -1,4 +1,4 @@
 {
   "title": "Long-term Memory",
-  "description": "Persistent memory for DSH with multiple OpenAI-compatible embedding providers and Qdrant: auto-capture/recall, memory manager, timezone-aware times, periodic maintenance."
+  "description": "Persistent memory for DSH with multiple OpenAI-compatible embedding providers and Qdrant: auto-capture/recall, memory manager, timezone-aware times, sleep consolidation and tiered compression, periodic maintenance."
 }

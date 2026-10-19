@@ -53,6 +53,8 @@ export class CaptureController {
   }
 
   observe(session, event) {
+    // 睡眠整理期间不记录（避免把 zzzZZ 对话写进长期记忆）
+    if (this.service.sleep?.isSleeping?.()) return
     const options = this.service.captureOptions()
     if (!options.autoCapture) return
     const sessionId = String(session?.id ?? '')

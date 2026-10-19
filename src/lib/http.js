@@ -9,6 +9,9 @@
  *   POST /__dsh_memory__/memories/delete     删除记忆 {ids:[...]}
  *   POST /__dsh_memory__/recreate            重建集合（需要 confirm:"DELETE"）
  *   POST /__dsh_memory__/maintenance         立即执行一次维护
+ *   GET  /__dsh_memory__/sleep               睡眠状态 + 整理任务列表摘要
+ *   POST /__dsh_memory__/sleep/run           手动触发一次睡眠整理
+ *   GET  /__dsh_memory__/consolidation       整理任务列表与历史
  *
  * POST 请求要求自定义头 x-dsh-memory: 1，避免跨站请求伪造（跨域预检会拦下）。
  */
@@ -101,6 +104,8 @@ export function registerHttpRoutes(ctx, service) {
             offset: query.get('offset') ?? null,
             kind: query.get('kind') ?? '',
             range: query.get('range') ?? '',
+            level: query.get('level') ?? '',
+            batch: query.get('batch') ?? '',
           })
           respond(res, 200, { ok: true, ...result })
           return
@@ -218,6 +223,64 @@ export function registerHttpRoutes(ctx, service) {
       }
     },
   }
+  const sleepRoute = {
+    kind: 'exact',
+    path: '/__dsh_memory__/sleep',
+    handler: async (req, res) => {
+      if (req.method !== 'GET') {
+        respond(res, 405, { ok: false, error: 'method not allowed' })
+        return
+      }
+      if (!service.sleep || !service.consolidation) {
+        respond(res, 503, { ok: false, error: '睡眠整理组件未加载' })
+        return
+      }
+      respond(res, 200, {
+        ok: true,
+        sleep: service.sleep.status(),
+        consolidation: service.consolidation.summary(),
+      })
+    },
+  }
+  const sleepRunRoute = {
+    kind: 'exact',
+    path: '/__dsh_memory__/sleep/run',
+    handler: async (req, res) => {
+      if (!trustedPost(req)) {
+        respond(res, 403, { ok: false, error: 'forbidden' })
+        return
+      }
+      if (!service.sleep) {
+        respond(res, 503, { ok: false, error: '睡眠整理组件未加载' })
+        return
+      }
+      try {
+        const body = await readJsonBody(req)
+        if (body?.confirm === 'run') {
+          respond(res, 200, service.sleep.requestManual())
+          return
+        }
+        respond(res, 200, service.sleep.requestManual())
+      } catch (error) {
+        respond(res, 500, { ok: false, error: errorText(error) })
+      }
+    },
+  }
+  const consolidationRoute = {
+    kind: 'exact',
+    path: '/__dsh_memory__/consolidation',
+    handler: async (req, res) => {
+      if (req.method !== 'GET') {
+        respond(res, 405, { ok: false, error: 'method not allowed' })
+        return
+      }
+      if (!service.consolidation) {
+        respond(res, 503, { ok: false, error: '整理引擎未加载' })
+        return
+      }
+      respond(res, 200, { ok: true, ...service.consolidation.summary() })
+    },
+  }
   const routes = [
     statusRoute,
     memoriesRoute,
@@ -226,6 +289,9 @@ export function registerHttpRoutes(ctx, service) {
     testRoute,
     recreateRoute,
     maintenanceRoute,
+    sleepRoute,
+    sleepRunRoute,
+    consolidationRoute,
   ]
   return routes.map((route) => ctx.effect(() => ctx.webServer.register(route), `dsh-memory: route ${route.path}`))
 }
