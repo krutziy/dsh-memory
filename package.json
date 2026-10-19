@@ -1,6 +1,6 @@
 {
   "name": "dsh-memory",
-  "version": "0.5.0",
+  "version": "0.6.0",
   "private": true,
   "description": "DSH 长期记忆插件（多 provider）：OpenAI 兼容的云端嵌入 + Qdrant 向量库，自动记录对话要点与图片概览、自动召回，提供 memory_search/save/forget 工具，并在设置页提供 provider 管理、记忆管理与定期维护。",
   "type": "module",

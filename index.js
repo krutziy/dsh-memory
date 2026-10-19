@@ -797,6 +797,21 @@ const Config = z.object({
     .description('召回/列表中显示相对时间（如“3 天前”）'),
 
   // -------------------- 图片 --------------------
+  captionSource: z
+    .string()
+    .default('dsh')
+    .volatile()
+    .description('图片概览模型来源：dsh=直接使用 DSH 已配置的模型；custom=使用插件自定义 provider'),
+  captionDshProvider: z
+    .string()
+    .default('')
+    .volatile()
+    .description('DSH 图片概览使用的 provider；留空使用 DSH 默认模型'),
+  captionDshModel: z
+    .string()
+    .default('')
+    .volatile()
+    .description('DSH 图片概览使用的模型；留空使用 DSH 默认模型（需支持图片输入）'),
   captionProviderId: z
     .string()
     .default('')
@@ -913,6 +928,26 @@ const Config = z.object({
     .max(1440)
     .volatile()
     .description('最近多少分钟内没有人类消息、且没有运行中的会话，才算空闲可以睡'),
+  consolidationSource: z
+    .string()
+    .default('dsh')
+    .volatile()
+    .description('整理模型来源：dsh=直接使用 DSH 已配置的模型；custom=使用插件自定义 provider'),
+  consolidationDshProvider: z
+    .string()
+    .default('')
+    .volatile()
+    .description('DSH 模型来源时使用的 provider；留空使用 DSH 默认模型'),
+  consolidationDshModel: z
+    .string()
+    .default('')
+    .volatile()
+    .description('DSH 模型来源时使用的模型；留空使用 DSH 默认模型'),
+  consolidationLimitItems: z
+    .boolean()
+    .default(false)
+    .volatile()
+    .description('是否限制每级整理输出的条数（默认关闭，由模型决定；开启后使用内部安全上限）'),
   consolidationProviderId: z
     .string()
     .default('')
@@ -1610,6 +1645,187 @@ class MemoryService {
     return { baseUrl: normalizeUrl(base), model: String(provider?.visionModel ?? '').trim(), ref }
   }
 
+  /** DSH 已配置的 LLM provider 列表（合并可配置目录与当前 live 路由）。 */
+  async dshProviders() {
+    let configurable = []
+    let live = []
+    try {
+      configurable = await this.ctx.llm.listConfigurableProviders()
+    } catch { /* ignore */ }
+    try {
+      live = await this.ctx.llm.listProviders()
+    } catch { /* ignore */ }
+    const providers = []
+    const seen = new Set()
+    for (const entry of configurable ?? []) {
+      const id = String(entry?.provider ?? '').trim()
+      if (!id || seen.has(id)) continue
+      seen.add(id)
+      providers.push({
+        id,
+        name: String(entry?.displayName ?? id),
+        settingsNs: String(entry?.settingsNs ?? ''),
+        declared: entry?.declared === true,
+        live: (live ?? []).some((item) => item.id === id),
+      })
+    }
+    for (const entry of live ?? []) {
+      const id = String(entry?.id ?? '').trim()
+      if (!id || seen.has(id)) continue
+      seen.add(id)
+      providers.push({ id, name: String(entry?.name ?? id), settingsNs: '', declared: false, live: true })
+    }
+    return providers
+  }
+
+  /** DSH 模型目录：providers + 每个 live provider 的模型 + 当前默认模型。 */
+  async dshCatalog() {
+    const providers = await this.dshProviders()
+    const models = {}
+    for (const provider of providers) {
+      if (!provider.live) continue
+      try {
+        models[provider.id] = (await this.ctx.llm.listModels(provider.id)).map((item) => ({
+          id: String(item?.id ?? ''),
+          name: String(item?.name ?? item?.id ?? ''),
+          inputModalities: Array.isArray(item?.inputModalities) ? item.inputModalities.map(String) : [],
+        }))
+      } catch (error) {
+        models[provider.id] = []
+      }
+    }
+    let defaultModel = null
+    try {
+      const selection = this.ctx.agentDefaultModel?.currentSelection?.()
+      defaultModel = selection ? { provider: selection.provider, model: selection.model } : null
+    } catch { /* ignore */ }
+    return { providers, models, defaultModel }
+  }
+
+  /** 当前 DSH 默认模型选择（provider/model）。 */
+  dshDefaultSelection() {
+    try {
+      const selection = this.ctx.agentDefaultModel?.currentSelection?.()
+      if (selection?.provider && selection?.model) return { provider: String(selection.provider), model: String(selection.model) }
+    } catch { /* ignore */ }
+    return null
+  }
+
+  /** 功能模型目标：优先读配置，留空回退 DSH 默认模型。 */
+  dshTarget(provider, model, fallbackSelection = this.dshDefaultSelection()) {
+    const providerId = String(provider ?? '').trim() || String(fallbackSelection?.provider ?? '')
+    const modelId = String(model ?? '').trim() || String(fallbackSelection?.model ?? '')
+    return { providerId, modelId }
+  }
+
+  /** 通过 DSH LLM 服务调用一次对话补全（流式聚合为文本）。 */
+  async dshChat({ provider, model, system, messages, maxTokens = 1024, temperature = 0.3, reasoningEffort = 'off', signal }) {
+    if (!this.ctx.llm || typeof this.ctx.llm.stream !== 'function') {
+      throw new Error('DSH LLM 服务不可用')
+    }
+    const target = this.dshTarget(provider, model)
+    if (!target.providerId || !target.modelId) throw new Error('尚未选择 DSH 模型')
+    const startedAt = Date.now()
+    const parts = []
+    let usage = null
+    let finish = null
+    const requestMessages = (messages ?? []).map((message) => ({
+      role: message.role,
+      content:
+        typeof message.content === 'string'
+          ? [{ type: 'text', text: message.content }]
+          : (message.content ?? []).map((block) =>
+              typeof block === 'string' ? { type: 'text', text: block } : block,
+            ),
+    }))
+    const stream = this.ctx.llm.stream({
+      provider: target.providerId,
+      model: target.modelId,
+      system,
+      messages: requestMessages,
+      maxTokens,
+      temperature,
+      reasoningEffort,
+      signal,
+    })
+    for await (const chunk of stream) {
+      if (!chunk) continue
+      if (chunk.type === 'text-delta') parts.push(chunk.text ?? '')
+      else if (chunk.type === 'block-end' && chunk.block?.type === 'text') parts.push(chunk.block.text ?? '')
+      else if (chunk.type === 'usage') usage = chunk.usage ?? null
+      else if (chunk.type === 'finish') finish = chunk.reason ?? null
+    }
+    if (finish?.kind === 'error' || finish?.kind === 'aborted') {
+      const failure = finish.failure
+      throw new Error(`DSH 模型调用失败：${failure?.message ?? failure?.code ?? finish.kind}`)
+    }
+    const text = parts.join('').trim()
+    if (!text) throw new Error('DSH 模型返回为空')
+    return {
+      text,
+      latencyMs: Date.now() - startedAt,
+      usage,
+      provider: target.providerId,
+      model: target.modelId,
+      source: 'dsh',
+    }
+  }
+
+  /** 通过 DSH LLM 服务做图片概览（图片以 attachment block 传入）。 */
+  async dshCaption({ provider, model, ref, prompt, maxTokens = 300, signal }) {
+    if (!ref) throw new Error('缺少图片附件引用')
+    return this.dshChat({
+      provider,
+      model,
+      maxTokens,
+      temperature: 0.2,
+      reasoningEffort: 'off',
+      signal,
+      messages: [
+        {
+          role: 'user',
+          content: [
+            { type: 'text', text: prompt },
+            { type: 'image', attachment: ref },
+          ],
+        },
+      ],
+    })
+  }
+
+  /** 整理/摘要调用：DSH 模型或插件自定义 provider 二选一。 */
+  async consolidationChat({ system, messages = [], maxTokens = 1024, temperature = 0.3, signal }) {
+    const cfg = this.cfg()
+    const source = cfg.consolidationSource === 'custom' ? 'custom' : 'dsh'
+    if (source === 'dsh') {
+      const target = this.dshTarget(cfg.consolidationDshProvider, cfg.consolidationDshModel)
+      if (target.providerId && target.modelId) {
+        return this.dshChat({
+          provider: target.providerId,
+          model: target.modelId,
+          system,
+          messages,
+          maxTokens,
+          temperature,
+          reasoningEffort: 'off',
+          signal,
+        })
+      }
+      throw new Error('DSH 默认模型不可用（请在 DSH 设置 → 模型 中配置）')
+    }
+    const llm = await this.consolidationClient()
+    if (!llm) throw new Error('未配置自定义整理模型')
+    const response = await llm.client.chat({ model: llm.model, messages, maxTokens, temperature, signal })
+    return {
+      text: response.text,
+      latencyMs: response.latencyMs,
+      usage: response.usage,
+      provider: llm.provider.id,
+      model: llm.model,
+      source: 'custom',
+    }
+  }
+
   /** 图片概览的目标 provider / 模型（支持在“模型列表”里单独指定）。 */
   captionTarget() {
     const cfg = this.cfg()
@@ -1937,7 +2153,8 @@ class MemoryService {
   async addImageMemory({ ref, sessionId, cwd, turn }) {
     const image = this.imageOptions()
     if (image.imageMode === 'off') return { ok: false, skipped: 'image-mode-off' }
-    const { provider, vision, model: captionModel } = this.captionTarget()
+    const cfg = this.cfg()
+    const source = cfg.captionSource === 'custom' ? 'custom' : 'dsh'
     const mediaType = ref?.mediaType || 'image/png'
     const imageMeta = {
       mediaType: String(mediaType),
@@ -1946,23 +2163,51 @@ class MemoryService {
     }
     let text
     let caption = null
-    if (image.imageMode === 'caption' && captionModel) {
-      try {
-        const stored = await this.ctx.attachments.readImage(ref)
-        const dataUri = toDataUri(stored?.data ?? stored, mediaType)
-        const client = await this.clientFor(provider)
-        client.visionModel = captionModel
-        const result = await client.captionImage(dataUri, {
-          prompt: image.captionPrompt,
-          maxTokens: image.captionMaxTokens,
-        })
-        caption = cleanText(result.text)
-        text = `图片概览：${caption || '（模型未返回描述）'}`
-        this.stats.captions += 1
-      } catch (error) {
-        this.logger.warn?.(`[dsh-memory] 图片概览失败，降级为占位记录：${errorText(error)}`)
-        text = '用户发送了一张图片（概览生成失败，仅记录图片存在）'
+    if (image.imageMode === 'caption') {
+      // 优先：DSH 已配置的模型（图片以 attachment block 传入，无需额外 Key）
+      if (source === 'dsh') {
+        try {
+          const target = this.dshTarget(cfg.captionDshProvider, cfg.captionDshModel)
+          if (!target.providerId || !target.modelId) throw new Error('DSH 默认模型不可用')
+          const result = await this.dshCaption({
+            provider: target.providerId,
+            model: target.modelId,
+            ref,
+            prompt: image.captionPrompt,
+            maxTokens: Math.max(300, image.captionMaxTokens),
+          })
+          caption = cleanText(result.text)
+          this.stats.captions += 1
+        } catch (error) {
+          this.logger.warn?.(`[dsh-memory] DSH 图片概览失败，尝试自定义 provider：${errorText(error)}`)
+        }
       }
+      // 回退：插件自定义 provider 的视觉模型
+      if (!caption) {
+        const { provider, vision, model: customModel } = this.captionTarget()
+        if (customModel) {
+          try {
+            const stored = await this.ctx.attachments.readImage(ref)
+            const dataUri = toDataUri(stored?.data ?? stored, mediaType)
+            const client = await this.clientFor(provider)
+            client.visionModel = customModel
+            void vision
+            const result = await client.captionImage(dataUri, {
+              prompt: image.captionPrompt,
+              maxTokens: image.captionMaxTokens,
+            })
+            caption = cleanText(result.text)
+            this.stats.captions += 1
+          } catch (error) {
+            this.logger.warn?.(`[dsh-memory] 图片概览失败，降级为占位记录：${errorText(error)}`)
+          }
+        } else {
+          this.logger.warn?.('[dsh-memory] 图片概览没有可用模型（DSH 模型不可用且未配置自定义视觉模型）')
+        }
+      }
+      text = caption
+        ? `图片概览：${caption}`
+        : '用户发送了一张图片（概览生成失败，仅记录图片存在）'
     } else {
       text = '用户发送了一张图片（未解析图片内容）'
     }
@@ -2529,7 +2774,7 @@ class MemoryService {
       ok: true,
       app: {
         name: 'dsh-memory',
-        version: '0.5.0',
+        version: '0.6.0',
         startedAt: this.stats.startedAt,
       },
       time: (() => {
@@ -2557,29 +2802,61 @@ class MemoryService {
       providers: [],
       storage: { ...storage },
       functions: (() => {
-        const caption = this.captionTarget()
-        let consolidationProvider = null
-        let consolidationModel = String(this.cfg().consolidationModel ?? '').trim()
-        try {
-          consolidationProvider = this.cfg().consolidationProviderId
-            ? this.providerById(this.cfg().consolidationProviderId)
-            : this.activeProvider()
-        } catch {
-          consolidationProvider = null
+        const cfg = this.cfg()
+        const captionSource = cfg.captionSource === 'custom' ? 'custom' : 'dsh'
+        let caption
+        if (captionSource === 'dsh') {
+          const target = this.dshTarget(cfg.captionDshProvider, cfg.captionDshModel)
+          caption = {
+            source: 'dsh',
+            providerId: target.providerId,
+            providerName: target.providerId,
+            model: target.modelId,
+            configured: Boolean(target.providerId && target.modelId),
+          }
+        } else {
+          const custom = this.captionTarget()
+          caption = {
+            source: 'custom',
+            providerId: custom.provider?.id ?? '',
+            providerName: custom.provider?.name ?? '',
+            model: custom.model,
+            configured: Boolean(custom.model),
+          }
+        }
+        const consolidationSource = cfg.consolidationSource === 'custom' ? 'custom' : 'dsh'
+        let consolidation
+        if (consolidationSource === 'dsh') {
+          const target = this.dshTarget(cfg.consolidationDshProvider, cfg.consolidationDshModel)
+          consolidation = {
+            source: 'dsh',
+            providerId: target.providerId,
+            providerName: target.providerId,
+            model: target.modelId,
+            configured: Boolean(target.providerId && target.modelId),
+          }
+        } else {
+          let customProvider = null
+          try {
+            customProvider = cfg.consolidationProviderId
+              ? this.providerById(cfg.consolidationProviderId)
+              : this.activeProvider()
+          } catch {
+            customProvider = null
+          }
+          consolidation = {
+            source: 'custom',
+            providerId: customProvider?.id ?? '',
+            providerName: customProvider?.name ?? '',
+            model: String(cfg.consolidationModel ?? '').trim(),
+            configured: Boolean(String(cfg.consolidationModel ?? '').trim()),
+          }
         }
         return {
           embedding: { providerId: provider.id, model: provider.embedModel, dimensions: provider.dimensions },
-          caption: {
-            providerId: caption.provider?.id ?? '',
-            providerName: caption.provider?.name ?? '',
-            model: caption.model,
-            configured: Boolean(caption.model),
-          },
-          consolidation: {
-            providerId: consolidationProvider?.id ?? '',
-            providerName: consolidationProvider?.name ?? '',
-            model: consolidationModel,
-          },
+          caption,
+          consolidation,
+          limitItems: cfg.consolidationLimitItems === true,
         }
       })(),
       behavior: {
@@ -2823,12 +3100,14 @@ class ConsolidationEngine {
 
   /** 配置级别定义（level1 为每日原始记忆压缩，level2/3 为后续批次压缩）。 */
   stages() {
-    // 保留条数交由模型按内容重要性决定；这里只保留安全上限（防止模型输出失控）。
+    // 默认不限制输出条数，由整理模型按内容重要性自行决定；
+    // 只有在设置页显式开启「限制每级整理条数」时才套用内部安全上限。
     // 7 天 / 30 天的触发间隔是固定的整理节奏，未来要扩展更多级只需在数组里追加。
+    const limitEnabled = this.service.cfg().consolidationLimitItems === true
     return [
-      { level: 1, maxItems: 40, afterDays: 0 },
-      { level: 2, maxItems: 20, afterDays: 7 },
-      { level: 3, maxItems: 10, afterDays: 30 },
+      { level: 1, maxItems: limitEnabled ? 40 : null, afterDays: 0 },
+      { level: 2, maxItems: limitEnabled ? 20 : null, afterDays: 7 },
+      { level: 3, maxItems: limitEnabled ? 10 : null, afterDays: 30 },
     ]
   }
 
@@ -3137,11 +3416,9 @@ class ConsolidationEngine {
       let llmCalls = 0
       let latencyMs = 0
       try {
-        const llm = await this.service.consolidationClient()
-        if (!llm) throw new Error('no-consolidation-model')
         const partials = []
         for (const chunk of chunks) {
-          const partial = await this.#callLLM(llm, {
+          const partial = await this.#callLLM({
             level,
             stage,
             items: chunk,
@@ -3153,7 +3430,7 @@ class ConsolidationEngine {
           llmCalls += 1
           latencyMs += partial.latencyMs ?? 0
         }
-        combined = partials.length === 1 ? partials[0].data : await this.#mergePartials(llm, partials, stage)
+        combined = partials.length === 1 ? partials[0].data : await this.#mergePartials(partials, stage)
         if (partials.length > 1) {
           llmCalls += 1
           latencyMs += combined?.latencyMs ?? 0
@@ -3171,9 +3448,10 @@ class ConsolidationEngine {
       const facts = Array.isArray(combined?.facts) ? combined.facts : []
       const event = combined?.event && typeof combined.event === 'object' ? combined.event : null
 
-      // 保留条数由模型决定；这里只兜底安全上限，避免模型异常输出过多条目。
-      const maxItems = Math.max(1, stage.maxItems ?? 20)
-      const factLimit = Math.max(0, maxItems - (summary ? 1 : 0))
+      // 默认保留条数由模型决定；只有开启「限制每级整理条数」时才截断。
+      const limitEnabled = Number.isFinite(stage.maxItems)
+      const maxItems = limitEnabled ? Math.max(1, stage.maxItems) : null
+      const factLimit = limitEnabled ? Math.max(0, maxItems - (summary ? 1 : 0)) : Infinity
       const selectedFacts = facts
         .filter((fact) => fact && typeof fact.text === 'string' && fact.text.trim())
         .slice(0, factLimit)
@@ -3187,11 +3465,16 @@ class ConsolidationEngine {
       if (summary) entries.push({ text: summary, kind: 'summary', tags: ['summary'] })
       for (const fact of selectedFacts) entries.push(fact)
       if (entries.length === 0) entries.push({ text: rendered.slice(0, Math.max(80, Math.min(400, rendered.length))), kind: 'note', tags: ['fallback'] })
-      if (event?.summary && String(event.summary).trim()) {
+      const eventText = event?.summary && String(event.summary).trim()
+        ? String(event.summary).trim()
+        : related.length > 0
+          ? `相关事件：${summary || related[0].text}`.slice(0, 500)
+          : ''
+      if (eventText) {
         entries.push({
-          text: String(event.summary).trim(),
+          text: eventText,
           kind: 'event',
-          tags: Array.isArray(event.tags) ? event.tags.map(String).slice(0, 8) : ['event'],
+          tags: Array.isArray(event?.tags) ? event.tags.map(String).slice(0, 8) : ['event'],
         })
       }
 
@@ -3211,13 +3494,16 @@ class ConsolidationEngine {
 
       const written = []
       try {
-        for (const entry of entries) {
+        for (const [index, entry] of entries.entries()) {
           const saved = await this.service.addMemory({
             kind: entry.kind === 'summary' ? 'summary' : entry.kind,
             text: entry.text,
             meta: {
               ...baseMeta,
               tags: entry.tags,
+              // 批次内唯一：避免整理产物的内容哈希与原文（或彼此）相同，
+              // 导致“先写入、再删除原文”把新产物一起删掉。
+              idSeed: `sleep-${batchId}-${index}`,
             },
           })
           written.push(saved)
@@ -3347,18 +3633,22 @@ class ConsolidationEngine {
     return [...related.values()].slice(0, maxCandidates)
   }
 
-  /** 调一次整理 LLM。 */
-  async #callLLM(llm, { level, stage, items, rendered, related, isFirst }) {
+  /** 调一次整理 LLM（DSH 模型或自定义 provider，由 service 路由）。 */
+  async #callLLM({ level, stage, items, rendered, related, isFirst }) {
     const cfg = this.service.cfg()
-    const maxFacts = Math.max(1, (stage?.maxItems ?? 20) - 1)
+    const limitEnabled = Number.isFinite(stage?.maxItems)
+    const maxFacts = limitEnabled ? Math.max(1, stage.maxItems - 1) : null
     const relatedText = isFirst && related.length > 0
       ? `\n\n【可能相关的其他事件记忆（仅参考，不要删除/编造，可合并同一事件的信息）】\n${renderMemoryLines(related, 6000, (item) => `- [${this.service.formatTs(item.ts)}·${item.kind}${item.batch ? ' #' + item.batch : ''}] ${item.text.slice(0, 500)}`)}`
       : ''
     const customPrompt = String(cfg.consolidationPrompt ?? '').trim()
     const system = customPrompt || DEFAULT_PROMPT
+    const countRule = limitEnabled
+      ? `请输出 JSON：summary、facts（条数由你按重要性决定，最多 ${maxFacts} 条）、可选 event。`
+      : '请输出 JSON：summary、facts（条数由你按重要性自行决定）、可选 event。'
     const user = [
       `这是第 ${level} 级记忆整理。本批共 ${items.length} 条记忆。`,
-      `请输出 JSON：summary、facts（条数由你按重要性决定，最多 ${maxFacts} 条）、可选 event。`,
+      countRule,
       '精简是默认目标：优先保留关键事实、偏好、决定、时间和人名；重复、寒暄和流水账直接丢弃。',
       '',
       '【本批记忆】',
@@ -3366,13 +3656,10 @@ class ConsolidationEngine {
       relatedText,
     ].join('\n')
     const startedAt = Date.now()
-    const response = await llm.client.chat({
-      model: llm.model,
-      messages: [
-        { role: 'system', content: system },
-        { role: 'user', content: user },
-      ],
-      maxTokens: level >= 3 ? 2048 : level === 2 ? 1536 : 1024,
+    const response = await this.service.consolidationChat({
+      system,
+      messages: [{ role: 'user', content: user }],
+      maxTokens: level >= 3 ? 4096 : level === 2 ? 3072 : 2048,
       temperature: 0.2,
     })
     const parsed = extractJson(response.text)
@@ -3388,28 +3675,23 @@ class ConsolidationEngine {
       latencyMs: response.latencyMs ?? Date.now() - startedAt,
       raw: response.text,
       usage: response.usage ?? null,
+      modelSource: response.source ?? '',
+      model: response.model ?? '',
     }
   }
 
   /** 多块结果合并。 */
-  async #mergePartials(llm, partials, stage) {
+  async #mergePartials(partials, stage) {
     const summaries = partials.map((partial, index) => `## 分块 ${index + 1}\n${JSON.stringify(partial.data)}`).join('\n\n')
     const startedAt = Date.now()
     try {
-      const response = await llm.client.chat({
-        model: llm.model,
-        messages: [
-          {
-            role: 'system',
-            content:
-              '你在合并多个记忆整理分块的结果。请合并去重，输出同样格式的严格 JSON：{"summary":"...","facts":[...],"event":{...}}；facts 不要超过上限。',
-          },
-          {
-            role: 'user',
-            content: `facts 上限 ${Math.max(1, (stage?.maxItems ?? 20) - 1)}。\n\n${summaries}`,
-          },
-        ],
-        maxTokens: 2048,
+      const limitEnabled = Number.isFinite(stage?.maxItems)
+      const limitRule = limitEnabled ? `facts 上限 ${Math.max(1, stage.maxItems - 1)}。` : 'facts 条数由你按重要性决定。'
+      const response = await this.service.consolidationChat({
+        system:
+          '你在合并多个记忆整理分块的结果。请合并去重，输出同样格式的严格 JSON：{"summary":"...","facts":[...],"event":{...}}。',
+        messages: [{ role: 'user', content: `${limitRule}\n\n${summaries}` }],
+        maxTokens: 3072,
         temperature: 0.2,
       })
       const parsed = extractJson(response.text)
@@ -3447,7 +3729,7 @@ class ConsolidationEngine {
 
   /** 纯规则压缩（LLM 不可用时的回退）。 */
   #ruleCompress(chunks, stage) {
-    const maxItems = Math.max(1, stage?.maxItems ?? 12)
+    const maxItems = Number.isFinite(stage?.maxItems) ? Math.max(1, stage.maxItems) : Infinity
     const facts = []
     const seen = new Set()
     for (const chunk of chunks) {
@@ -4646,9 +4928,24 @@ function registerHttpRoutes(ctx, service) {
       }
     },
   }
+  const dshModelsRoute = {
+    kind: 'exact',
+    path: '/__dsh_memory__/dsh-models',
+    handler: async (req, res) => {
+      if (req.method !== 'GET') {
+        respond(res, 405, { ok: false, error: 'method not allowed' })
+        return
+      }
+      try {
+        respond(res, 200, { ok: true, ...(await service.dshCatalog()) })
+      } catch (error) {
+        respond(res, 500, { ok: false, error: errorText(error) })
+      }
+    },
+  }
+
   const routes = [
     statusRoute,
-    modelsRoute,
     memoriesRoute,
     memoriesDeleteRoute,
     exportRoute,
@@ -4658,6 +4955,8 @@ function registerHttpRoutes(ctx, service) {
     sleepRoute,
     sleepRunRoute,
     consolidationRoute,
+    modelsRoute,
+    dshModelsRoute,
   ]
   return routes.map((route) => ctx.effect(() => ctx.webServer.register(route), `dsh-memory: route ${route.path}`))
 }
@@ -4685,7 +4984,7 @@ function registerHttpRoutes(ctx, service) {
 const name = 'dsh-memory'
 
 /** 需要的 Host 服务；缺任意一个时插件保持未激活，而不是报错。 */
-const inject = ['tools', 'systemPrompt', 'webServer', 'credentials', 'attachments', 'sessions', 'timer', 'agents']
+const inject = ['tools', 'systemPrompt', 'webServer', 'credentials', 'attachments', 'sessions', 'timer', 'agents', 'llm', 'agentDefaultModel']
 
 
 /** 注入系统提示词的长期记忆使用说明。 */
@@ -4772,7 +5071,7 @@ function apply(ctx, config) {
 
   const provider = service.activeProvider()
   logger.info?.(
-    `[dsh-memory] 已加载 v0.5.0：provider=${provider.id}（${provider.embedModel}，${provider.dimensions} 维）→ Qdrant ${service.storage().qdrantUrl} / ${service.storage().collection}`,
+    `[dsh-memory] 已加载 v0.6.0：provider=${provider.id}（${provider.embedModel}，${provider.dimensions} 维）→ Qdrant ${service.storage().qdrantUrl} / ${service.storage().collection}`,
   )
 
   // 6) 启动自检：确保 collection 存在（失败只告警，不阻塞 DSH 启动），并补齐旧记忆标签

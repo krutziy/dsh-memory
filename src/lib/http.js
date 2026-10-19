@@ -298,9 +298,24 @@ export function registerHttpRoutes(ctx, service) {
       }
     },
   }
+  const dshModelsRoute = {
+    kind: 'exact',
+    path: '/__dsh_memory__/dsh-models',
+    handler: async (req, res) => {
+      if (req.method !== 'GET') {
+        respond(res, 405, { ok: false, error: 'method not allowed' })
+        return
+      }
+      try {
+        respond(res, 200, { ok: true, ...(await service.dshCatalog()) })
+      } catch (error) {
+        respond(res, 500, { ok: false, error: errorText(error) })
+      }
+    },
+  }
+
   const routes = [
     statusRoute,
-    modelsRoute,
     memoriesRoute,
     memoriesDeleteRoute,
     exportRoute,
@@ -310,6 +325,8 @@ export function registerHttpRoutes(ctx, service) {
     sleepRoute,
     sleepRunRoute,
     consolidationRoute,
+    modelsRoute,
+    dshModelsRoute,
   ]
   return routes.map((route) => ctx.effect(() => ctx.webServer.register(route), `dsh-memory: route ${route.path}`))
 }

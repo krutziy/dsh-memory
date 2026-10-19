@@ -190,6 +190,187 @@ export class MemoryService {
     return { baseUrl: normalizeUrl(base), model: String(provider?.visionModel ?? '').trim(), ref }
   }
 
+  /** DSH 已配置的 LLM provider 列表（合并可配置目录与当前 live 路由）。 */
+  async dshProviders() {
+    let configurable = []
+    let live = []
+    try {
+      configurable = await this.ctx.llm.listConfigurableProviders()
+    } catch { /* ignore */ }
+    try {
+      live = await this.ctx.llm.listProviders()
+    } catch { /* ignore */ }
+    const providers = []
+    const seen = new Set()
+    for (const entry of configurable ?? []) {
+      const id = String(entry?.provider ?? '').trim()
+      if (!id || seen.has(id)) continue
+      seen.add(id)
+      providers.push({
+        id,
+        name: String(entry?.displayName ?? id),
+        settingsNs: String(entry?.settingsNs ?? ''),
+        declared: entry?.declared === true,
+        live: (live ?? []).some((item) => item.id === id),
+      })
+    }
+    for (const entry of live ?? []) {
+      const id = String(entry?.id ?? '').trim()
+      if (!id || seen.has(id)) continue
+      seen.add(id)
+      providers.push({ id, name: String(entry?.name ?? id), settingsNs: '', declared: false, live: true })
+    }
+    return providers
+  }
+
+  /** DSH 模型目录：providers + 每个 live provider 的模型 + 当前默认模型。 */
+  async dshCatalog() {
+    const providers = await this.dshProviders()
+    const models = {}
+    for (const provider of providers) {
+      if (!provider.live) continue
+      try {
+        models[provider.id] = (await this.ctx.llm.listModels(provider.id)).map((item) => ({
+          id: String(item?.id ?? ''),
+          name: String(item?.name ?? item?.id ?? ''),
+          inputModalities: Array.isArray(item?.inputModalities) ? item.inputModalities.map(String) : [],
+        }))
+      } catch (error) {
+        models[provider.id] = []
+      }
+    }
+    let defaultModel = null
+    try {
+      const selection = this.ctx.agentDefaultModel?.currentSelection?.()
+      defaultModel = selection ? { provider: selection.provider, model: selection.model } : null
+    } catch { /* ignore */ }
+    return { providers, models, defaultModel }
+  }
+
+  /** 当前 DSH 默认模型选择（provider/model）。 */
+  dshDefaultSelection() {
+    try {
+      const selection = this.ctx.agentDefaultModel?.currentSelection?.()
+      if (selection?.provider && selection?.model) return { provider: String(selection.provider), model: String(selection.model) }
+    } catch { /* ignore */ }
+    return null
+  }
+
+  /** 功能模型目标：优先读配置，留空回退 DSH 默认模型。 */
+  dshTarget(provider, model, fallbackSelection = this.dshDefaultSelection()) {
+    const providerId = String(provider ?? '').trim() || String(fallbackSelection?.provider ?? '')
+    const modelId = String(model ?? '').trim() || String(fallbackSelection?.model ?? '')
+    return { providerId, modelId }
+  }
+
+  /** 通过 DSH LLM 服务调用一次对话补全（流式聚合为文本）。 */
+  async dshChat({ provider, model, system, messages, maxTokens = 1024, temperature = 0.3, reasoningEffort = 'off', signal }) {
+    if (!this.ctx.llm || typeof this.ctx.llm.stream !== 'function') {
+      throw new Error('DSH LLM 服务不可用')
+    }
+    const target = this.dshTarget(provider, model)
+    if (!target.providerId || !target.modelId) throw new Error('尚未选择 DSH 模型')
+    const startedAt = Date.now()
+    const parts = []
+    let usage = null
+    let finish = null
+    const requestMessages = (messages ?? []).map((message) => ({
+      role: message.role,
+      content:
+        typeof message.content === 'string'
+          ? [{ type: 'text', text: message.content }]
+          : (message.content ?? []).map((block) =>
+              typeof block === 'string' ? { type: 'text', text: block } : block,
+            ),
+    }))
+    const stream = this.ctx.llm.stream({
+      provider: target.providerId,
+      model: target.modelId,
+      system,
+      messages: requestMessages,
+      maxTokens,
+      temperature,
+      reasoningEffort,
+      signal,
+    })
+    for await (const chunk of stream) {
+      if (!chunk) continue
+      if (chunk.type === 'text-delta') parts.push(chunk.text ?? '')
+      else if (chunk.type === 'block-end' && chunk.block?.type === 'text') parts.push(chunk.block.text ?? '')
+      else if (chunk.type === 'usage') usage = chunk.usage ?? null
+      else if (chunk.type === 'finish') finish = chunk.reason ?? null
+    }
+    if (finish?.kind === 'error' || finish?.kind === 'aborted') {
+      const failure = finish.failure
+      throw new Error(`DSH 模型调用失败：${failure?.message ?? failure?.code ?? finish.kind}`)
+    }
+    const text = parts.join('').trim()
+    if (!text) throw new Error('DSH 模型返回为空')
+    return {
+      text,
+      latencyMs: Date.now() - startedAt,
+      usage,
+      provider: target.providerId,
+      model: target.modelId,
+      source: 'dsh',
+    }
+  }
+
+  /** 通过 DSH LLM 服务做图片概览（图片以 attachment block 传入）。 */
+  async dshCaption({ provider, model, ref, prompt, maxTokens = 300, signal }) {
+    if (!ref) throw new Error('缺少图片附件引用')
+    return this.dshChat({
+      provider,
+      model,
+      maxTokens,
+      temperature: 0.2,
+      reasoningEffort: 'off',
+      signal,
+      messages: [
+        {
+          role: 'user',
+          content: [
+            { type: 'text', text: prompt },
+            { type: 'image', attachment: ref },
+          ],
+        },
+      ],
+    })
+  }
+
+  /** 整理/摘要调用：DSH 模型或插件自定义 provider 二选一。 */
+  async consolidationChat({ system, messages = [], maxTokens = 1024, temperature = 0.3, signal }) {
+    const cfg = this.cfg()
+    const source = cfg.consolidationSource === 'custom' ? 'custom' : 'dsh'
+    if (source === 'dsh') {
+      const target = this.dshTarget(cfg.consolidationDshProvider, cfg.consolidationDshModel)
+      if (target.providerId && target.modelId) {
+        return this.dshChat({
+          provider: target.providerId,
+          model: target.modelId,
+          system,
+          messages,
+          maxTokens,
+          temperature,
+          reasoningEffort: 'off',
+          signal,
+        })
+      }
+      throw new Error('DSH 默认模型不可用（请在 DSH 设置 → 模型 中配置）')
+    }
+    const llm = await this.consolidationClient()
+    if (!llm) throw new Error('未配置自定义整理模型')
+    const response = await llm.client.chat({ model: llm.model, messages, maxTokens, temperature, signal })
+    return {
+      text: response.text,
+      latencyMs: response.latencyMs,
+      usage: response.usage,
+      provider: llm.provider.id,
+      model: llm.model,
+      source: 'custom',
+    }
+  }
+
   /** 图片概览的目标 provider / 模型（支持在“模型列表”里单独指定）。 */
   captionTarget() {
     const cfg = this.cfg()
@@ -517,7 +698,8 @@ export class MemoryService {
   async addImageMemory({ ref, sessionId, cwd, turn }) {
     const image = this.imageOptions()
     if (image.imageMode === 'off') return { ok: false, skipped: 'image-mode-off' }
-    const { provider, vision, model: captionModel } = this.captionTarget()
+    const cfg = this.cfg()
+    const source = cfg.captionSource === 'custom' ? 'custom' : 'dsh'
     const mediaType = ref?.mediaType || 'image/png'
     const imageMeta = {
       mediaType: String(mediaType),
@@ -526,23 +708,51 @@ export class MemoryService {
     }
     let text
     let caption = null
-    if (image.imageMode === 'caption' && captionModel) {
-      try {
-        const stored = await this.ctx.attachments.readImage(ref)
-        const dataUri = toDataUri(stored?.data ?? stored, mediaType)
-        const client = await this.clientFor(provider)
-        client.visionModel = captionModel
-        const result = await client.captionImage(dataUri, {
-          prompt: image.captionPrompt,
-          maxTokens: image.captionMaxTokens,
-        })
-        caption = cleanText(result.text)
-        text = `图片概览：${caption || '（模型未返回描述）'}`
-        this.stats.captions += 1
-      } catch (error) {
-        this.logger.warn?.(`[dsh-memory] 图片概览失败，降级为占位记录：${errorText(error)}`)
-        text = '用户发送了一张图片（概览生成失败，仅记录图片存在）'
+    if (image.imageMode === 'caption') {
+      // 优先：DSH 已配置的模型（图片以 attachment block 传入，无需额外 Key）
+      if (source === 'dsh') {
+        try {
+          const target = this.dshTarget(cfg.captionDshProvider, cfg.captionDshModel)
+          if (!target.providerId || !target.modelId) throw new Error('DSH 默认模型不可用')
+          const result = await this.dshCaption({
+            provider: target.providerId,
+            model: target.modelId,
+            ref,
+            prompt: image.captionPrompt,
+            maxTokens: Math.max(300, image.captionMaxTokens),
+          })
+          caption = cleanText(result.text)
+          this.stats.captions += 1
+        } catch (error) {
+          this.logger.warn?.(`[dsh-memory] DSH 图片概览失败，尝试自定义 provider：${errorText(error)}`)
+        }
       }
+      // 回退：插件自定义 provider 的视觉模型
+      if (!caption) {
+        const { provider, vision, model: customModel } = this.captionTarget()
+        if (customModel) {
+          try {
+            const stored = await this.ctx.attachments.readImage(ref)
+            const dataUri = toDataUri(stored?.data ?? stored, mediaType)
+            const client = await this.clientFor(provider)
+            client.visionModel = customModel
+            void vision
+            const result = await client.captionImage(dataUri, {
+              prompt: image.captionPrompt,
+              maxTokens: image.captionMaxTokens,
+            })
+            caption = cleanText(result.text)
+            this.stats.captions += 1
+          } catch (error) {
+            this.logger.warn?.(`[dsh-memory] 图片概览失败，降级为占位记录：${errorText(error)}`)
+          }
+        } else {
+          this.logger.warn?.('[dsh-memory] 图片概览没有可用模型（DSH 模型不可用且未配置自定义视觉模型）')
+        }
+      }
+      text = caption
+        ? `图片概览：${caption}`
+        : '用户发送了一张图片（概览生成失败，仅记录图片存在）'
     } else {
       text = '用户发送了一张图片（未解析图片内容）'
     }
@@ -1109,7 +1319,7 @@ export class MemoryService {
       ok: true,
       app: {
         name: 'dsh-memory',
-        version: '0.5.0',
+        version: '0.6.0',
         startedAt: this.stats.startedAt,
       },
       time: (() => {
@@ -1137,29 +1347,61 @@ export class MemoryService {
       providers: [],
       storage: { ...storage },
       functions: (() => {
-        const caption = this.captionTarget()
-        let consolidationProvider = null
-        let consolidationModel = String(this.cfg().consolidationModel ?? '').trim()
-        try {
-          consolidationProvider = this.cfg().consolidationProviderId
-            ? this.providerById(this.cfg().consolidationProviderId)
-            : this.activeProvider()
-        } catch {
-          consolidationProvider = null
+        const cfg = this.cfg()
+        const captionSource = cfg.captionSource === 'custom' ? 'custom' : 'dsh'
+        let caption
+        if (captionSource === 'dsh') {
+          const target = this.dshTarget(cfg.captionDshProvider, cfg.captionDshModel)
+          caption = {
+            source: 'dsh',
+            providerId: target.providerId,
+            providerName: target.providerId,
+            model: target.modelId,
+            configured: Boolean(target.providerId && target.modelId),
+          }
+        } else {
+          const custom = this.captionTarget()
+          caption = {
+            source: 'custom',
+            providerId: custom.provider?.id ?? '',
+            providerName: custom.provider?.name ?? '',
+            model: custom.model,
+            configured: Boolean(custom.model),
+          }
+        }
+        const consolidationSource = cfg.consolidationSource === 'custom' ? 'custom' : 'dsh'
+        let consolidation
+        if (consolidationSource === 'dsh') {
+          const target = this.dshTarget(cfg.consolidationDshProvider, cfg.consolidationDshModel)
+          consolidation = {
+            source: 'dsh',
+            providerId: target.providerId,
+            providerName: target.providerId,
+            model: target.modelId,
+            configured: Boolean(target.providerId && target.modelId),
+          }
+        } else {
+          let customProvider = null
+          try {
+            customProvider = cfg.consolidationProviderId
+              ? this.providerById(cfg.consolidationProviderId)
+              : this.activeProvider()
+          } catch {
+            customProvider = null
+          }
+          consolidation = {
+            source: 'custom',
+            providerId: customProvider?.id ?? '',
+            providerName: customProvider?.name ?? '',
+            model: String(cfg.consolidationModel ?? '').trim(),
+            configured: Boolean(String(cfg.consolidationModel ?? '').trim()),
+          }
         }
         return {
           embedding: { providerId: provider.id, model: provider.embedModel, dimensions: provider.dimensions },
-          caption: {
-            providerId: caption.provider?.id ?? '',
-            providerName: caption.provider?.name ?? '',
-            model: caption.model,
-            configured: Boolean(caption.model),
-          },
-          consolidation: {
-            providerId: consolidationProvider?.id ?? '',
-            providerName: consolidationProvider?.name ?? '',
-            model: consolidationModel,
-          },
+          caption,
+          consolidation,
+          limitItems: cfg.consolidationLimitItems === true,
         }
       })(),
       behavior: {

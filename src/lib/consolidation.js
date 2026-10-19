@@ -80,12 +80,14 @@ export class ConsolidationEngine {
 
   /** 配置级别定义（level1 为每日原始记忆压缩，level2/3 为后续批次压缩）。 */
   stages() {
-    // 保留条数交由模型按内容重要性决定；这里只保留安全上限（防止模型输出失控）。
+    // 默认不限制输出条数，由整理模型按内容重要性自行决定；
+    // 只有在设置页显式开启「限制每级整理条数」时才套用内部安全上限。
     // 7 天 / 30 天的触发间隔是固定的整理节奏，未来要扩展更多级只需在数组里追加。
+    const limitEnabled = this.service.cfg().consolidationLimitItems === true
     return [
-      { level: 1, maxItems: 40, afterDays: 0 },
-      { level: 2, maxItems: 20, afterDays: 7 },
-      { level: 3, maxItems: 10, afterDays: 30 },
+      { level: 1, maxItems: limitEnabled ? 40 : null, afterDays: 0 },
+      { level: 2, maxItems: limitEnabled ? 20 : null, afterDays: 7 },
+      { level: 3, maxItems: limitEnabled ? 10 : null, afterDays: 30 },
     ]
   }
 
@@ -394,11 +396,9 @@ export class ConsolidationEngine {
       let llmCalls = 0
       let latencyMs = 0
       try {
-        const llm = await this.service.consolidationClient()
-        if (!llm) throw new Error('no-consolidation-model')
         const partials = []
         for (const chunk of chunks) {
-          const partial = await this.#callLLM(llm, {
+          const partial = await this.#callLLM({
             level,
             stage,
             items: chunk,
@@ -410,7 +410,7 @@ export class ConsolidationEngine {
           llmCalls += 1
           latencyMs += partial.latencyMs ?? 0
         }
-        combined = partials.length === 1 ? partials[0].data : await this.#mergePartials(llm, partials, stage)
+        combined = partials.length === 1 ? partials[0].data : await this.#mergePartials(partials, stage)
         if (partials.length > 1) {
           llmCalls += 1
           latencyMs += combined?.latencyMs ?? 0
@@ -428,9 +428,10 @@ export class ConsolidationEngine {
       const facts = Array.isArray(combined?.facts) ? combined.facts : []
       const event = combined?.event && typeof combined.event === 'object' ? combined.event : null
 
-      // 保留条数由模型决定；这里只兜底安全上限，避免模型异常输出过多条目。
-      const maxItems = Math.max(1, stage.maxItems ?? 20)
-      const factLimit = Math.max(0, maxItems - (summary ? 1 : 0))
+      // 默认保留条数由模型决定；只有开启「限制每级整理条数」时才截断。
+      const limitEnabled = Number.isFinite(stage.maxItems)
+      const maxItems = limitEnabled ? Math.max(1, stage.maxItems) : null
+      const factLimit = limitEnabled ? Math.max(0, maxItems - (summary ? 1 : 0)) : Infinity
       const selectedFacts = facts
         .filter((fact) => fact && typeof fact.text === 'string' && fact.text.trim())
         .slice(0, factLimit)
@@ -444,11 +445,16 @@ export class ConsolidationEngine {
       if (summary) entries.push({ text: summary, kind: 'summary', tags: ['summary'] })
       for (const fact of selectedFacts) entries.push(fact)
       if (entries.length === 0) entries.push({ text: rendered.slice(0, Math.max(80, Math.min(400, rendered.length))), kind: 'note', tags: ['fallback'] })
-      if (event?.summary && String(event.summary).trim()) {
+      const eventText = event?.summary && String(event.summary).trim()
+        ? String(event.summary).trim()
+        : related.length > 0
+          ? `相关事件：${summary || related[0].text}`.slice(0, 500)
+          : ''
+      if (eventText) {
         entries.push({
-          text: String(event.summary).trim(),
+          text: eventText,
           kind: 'event',
-          tags: Array.isArray(event.tags) ? event.tags.map(String).slice(0, 8) : ['event'],
+          tags: Array.isArray(event?.tags) ? event.tags.map(String).slice(0, 8) : ['event'],
         })
       }
 
@@ -468,13 +474,16 @@ export class ConsolidationEngine {
 
       const written = []
       try {
-        for (const entry of entries) {
+        for (const [index, entry] of entries.entries()) {
           const saved = await this.service.addMemory({
             kind: entry.kind === 'summary' ? 'summary' : entry.kind,
             text: entry.text,
             meta: {
               ...baseMeta,
               tags: entry.tags,
+              // 批次内唯一：避免整理产物的内容哈希与原文（或彼此）相同，
+              // 导致“先写入、再删除原文”把新产物一起删掉。
+              idSeed: `sleep-${batchId}-${index}`,
             },
           })
           written.push(saved)
@@ -604,18 +613,22 @@ export class ConsolidationEngine {
     return [...related.values()].slice(0, maxCandidates)
   }
 
-  /** 调一次整理 LLM。 */
-  async #callLLM(llm, { level, stage, items, rendered, related, isFirst }) {
+  /** 调一次整理 LLM（DSH 模型或自定义 provider，由 service 路由）。 */
+  async #callLLM({ level, stage, items, rendered, related, isFirst }) {
     const cfg = this.service.cfg()
-    const maxFacts = Math.max(1, (stage?.maxItems ?? 20) - 1)
+    const limitEnabled = Number.isFinite(stage?.maxItems)
+    const maxFacts = limitEnabled ? Math.max(1, stage.maxItems - 1) : null
     const relatedText = isFirst && related.length > 0
       ? `\n\n【可能相关的其他事件记忆（仅参考，不要删除/编造，可合并同一事件的信息）】\n${renderMemoryLines(related, 6000, (item) => `- [${this.service.formatTs(item.ts)}·${item.kind}${item.batch ? ' #' + item.batch : ''}] ${item.text.slice(0, 500)}`)}`
       : ''
     const customPrompt = String(cfg.consolidationPrompt ?? '').trim()
     const system = customPrompt || DEFAULT_PROMPT
+    const countRule = limitEnabled
+      ? `请输出 JSON：summary、facts（条数由你按重要性决定，最多 ${maxFacts} 条）、可选 event。`
+      : '请输出 JSON：summary、facts（条数由你按重要性自行决定）、可选 event。'
     const user = [
       `这是第 ${level} 级记忆整理。本批共 ${items.length} 条记忆。`,
-      `请输出 JSON：summary、facts（条数由你按重要性决定，最多 ${maxFacts} 条）、可选 event。`,
+      countRule,
       '精简是默认目标：优先保留关键事实、偏好、决定、时间和人名；重复、寒暄和流水账直接丢弃。',
       '',
       '【本批记忆】',
@@ -623,13 +636,10 @@ export class ConsolidationEngine {
       relatedText,
     ].join('\n')
     const startedAt = Date.now()
-    const response = await llm.client.chat({
-      model: llm.model,
-      messages: [
-        { role: 'system', content: system },
-        { role: 'user', content: user },
-      ],
-      maxTokens: level >= 3 ? 2048 : level === 2 ? 1536 : 1024,
+    const response = await this.service.consolidationChat({
+      system,
+      messages: [{ role: 'user', content: user }],
+      maxTokens: level >= 3 ? 4096 : level === 2 ? 3072 : 2048,
       temperature: 0.2,
     })
     const parsed = extractJson(response.text)
@@ -645,28 +655,23 @@ export class ConsolidationEngine {
       latencyMs: response.latencyMs ?? Date.now() - startedAt,
       raw: response.text,
       usage: response.usage ?? null,
+      modelSource: response.source ?? '',
+      model: response.model ?? '',
     }
   }
 
   /** 多块结果合并。 */
-  async #mergePartials(llm, partials, stage) {
+  async #mergePartials(partials, stage) {
     const summaries = partials.map((partial, index) => `## 分块 ${index + 1}\n${JSON.stringify(partial.data)}`).join('\n\n')
     const startedAt = Date.now()
     try {
-      const response = await llm.client.chat({
-        model: llm.model,
-        messages: [
-          {
-            role: 'system',
-            content:
-              '你在合并多个记忆整理分块的结果。请合并去重，输出同样格式的严格 JSON：{"summary":"...","facts":[...],"event":{...}}；facts 不要超过上限。',
-          },
-          {
-            role: 'user',
-            content: `facts 上限 ${Math.max(1, (stage?.maxItems ?? 20) - 1)}。\n\n${summaries}`,
-          },
-        ],
-        maxTokens: 2048,
+      const limitEnabled = Number.isFinite(stage?.maxItems)
+      const limitRule = limitEnabled ? `facts 上限 ${Math.max(1, stage.maxItems - 1)}。` : 'facts 条数由你按重要性决定。'
+      const response = await this.service.consolidationChat({
+        system:
+          '你在合并多个记忆整理分块的结果。请合并去重，输出同样格式的严格 JSON：{"summary":"...","facts":[...],"event":{...}}。',
+        messages: [{ role: 'user', content: `${limitRule}\n\n${summaries}` }],
+        maxTokens: 3072,
         temperature: 0.2,
       })
       const parsed = extractJson(response.text)
@@ -704,7 +709,7 @@ export class ConsolidationEngine {
 
   /** 纯规则压缩（LLM 不可用时的回退）。 */
   #ruleCompress(chunks, stage) {
-    const maxItems = Math.max(1, stage?.maxItems ?? 12)
+    const maxItems = Number.isFinite(stage?.maxItems) ? Math.max(1, stage.maxItems) : Infinity
     const facts = []
     const seen = new Set()
     for (const chunk of chunks) {

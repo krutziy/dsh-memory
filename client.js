@@ -145,6 +145,13 @@ window.__ModuleLoader__.load({
       { key: 'injectCurrentTime', type: 'switch', tab: 'behavior' },
       { key: 'relativeTime', type: 'switch', tab: 'behavior' },
       { key: 'consolidationEnabled', type: 'switch', tab: 'behavior' },
+      { key: 'consolidationLimitItems', type: 'switch', tab: 'behavior' },
+      { key: 'consolidationSource', type: 'select', tab: 'models', options: ['dsh', 'custom'] },
+      { key: 'consolidationDshProvider', type: 'text', tab: 'models' },
+      { key: 'consolidationDshModel', type: 'text', tab: 'models' },
+      { key: 'captionSource', type: 'select', tab: 'models', options: ['dsh', 'custom'] },
+      { key: 'captionDshProvider', type: 'text', tab: 'models' },
+      { key: 'captionDshModel', type: 'text', tab: 'models' },
       { key: 'sleepAt', type: 'text', tab: 'behavior' },
       { key: 'sleepRetryMinutes', type: 'number', tab: 'behavior' },
       { key: 'idleMinutes', type: 'number', tab: 'behavior' },
@@ -309,6 +316,7 @@ window.__ModuleLoader__.load({
           activeTest: { phase: 'idle', data: null, error: null },
           consolidation: { phase: 'idle', data: null, error: null },
           modelCatalog: {},
+          dshCatalog: { phase: 'idle', data: null, error: null },
           sleepRun: { phase: 'idle', error: null },
           memories: {
             phase: 'idle',
@@ -376,6 +384,7 @@ window.__ModuleLoader__.load({
       setTab(tab) {
         this.patch({ tab })
         if (tab === 'models') {
+          if (this.state.dshCatalog?.phase === 'idle') void this.loadDshCatalog()
           for (const provider of this.state.providers ?? []) {
             const id = String(provider.id ?? '').trim()
             if (id && !this.state.modelCatalog?.[id]) void this.fetchProviderModels(id)
@@ -807,6 +816,19 @@ window.__ModuleLoader__.load({
         this.patch({ memories: { ...this.state.memories, level: String(level ?? '') } })
       }
 
+      async loadDshCatalog() {
+        if (this.state.dshCatalog.phase === 'loading') return
+        this.patch({ dshCatalog: { phase: 'loading', data: this.state.dshCatalog.data, error: null } })
+        try {
+          const response = await fetch(`${API}/dsh-models`, { headers: { Accept: 'application/json' } })
+          const data = await response.json().catch(() => null)
+          if (!data || data.ok === false) throw new Error(data?.error ?? `HTTP ${response.status}`)
+          this.patch({ dshCatalog: { phase: 'ready', data, error: null } })
+        } catch (error) {
+          this.patch({ dshCatalog: { phase: 'error', data: this.state.dshCatalog.data, error: errorText(error) } })
+        }
+      }
+
       async fetchProviderModels(providerId) {
         const id = String(providerId ?? '').trim()
         if (!id) return
@@ -1039,6 +1061,7 @@ window.__ModuleLoader__.load({
           setMemoriesLevel: (level) => this.setMemoriesLevel(level),
           refreshConsolidation: () => this.refreshConsolidation(),
           fetchProviderModels: (providerId) => this.fetchProviderModels(providerId),
+          loadDshCatalog: () => this.loadDshCatalog(),
           runSleepManual: () => this.runSleepManual(),
           setMemoryAdd: (field, value) => this.setMemoryAdd(field, value),
           loadMoreMemories: () => this.loadMemories({ reset: false }),
@@ -1123,6 +1146,10 @@ window.__ModuleLoader__.load({
 .dsm-switch::after{content:"";position:absolute;top:2px;left:2px;width:18px;height:18px;border-radius:50%;background:#fff;transition:transform .15s}
 .dsm-switch[aria-checked="true"]::after{transform:translateX(18px)}
 .dsm-actions{display:flex;align-items:center;gap:8px;flex-wrap:wrap}
+.dsm-details{border:1px solid var(--dsw-alias-border-subtle,#e5e5e5);border-radius:10px;padding:12px 14px;background:var(--dsw-alias-fill-secondary,rgba(0,0,0,.02))}
+.dsm-details>summary{cursor:pointer;font-weight:600;font-size:13px;user-select:none}
+.dsm-details[open]>summary{margin-bottom:10px}
+.dsm-dshPicker{display:flex;flex-direction:column;gap:4px}
 .dsm-functionRow{border-top:1px solid var(--dsw-alias-border-subtle,#e5e5e5);padding-top:14px;margin-top:10px;display:flex;flex-direction:column;gap:6px}
 .dsm-functionTitle{font-weight:600;font-size:13px}
 .dsm-modelChips{display:flex;flex-wrap:wrap;align-items:center;gap:6px;margin-top:8px}
@@ -1700,6 +1727,7 @@ window.__ModuleLoader__.load({
         h(
           'section',
           { className: 'dsm-card' },
+          h('p', { className: 'dsm-hint' }, t('sectionProvidersHintV6')),
           h(
             'div',
             { className: 'dsm-cardHead' },
@@ -1868,7 +1896,7 @@ window.__ModuleLoader__.load({
             h(
               'span',
               { className: 'dsm-statusValue' },
-              `${t('sleepModelProvider')}: ${state.drafts.consolidationProviderId || t('sleepProviderAuto')} · ${state.drafts.consolidationModel || '-'}`,
+              `${state.status?.data?.functions?.consolidation?.source === 'custom' ? t('modelSourceCustom') : t('modelSourceDsh')} · ${state.status?.data?.functions?.consolidation?.providerId || '-'} · ${state.status?.data?.functions?.consolidation?.model || '-'}`,
             ),
           ),
           h('p', { className: 'dsm-hint' }, t('sleepModelHint')),
@@ -1899,7 +1927,65 @@ window.__ModuleLoader__.load({
       )
     }
 
-    /** 功能模型选择行（provider + 模型下拉/手填）。 */
+    /** DSH 模型选择行（provider + model，均来自 DSH 模型设置）。 */
+    function DshModelPicker({ idPrefix, providerField, modelField, state, actions, t, disabled, imageOnly }) {
+      const dsh = state.dshCatalog?.data
+      const providers = (dsh?.providers ?? []).filter((provider) => provider.live)
+      const modelsByProvider = dsh?.models ?? {}
+      const fallback = dsh?.defaultModel
+      const draftProvider = String(state.drafts?.[providerField] ?? '')
+      const draftModel = String(state.drafts?.[modelField] ?? '')
+      const effectiveProvider = draftProvider || fallback?.provider || providers[0]?.id || ''
+      let models = modelsByProvider[effectiveProvider] ?? []
+      if (imageOnly) models = models.filter((model) => (model.inputModalities ?? []).includes('image'))
+      const providerOptions = [
+        { value: '', label: t('modelDshDefault') },
+        ...providers.map((provider) => ({ value: provider.id, label: provider.name || provider.id })),
+      ]
+      const modelOptions = [{ value: '', label: t('modelDshDefault') }, ...models.map((model) => ({ value: model.id, label: model.name || model.id }))]
+      return h(
+        'div',
+        { className: 'dsm-dshPicker' },
+        h(
+          'div',
+          { className: 'dsm-grid2' },
+          h(
+            Field,
+            { label: t('modelProviderLabel') },
+            h(SelectField, {
+              id: `${idPrefix}-provider`,
+              value: draftProvider,
+              options: providerOptions,
+              disabled: disabled || state.dshCatalog?.phase === 'loading',
+              onChange: (value) => actions.editField(providerField, value),
+            }),
+          ),
+          h(
+            Field,
+            { label: t('modelLabel') },
+            h(SelectField, {
+              id: `${idPrefix}-model`,
+              value: draftModel,
+              options: modelOptions,
+              disabled: disabled || state.dshCatalog?.phase === 'loading',
+              onChange: (value) => actions.editField(modelField, value),
+            }),
+          ),
+        ),
+        h(
+          'p',
+          { className: 'dsm-hint' },
+          imageOnly && models.length === 0
+            ? t('modelDshNoImageModel')
+            : t('modelDshEffective', {
+                provider: effectiveProvider || '-',
+                model: draftModel || fallback?.model || t('modelDshDefault'),
+              }),
+        ),
+      )
+    }
+
+    /** 自定义 provider 的模型选择行（插件内 provider 档案）。 */
     function FunctionModelPicker({ idPrefix, label, hint, providerField, modelField, state, actions, t, disabled }) {
       const providers = state.providers ?? []
       const providerDraft = String(state.drafts?.[providerField] ?? '')
@@ -1966,65 +2052,120 @@ window.__ModuleLoader__.load({
       )
     }
 
-    /** 模型列表 Tab：各 provider 的模型 + 功能模型分配。 */
+    /** 功能模型来源选择行。 */
+    function ModelSourceRow({ label, hint, sourceField, children, state, actions, t, disabled }) {
+      const source = String(state.drafts?.[sourceField] ?? 'dsh')
+      return h(
+        'div',
+        { className: 'dsm-functionRow' },
+        h('div', { className: 'dsm-functionTitle' }, label),
+        h('p', { className: 'dsm-hint' }, hint),
+        h(
+          'div',
+          { className: 'dsm-grid2' },
+          h(
+            Field,
+            { label: t('modelSourceLabel') },
+            h(SelectField, {
+              id: `dsm-source-${sourceField}`,
+              value: source,
+              options: [
+                { value: 'dsh', label: t('modelSourceDsh') },
+                { value: 'custom', label: t('modelSourceCustom') },
+              ],
+              disabled,
+              onChange: (value) => actions.editField(sourceField, value),
+            }),
+          ),
+        ),
+        source === 'dsh' ? children.dsh : children.custom,
+      )
+    }
+
+    /** 模型列表 Tab：读取 DSH 模型 + 功能模型分配。 */
     function ModelsTab({ state, actions, t, disabled }) {
-      const providers = state.providers ?? []
-      const catalog = state.modelCatalog ?? {}
+      const dsh = state.dshCatalog?.data
+      const phase = state.dshCatalog?.phase ?? 'idle'
+      const providers = dsh?.providers ?? []
+      const live = providers.filter((provider) => provider.live)
+      const dormant = providers.filter((provider) => !provider.live)
+      const modelsByProvider = dsh?.models ?? {}
+      const fallback = dsh?.defaultModel
       return h(
         React.Fragment,
         null,
         h(
           'section',
           { className: 'dsm-card' },
-          h('h3', { className: 'dsm-cardTitle' }, t('sectionModelList')),
-          h('p', { className: 'dsm-hint' }, t('sectionModelListHint')),
-          providers.map((provider, index) => {
-            const id = String(provider.id ?? '')
-            const keyRef = providerKeyRef(provider)
-            const visionRef = providerVisionKeyRef(provider)
-            const entry = catalog[id]
-            const models = entry?.models ?? []
-            return h(
+          h(
+            'div',
+            { className: 'dsm-cardHead' },
+            h('h3', { className: 'dsm-cardTitle' }, t('sectionDshModels')),
+            h(
               'div',
-              { className: 'dsm-provider', key: id || 'provider-' + index },
+              { className: 'dsm-actions' },
               h(
+                'button',
+                {
+                  type: 'button',
+                  className: 'dsm-btn dsm-btnSmall dsm-btnGhost',
+                  disabled: phase === 'loading',
+                  onClick: actions.loadDshCatalog,
+                },
+                phase === 'loading' ? t('loading') : t('modelDshRefresh'),
+              ),
+            ),
+          ),
+          h('p', { className: 'dsm-hint' }, t('sectionDshModelsHint')),
+          fallback
+            ? h(
                 'div',
-                { className: 'dsm-providerHead' },
-                h('div', { className: 'dsm-providerTitle' }, provider.name || id, h(Badge, null, id)),
+                { className: 'dsm-statusRow', key: 'default-model' },
+                h('span', { className: 'dsm-statusLabel' }, t('modelDshDefaultModel')),
+                h('span', { className: 'dsm-statusValue' }, `${fallback.provider} · ${fallback.model}`),
+              )
+            : null,
+          phase === 'error' ? h('p', { className: 'dsm-hint dsm-err' }, `${t('modelDshError')}：${state.dshCatalog.error}`) : null,
+          live.length === 0
+            ? h('p', { className: 'dsm-hint' }, phase === 'loading' ? t('loading') : t('modelDshNoProviders'))
+            : live.map((provider) =>
                 h(
                   'div',
-                  { className: 'dsm-actions' },
+                  { className: 'dsm-provider', key: provider.id },
                   h(
-                    'button',
-                    {
-                      type: 'button',
-                      className: 'dsm-btn dsm-btnSmall dsm-btnGhost',
-                      disabled: disabled || entry?.phase === 'loading',
-                      onClick: () => actions.fetchProviderModels(id),
-                    },
-                    entry?.phase === 'loading' ? t('modelFetching') : t('modelFetch'),
+                    'div',
+                    { className: 'dsm-providerHead' },
+                    h('div', { className: 'dsm-providerTitle' }, provider.name || provider.id, h(Badge, null, provider.id)),
+                    h('span', { className: 'dsm-hint' }, t('modelDshLive')),
+                  ),
+                  h(
+                    'div',
+                    { className: 'dsm-modelChips' },
+                    (modelsByProvider[provider.id] ?? []).length === 0
+                      ? h('span', { className: 'dsm-hint' }, t('modelCatalogEmpty'))
+                      : (modelsByProvider[provider.id] ?? []).map((model) =>
+                          h(
+                            'code',
+                            { className: 'dsm-modelChip', key: model.id },
+                            `${model.id}${(model.inputModalities ?? []).includes('image') ? ' · 图片' : ''}`,
+                          ),
+                        ),
                   ),
                 ),
               ),
-              h('p', { className: 'dsm-hint' }, provider.baseUrl || ''),
-              h(KeyEditor, { refName: keyRef, label: t('providerKey'), state, actions, t, disabled }),
-              visionRef !== keyRef ? h(KeyEditor, { refName: visionRef, label: t('providerVisionKey'), state, actions, t, disabled }) : null,
-              h('p', { className: 'dsm-hint' }, t('modelKeyHint')),
-              entry?.phase === 'error' ? h('p', { className: 'dsm-hint dsm-err' }, `${t('modelCatalogError')}：${entry.error}`) : null,
-              models.length > 0
-                ? h(
-                    'div',
-                    { className: 'dsm-modelChips' },
-                    h('span', { className: 'dsm-hint' }, t('modelCatalogCount', { count: models.length })),
-                    models.slice(0, 60).map((model) =>
-                      h('code', { className: 'dsm-modelChip', key: model.id, title: model.ownedBy || '' }, model.id),
-                    ),
-                  )
-                : entry?.phase === 'ready'
-                  ? h('p', { className: 'dsm-hint' }, t('modelCatalogEmpty'))
-                  : null,
-            )
-          }),
+          dormant.length > 0
+            ? h(
+                'details',
+                { className: 'dsm-details' },
+                h('summary', null, t('modelDshDormant', { count: dormant.length })),
+                h(
+                  'div',
+                  { className: 'dsm-modelChips' },
+                  dormant.slice(0, 40).map((provider) => h('code', { className: 'dsm-modelChip', key: provider.id }, provider.name || provider.id)),
+                ),
+                h('p', { className: 'dsm-hint' }, t('modelDshDormantHint')),
+              )
+            : null,
         ),
         h(
           'section',
@@ -2033,41 +2174,80 @@ window.__ModuleLoader__.load({
           h('p', { className: 'dsm-hint' }, t('sectionFunctionModelsHint')),
           h(
             'div',
-            { className: 'dsm-statusList' },
+            { className: 'dsm-statusRow', key: 'embedding-function' },
+            h('span', { className: 'dsm-statusLabel' }, t('modelFunctionEmbedding')),
             h(
-              'div',
-              { className: 'dsm-statusRow', key: 'embedding-function' },
-              h('span', { className: 'dsm-statusLabel' }, t('modelFunctionEmbedding')),
-              h(
-                'span',
-                { className: 'dsm-statusValue' },
-                `${state.activeProvider || '-'} · ${providers.find((p) => p.id === (state.activeProvider || providers[0]?.id))?.embedModel || '-'}`,
-              ),
+              'span',
+              { className: 'dsm-statusValue' },
+              `${state.activeProvider || '-'} · ${(state.providers ?? []).find((p) => p.id === (state.activeProvider || (state.providers ?? [])[0]?.id))?.embedModel || '-'}`,
             ),
-            h('p', { className: 'dsm-hint' }, t('modelFunctionEmbeddingHint')),
           ),
-          h(FunctionModelPicker, {
-            idPrefix: 'dsm-caption',
-            label: t('modelFunctionCaption'),
-            hint: t('modelFunctionCaptionHint'),
-            providerField: 'captionProviderId',
-            modelField: 'captionModel',
-            state,
-            actions,
-            t,
-            disabled,
-          }),
-          h(FunctionModelPicker, {
-            idPrefix: 'dsm-consolidation',
+          h('p', { className: 'dsm-hint' }, t('modelFunctionEmbeddingHint')),
+          h(ModelSourceRow, {
             label: t('modelFunctionConsolidation'),
             hint: t('modelFunctionConsolidationHint'),
-            providerField: 'consolidationProviderId',
-            modelField: 'consolidationModel',
+            sourceField: 'consolidationSource',
             state,
             actions,
             t,
             disabled,
+            children: {
+              dsh: h(DshModelPicker, {
+                idPrefix: 'dsm-consolidation-dsh',
+                providerField: 'consolidationDshProvider',
+                modelField: 'consolidationDshModel',
+                state,
+                actions,
+                t,
+                disabled,
+              }),
+              custom: h(FunctionModelPicker, {
+                idPrefix: 'dsm-consolidation-custom',
+                label: t('modelCustomProvider'),
+                hint: t('modelCustomProviderHint'),
+                providerField: 'consolidationProviderId',
+                modelField: 'consolidationModel',
+                state,
+                actions,
+                t,
+                disabled,
+              }),
+            },
           }),
+          h(ModelSourceRow, {
+            label: t('modelFunctionCaption'),
+            hint: t('modelFunctionCaptionHint'),
+            sourceField: 'captionSource',
+            state,
+            actions,
+            t,
+            disabled,
+            children: {
+              dsh: h(DshModelPicker, {
+                idPrefix: 'dsm-caption-dsh',
+                providerField: 'captionDshProvider',
+                modelField: 'captionDshModel',
+                state,
+                actions,
+                t,
+                disabled,
+                imageOnly: true,
+              }),
+              custom: h(FunctionModelPicker, {
+                idPrefix: 'dsm-caption-custom',
+                label: t('modelCustomProvider'),
+                hint: t('modelCustomProviderHint'),
+                providerField: 'captionProviderId',
+                modelField: 'captionModel',
+                state,
+                actions,
+                t,
+                disabled,
+              }),
+            },
+          }),
+          h('p', { className: 'dsm-hint' }, t('modelLimitsHint')),
+          h(ScalarField, { field: SCALAR_BY_KEY.get('consolidationLimitItems'), state, actions, t, disabled }),
         ),
       )
     }
@@ -2088,6 +2268,30 @@ window.__ModuleLoader__.load({
             'div',
             { className: 'dsm-grid2' },
             behaviorKeys.map((key) => h(ScalarField, { key, field: SCALAR_BY_KEY.get(key), state, actions, t, disabled })),
+          ),
+        ),
+        h(SleepCard, { state, actions, t, disabled }),
+        h(
+          'section',
+          { className: 'dsm-card' },
+          h('h3', { className: 'dsm-cardTitle' }, t('sectionTime')),
+          h(
+            'p',
+            { className: 'dsm-hint' },
+            t('sectionTimeHint', {
+              tz: state.status?.data?.time?.timezoneLabel ?? '服务器本地',
+              now: state.status?.data?.time?.now ?? '',
+            }),
+          ),
+          h(
+            'div',
+            { className: 'dsm-grid2' },
+            h(ScalarField, { field: SCALAR_BY_KEY.get('timezone'), state, actions, t, disabled }),
+            state.drafts.timezone === 'custom'
+              ? h(ScalarField, { field: SCALAR_BY_KEY.get('timezoneCustom'), state, actions, t, disabled })
+              : null,
+            h(ScalarField, { field: SCALAR_BY_KEY.get('injectCurrentTime'), state, actions, t, disabled }),
+            h(ScalarField, { field: SCALAR_BY_KEY.get('relativeTime'), state, actions, t, disabled }),
           ),
         ),
         h(
@@ -2112,29 +2316,17 @@ window.__ModuleLoader__.load({
             toolKeys.map((key) => h(ScalarField, { key, field: SCALAR_BY_KEY.get(key), state, actions, t, disabled })),
           ),
         ),
-        h(SleepCard, { state, actions, t, disabled }),
-        h(ExperimentalCard, { state, actions, t, disabled }),
         h(
-          'section',
-          { className: 'dsm-card' },
-          h('h3', { className: 'dsm-cardTitle' }, t('sectionTime')),
-          h(
-            'p',
-            { className: 'dsm-hint' },
-            t('sectionTimeHint', {
-              tz: state.status?.data?.time?.timezoneLabel ?? '服务器本地',
-              now: state.status?.data?.time?.now ?? '',
-            }),
-          ),
+          'details',
+          { className: 'dsm-details' },
+          h('summary', null, t('sectionExperimental')),
+          h('p', { className: 'dsm-hint' }, t('sectionExperimentalHint')),
           h(
             'div',
             { className: 'dsm-grid2' },
-            h(ScalarField, { field: SCALAR_BY_KEY.get('timezone'), state, actions, t, disabled }),
-            state.drafts.timezone === 'custom'
-              ? h(ScalarField, { field: SCALAR_BY_KEY.get('timezoneCustom'), state, actions, t, disabled })
-              : null,
-            h(ScalarField, { field: SCALAR_BY_KEY.get('injectCurrentTime'), state, actions, t, disabled }),
-            h(ScalarField, { field: SCALAR_BY_KEY.get('relativeTime'), state, actions, t, disabled }),
+            ['experimentalEventMergeEnabled', 'experimentalEventMergeThreshold', 'experimentalEventMergeMaxCandidates', 'experimentalEnhancementEnabled', 'experimentalEnhancementDays'].map((key) =>
+              h(ScalarField, { key, field: SCALAR_BY_KEY.get(key), state, actions, t, disabled }),
+            ),
           ),
         ),
       )
@@ -2450,10 +2642,10 @@ window.__ModuleLoader__.load({
     function Tabs({ state, actions, t }) {
       const tabs = [
         { id: 'overview', label: t('tabOverview') },
-        { id: 'model', label: t('tabModel') },
         { id: 'models', label: t('tabModels') },
         { id: 'behavior', label: t('tabBehavior') },
         { id: 'manage', label: t('tabManage') },
+        { id: 'model', label: t('tabModel') },
         { id: 'advanced', label: t('tabAdvanced') },
       ]
       return h(
@@ -2526,6 +2718,7 @@ window.__ModuleLoader__.load({
         refreshConsolidation: props.refreshConsolidation,
         runSleepManual: props.runSleepManual,
         fetchProviderModels: props.fetchProviderModels,
+        loadDshCatalog: props.loadDshCatalog,
         setMemoryAdd: props.setMemoryAdd,
         loadMoreMemories: props.loadMoreMemories,
         refreshMemories: props.refreshMemories,
@@ -2578,6 +2771,25 @@ window.__ModuleLoader__.load({
     // 语言包（扁平 key，locale 服务只做扁查找）
     // ---------------------------------------------------------------------
     const zh = {
+      sectionDshModels: 'DSH 模型',
+      sectionDshModelsHint: '直接读取 DSH「设置 → 模型」里已配置的供应商与模型（Key 也在 DSH 里管理）。在这里为各功能选择模型即可；嵌入模型 DSH 没有提供接口，仍在「模型与向量库」里配置。',
+      modelDshRefresh: '刷新',
+      modelDshDefaultModel: 'DSH 默认模型',
+      modelDshLive: '已连接',
+      modelDshError: '读取 DSH 模型失败',
+      modelDshNoProviders: 'DSH 还没有已配置的模型供应商：请先在 DSH「设置 → 模型」里添加供应商与 API Key。',
+      modelDshDormant: '未连接的供应商（{count}）',
+      modelDshDormantHint: '这些供应商可在 DSH「设置 → 模型」中配置后使用。',
+      modelDshDefault: '跟随 DSH 默认模型',
+      modelDshEffective: '当前生效：{provider} · {model}',
+      modelDshNoImageModel: '当前供应商没有声明支持图片输入的模型；可更换供应商，或把来源切到自定义 provider 使用视觉模型。',
+      modelSourceLabel: '模型来源',
+      modelSourceDsh: 'DSH 模型（推荐）',
+      modelSourceCustom: '自定义 provider',
+      modelCustomProvider: '自定义 provider 模型',
+      modelCustomProviderHint: '使用本插件「模型与向量库」里配置的 provider 与 Key；DSH 模型不可用时作为回退。',
+      modelLimitsHint: '整理输出条数默认由模型决定；如需强制上限可打开下方开关（内部上限：L1 40 / L2 20 / L3 10 条）。',
+      sectionProvidersHintV6: '这里的 provider 主要用于嵌入模型与自定义回退；聊天类模型（记忆整理、图片概览）推荐在「模型列表」里直接继承 DSH 已配置的模型。',
       tabModels: '模型列表',
       sectionModelList: '模型',
       sectionModelListHint: '填入各提供商的 API 密钥即可使用其模型；也可以点「获取模型列表」从服务商拉取可用模型。',
@@ -2588,11 +2800,11 @@ window.__ModuleLoader__.load({
       modelCatalogError: '拉取模型列表失败',
       modelKeyHint: 'API Key 只保存在本机 DSH 凭据里，不会上传到其他服务。',
       sectionFunctionModels: '功能模型分配',
-      sectionFunctionModelsHint: '为每个功能选择使用的 provider 与模型；嵌入模型由当前激活 provider 决定（在「模型与向量库」里切换）。',
+      sectionFunctionModelsHint: '为每个功能选择模型来源：默认直接使用 DSH 已配置的模型（无需额外 Key），也可以切到自定义 provider。嵌入模型由当前激活 provider 决定。',
       modelFunctionEmbedding: '嵌入模型（自动记录 / 召回）',
       modelFunctionEmbeddingHint: '由当前激活 provider 的嵌入模型决定；更换会导致维度不一致，需同时重建集合。',
       modelFunctionCaption: '图片概览',
-      modelFunctionCaptionHint: '只在生成图片的一句话概览时使用视觉模型，不保存原图。',
+      modelFunctionCaptionHint: '只在生成图片的一句话概览时使用，不保存原图；DSH 来源请选择声明支持图片输入的模型。',
       modelFunctionConsolidation: '记忆整理',
       modelFunctionConsolidationHint: '睡眠整理使用该对话模型生成摘要、提炼事实。',
       modelProviderAuto: '跟随当前激活 provider',
@@ -2604,7 +2816,7 @@ window.__ModuleLoader__.load({
       modelPlaceholder: '例如 Qwen/Qwen2.5-7B-Instruct',
       sleepModelConfig: '整理模型',
       sleepModelProvider: 'provider',
-      sleepModelHint: '整理模型与图片概览模型现在在「模型列表」页里选择；保存后生效。',
+      sleepModelHint: '整理模型与图片概览模型在「模型列表」页按功能选择（可直接继承 DSH 模型）；保存后生效。',
       statusSleep: '睡眠整理',
       statusLevels: '记忆层级',
       sleepStatus: '状态',
@@ -2660,6 +2872,20 @@ window.__ModuleLoader__.load({
       'field.experimentalEnhancementEnabledHint': '额外保留整理后的 1 级记忆若干天，仅用于事件/按需召回',
       'field.experimentalEnhancementDays': '增强记忆保留天数',
       'field.experimentalEnhancementDaysHint': '到期后自动删除',
+      'field.consolidationLimitItems': '限制每级整理条数',
+      'field.consolidationLimitItemsHint': '默认关闭：保留多少条由整理模型决定；开启后使用内部上限 40/20/10',
+      'field.consolidationSource': '整理模型来源',
+      'field.consolidationSourceHint': 'dsh=直接使用 DSH 已配置模型；custom=使用插件自定义 provider',
+      'field.consolidationDshProvider': '整理 DSH provider',
+      'field.consolidationDshProviderHint': '留空跟随 DSH 默认模型；在「模型列表」里选择更直观',
+      'field.consolidationDshModel': '整理 DSH 模型',
+      'field.consolidationDshModelHint': '留空跟随 DSH 默认模型',
+      'field.captionSource': '图片概览模型来源',
+      'field.captionSourceHint': 'dsh=使用 DSH 模型（需支持图片输入）；custom=插件自定义视觉 provider',
+      'field.captionDshProvider': '图片概览 DSH provider',
+      'field.captionDshProviderHint': '留空跟随 DSH 默认模型',
+      'field.captionDshModel': '图片概览 DSH 模型',
+      'field.captionDshModelHint': '留空跟随 DSH 默认模型（需支持图片输入）',
       'field.captionProviderId': '图片概览 provider',
       'field.captionProviderIdHint': '留空跟随当前激活 provider；图片概览模型在「模型列表」里选择',
       'field.captionModel': '图片概览模型',
@@ -2919,6 +3145,25 @@ window.__ModuleLoader__.load({
     }
 
     const en = {
+      sectionDshModels: 'DSH models',
+      sectionDshModelsHint: 'Reads the providers and models already configured in DSH Settings → Models (keys are managed by DSH). Pick models for each function here; embeddings are not exposed by DSH, so the embedding model stays in "Models & storage".',
+      modelDshRefresh: 'Refresh',
+      modelDshDefaultModel: 'DSH default model',
+      modelDshLive: 'Connected',
+      modelDshError: 'Failed to read DSH models',
+      modelDshNoProviders: 'DSH has no configured model provider yet. Add a provider and API key in DSH Settings → Models first.',
+      modelDshDormant: 'Dormant providers ({count})',
+      modelDshDormantHint: 'Configure these providers in DSH Settings → Models to use them.',
+      modelDshDefault: 'Follow DSH default model',
+      modelDshEffective: 'Effective: {provider} · {model}',
+      modelDshNoImageModel: 'The selected provider declares no image-capable model; choose another provider or switch the source to a custom vision model.',
+      modelSourceLabel: 'Model source',
+      modelSourceDsh: 'DSH models (recommended)',
+      modelSourceCustom: 'Custom provider',
+      modelCustomProvider: 'Custom provider model',
+      modelCustomProviderHint: 'Uses the provider and key configured in "Models & storage"; also serves as a fallback when DSH models are unavailable.',
+      modelLimitsHint: 'Consolidation output size is decided by the model by default; enable the switch below to enforce caps (L1 40 / L2 20 / L3 10).',
+      sectionProvidersHintV6: 'Providers here are mainly for embeddings and custom fallbacks; chat functions (consolidation, image captions) should inherit DSH models in the "Models" tab.',
       tabModels: 'Models',
       sectionModelList: 'Models',
       sectionModelListHint: 'Enter each provider API key to use its models; use "Fetch models" to load the provider model list.',
@@ -3001,6 +3246,20 @@ window.__ModuleLoader__.load({
       'field.experimentalEnhancementEnabledHint': 'Keep level-1 memories for several days for event/on-demand recall only',
       'field.experimentalEnhancementDays': 'Enhanced retention days',
       'field.experimentalEnhancementDaysHint': 'Deleted automatically after this many days',
+      'field.consolidationLimitItems': 'Limit consolidation items',
+      'field.consolidationLimitItemsHint': 'Off by default: the model decides how much to keep; when on, caps of 40/20/10 apply',
+      'field.consolidationSource': 'Consolidation model source',
+      'field.consolidationSourceHint': 'dsh uses DSH-configured models; custom uses plugin providers',
+      'field.consolidationDshProvider': 'Consolidation DSH provider',
+      'field.consolidationDshProviderHint': 'Blank follows the DSH default model; prefer picking in the Models tab',
+      'field.consolidationDshModel': 'Consolidation DSH model',
+      'field.consolidationDshModelHint': 'Blank follows the DSH default model',
+      'field.captionSource': 'Caption model source',
+      'field.captionSourceHint': 'dsh uses DSH models (image-capable); custom uses a plugin vision provider',
+      'field.captionDshProvider': 'Caption DSH provider',
+      'field.captionDshProviderHint': 'Blank follows the DSH default model',
+      'field.captionDshModel': 'Caption DSH model',
+      'field.captionDshModelHint': 'Blank follows the DSH default model (must accept images)',
       'field.captionProviderId': 'Image caption provider',
       'field.captionProviderIdHint': 'Blank follows the active provider; pick the caption model in the Models tab',
       'field.captionModel': 'Image caption model',

@@ -190,6 +190,21 @@ export const Config = z.object({
     .description('召回/列表中显示相对时间（如“3 天前”）'),
 
   // -------------------- 图片 --------------------
+  captionSource: z
+    .string()
+    .default('dsh')
+    .volatile()
+    .description('图片概览模型来源：dsh=直接使用 DSH 已配置的模型；custom=使用插件自定义 provider'),
+  captionDshProvider: z
+    .string()
+    .default('')
+    .volatile()
+    .description('DSH 图片概览使用的 provider；留空使用 DSH 默认模型'),
+  captionDshModel: z
+    .string()
+    .default('')
+    .volatile()
+    .description('DSH 图片概览使用的模型；留空使用 DSH 默认模型（需支持图片输入）'),
   captionProviderId: z
     .string()
     .default('')
@@ -306,6 +321,26 @@ export const Config = z.object({
     .max(1440)
     .volatile()
     .description('最近多少分钟内没有人类消息、且没有运行中的会话，才算空闲可以睡'),
+  consolidationSource: z
+    .string()
+    .default('dsh')
+    .volatile()
+    .description('整理模型来源：dsh=直接使用 DSH 已配置的模型；custom=使用插件自定义 provider'),
+  consolidationDshProvider: z
+    .string()
+    .default('')
+    .volatile()
+    .description('DSH 模型来源时使用的 provider；留空使用 DSH 默认模型'),
+  consolidationDshModel: z
+    .string()
+    .default('')
+    .volatile()
+    .description('DSH 模型来源时使用的模型；留空使用 DSH 默认模型'),
+  consolidationLimitItems: z
+    .boolean()
+    .default(false)
+    .volatile()
+    .description('是否限制每级整理输出的条数（默认关闭，由模型决定；开启后使用内部安全上限）'),
   consolidationProviderId: z
     .string()
     .default('')

@@ -21,7 +21,7 @@ import { errorText } from './lib/util.js'
 export const name = 'dsh-memory'
 
 /** 需要的 Host 服务；缺任意一个时插件保持未激活，而不是报错。 */
-export const inject = ['tools', 'systemPrompt', 'webServer', 'credentials', 'attachments', 'sessions', 'timer', 'agents']
+export const inject = ['tools', 'systemPrompt', 'webServer', 'credentials', 'attachments', 'sessions', 'timer', 'agents', 'llm', 'agentDefaultModel']
 
 export { Config }
 
@@ -109,7 +109,7 @@ export function apply(ctx, config) {
 
   const provider = service.activeProvider()
   logger.info?.(
-    `[dsh-memory] 已加载 v0.5.0：provider=${provider.id}（${provider.embedModel}，${provider.dimensions} 维）→ Qdrant ${service.storage().qdrantUrl} / ${service.storage().collection}`,
+    `[dsh-memory] 已加载 v0.6.0：provider=${provider.id}（${provider.embedModel}，${provider.dimensions} 维）→ Qdrant ${service.storage().qdrantUrl} / ${service.storage().collection}`,
   )
 
   // 6) 启动自检：确保 collection 存在（失败只告警，不阻塞 DSH 启动），并补齐旧记忆标签
