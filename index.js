@@ -2132,7 +2132,8 @@ class MemoryService {
     })
     let total = null
     try {
-      total = await qdrant.count(storage.collection, { filter, exact: false })
+      // 注意：Qdrant 的近似 count 在带过滤条件时会明显偏差，这里必须精确计数
+      total = await qdrant.count(storage.collection, { filter, exact: true })
     } catch {
       /* ignore */
     }
