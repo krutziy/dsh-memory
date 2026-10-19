@@ -170,16 +170,10 @@ window.__ModuleLoader__.load({
       { key: 'captureAssistantChars', type: 'number', tab: 'advanced' },
       { key: 'captureMinChars', type: 'number', tab: 'advanced' },
       { key: 'includeSubagents', type: 'switch', tab: 'advanced' },
-      { key: 'level1Ratio', type: 'number', tab: 'advanced', float: true },
-      { key: 'level1MaxItems', type: 'number', tab: 'advanced' },
-      { key: 'level2AfterDays', type: 'number', tab: 'advanced' },
-      { key: 'level2Ratio', type: 'number', tab: 'advanced', float: true },
-      { key: 'level2MaxItems', type: 'number', tab: 'advanced' },
-      { key: 'level3AfterDays', type: 'number', tab: 'advanced' },
-      { key: 'level3Ratio', type: 'number', tab: 'advanced', float: true },
-      { key: 'level3MaxItems', type: 'number', tab: 'advanced' },
       { key: 'consolidationInputMaxChars', type: 'number', tab: 'advanced' },
       { key: 'debug', type: 'switch', tab: 'advanced' },
+      { key: 'captionProviderId', type: 'text', tab: 'models' },
+      { key: 'captionModel', type: 'text', tab: 'models' },
     ]
     const SCALAR_BY_KEY = new Map(SCALAR_FIELDS.map((field) => [field.key, field]))
 
@@ -314,6 +308,7 @@ window.__ModuleLoader__.load({
           status: { phase: 'idle', data: null, error: null },
           activeTest: { phase: 'idle', data: null, error: null },
           consolidation: { phase: 'idle', data: null, error: null },
+          modelCatalog: {},
           sleepRun: { phase: 'idle', error: null },
           memories: {
             phase: 'idle',
@@ -380,6 +375,12 @@ window.__ModuleLoader__.load({
 
       setTab(tab) {
         this.patch({ tab })
+        if (tab === 'models') {
+          for (const provider of this.state.providers ?? []) {
+            const id = String(provider.id ?? '').trim()
+            if (id && !this.state.modelCatalog?.[id]) void this.fetchProviderModels(id)
+          }
+        }
         if (tab === 'manage') {
           if (this.state.memories.phase === 'idle') this.loadMemories({ reset: true })
           this.refreshConsolidation()
@@ -611,16 +612,20 @@ window.__ModuleLoader__.load({
 
       // ---------------- 保存配置 ----------------
       collectOps(t) {
+        // 以 Host 镜像的最新快照作为“已保存值”基线，避免保存成功后再次修改时
+        // 因本地 value 过期而把“未变化的字段”又写一遍 / 产生无谓冲突。
+        const latest = this.form?.getSnapshot?.()
+        const savedValue = latest?.status === 'ready' && latest.value ? latest.value : this.state.value
         const ops = []
         for (const field of SCALAR_FIELDS) {
-          const saved = this.state.value[field.key]
+          const saved = savedValue?.[field.key]
           const draft = this.state.drafts[field.key]
           if (sameScalar(field, draft, saved)) continue
           ops.push({ op: 'set', path: [field.key], value: valueOf(field, draft, t) })
         }
         const stagedProviders = (this.state.providers ?? []).map(normalizeProviderDraft)
-        const savedProviders = Array.isArray(this.state.value.providers)
-          ? this.state.value.providers.map(normalizeProviderDraft)
+        const savedProviders = Array.isArray(savedValue?.providers)
+          ? savedValue.providers.map(normalizeProviderDraft)
           : []
         if (!providersEqual(stagedProviders, savedProviders)) {
           const errors = []
@@ -637,7 +642,7 @@ window.__ModuleLoader__.load({
           if (errors.length > 0) throw new Error(errors.join('；'))
           ops.push({ op: 'set', path: ['providers'], value: stagedProviders })
         }
-        const savedActive = String(this.state.value.activeProvider ?? '').trim()
+        const savedActive = String(savedValue?.activeProvider ?? '').trim()
         const stagedActive = String(this.state.activeProvider ?? '').trim()
         if (stagedActive !== savedActive) {
           ops.push({ op: 'set', path: ['activeProvider'], value: stagedActive })
@@ -675,7 +680,16 @@ window.__ModuleLoader__.load({
             }
           }
           if (collected.ops.length > 0) {
-            const ok = await this.form.mutate(collected.ops, snapshot.revision)
+            // 不传固定 expectedRevision：ConfigForm 会使用它已知的最新 revision，
+            // 避免页面持有旧 revision 时反复“设置版本冲突，需要刷新”。
+            let ok = await this.form.mutate(collected.ops)
+            if (!ok) {
+              // 给一次「恢复读」后的重试机会（例如其他设置页面刚写入了一下）
+              await new Promise((resolve) => setTimeout(resolve, 250))
+              if (this.form?.getSnapshot?.()?.status === 'ready') {
+                ok = await this.form.mutate(collected.ops)
+              }
+            }
             if (!ok) throw new Error(t('saveConflict'))
           }
           const cleared = { ...this.state.apiKeyDrafts }
@@ -791,6 +805,39 @@ window.__ModuleLoader__.load({
 
       setMemoriesLevel(level) {
         this.patch({ memories: { ...this.state.memories, level: String(level ?? '') } })
+      }
+
+      async fetchProviderModels(providerId) {
+        const id = String(providerId ?? '').trim()
+        if (!id) return
+        const current = this.state.modelCatalog?.[id]
+        if (current?.phase === 'loading') return
+        this.patch({
+          modelCatalog: {
+            ...this.state.modelCatalog,
+            [id]: { phase: 'loading', models: current?.models ?? [], error: null },
+          },
+        })
+        try {
+          const response = await fetch(`${API}/models?providerId=${encodeURIComponent(id)}`, {
+            headers: { Accept: 'application/json' },
+          })
+          const data = await response.json().catch(() => null)
+          if (!data || data.ok === false) throw new Error(data?.error ?? `HTTP ${response.status}`)
+          this.patch({
+            modelCatalog: {
+              ...this.state.modelCatalog,
+              [id]: { phase: 'ready', models: data.models ?? [], error: null },
+            },
+          })
+        } catch (error) {
+          this.patch({
+            modelCatalog: {
+              ...this.state.modelCatalog,
+              [id]: { phase: 'error', models: current?.models ?? [], error: errorText(error) },
+            },
+          })
+        }
       }
 
       async refreshConsolidation() {
@@ -991,6 +1038,7 @@ window.__ModuleLoader__.load({
           setMemoriesRange: (range) => this.setMemoriesRange(range),
           setMemoriesLevel: (level) => this.setMemoriesLevel(level),
           refreshConsolidation: () => this.refreshConsolidation(),
+          fetchProviderModels: (providerId) => this.fetchProviderModels(providerId),
           runSleepManual: () => this.runSleepManual(),
           setMemoryAdd: (field, value) => this.setMemoryAdd(field, value),
           loadMoreMemories: () => this.loadMemories({ reset: false }),
@@ -1075,6 +1123,10 @@ window.__ModuleLoader__.load({
 .dsm-switch::after{content:"";position:absolute;top:2px;left:2px;width:18px;height:18px;border-radius:50%;background:#fff;transition:transform .15s}
 .dsm-switch[aria-checked="true"]::after{transform:translateX(18px)}
 .dsm-actions{display:flex;align-items:center;gap:8px;flex-wrap:wrap}
+.dsm-functionRow{border-top:1px solid var(--dsw-alias-border-subtle,#e5e5e5);padding-top:14px;margin-top:10px;display:flex;flex-direction:column;gap:6px}
+.dsm-functionTitle{font-weight:600;font-size:13px}
+.dsm-modelChips{display:flex;flex-wrap:wrap;align-items:center;gap:6px;margin-top:8px}
+.dsm-modelChip{font-size:11px;line-height:16px;padding:1px 6px;border-radius:6px;background:var(--dsw-alias-fill-secondary,rgba(0,0,0,.04));border:1px solid var(--dsw-alias-border-subtle,rgba(0,0,0,.08));font-family:var(--dsw-alias-font-mono,monospace)}
 .dsm-btn{box-sizing:border-box;height:32px;padding:0 14px;border-radius:var(--dsw-radius-md);border:.5px solid var(--dsw-alias-border-l4);background:var(--dsw-alias-bg-layer-3);color:var(--dsw-alias-label-primary);font:inherit;font-size:13px;cursor:pointer}
 .dsm-btn:hover:not(:disabled){background:var(--dsw-alias-interactive-bg-hover)}
 .dsm-btn:disabled{opacity:.55;cursor:default}
@@ -1805,18 +1857,21 @@ window.__ModuleLoader__.load({
           h(ScalarField, { field: SCALAR_BY_KEY.get('sleepAt'), state, actions, t, disabled }),
           h(ScalarField, { field: SCALAR_BY_KEY.get('sleepRetryMinutes'), state, actions, t, disabled }),
           h(ScalarField, { field: SCALAR_BY_KEY.get('idleMinutes'), state, actions, t, disabled }),
+        ),
+        h(
+          'div',
+          { className: 'dsm-statusList' },
           h(
-            Field,
-            { label: t('field.consolidationProviderId'), hint: t('field.consolidationProviderIdHint') },
-            h(SelectField, {
-              id: 'dsm-consolidation-provider',
-              value: state.drafts.consolidationProviderId ?? '',
-              options: providerOptions,
-              disabled,
-              onChange: (value) => actions.editField('consolidationProviderId', value),
-            }),
+            'div',
+            { className: 'dsm-statusRow', key: 'model-config' },
+            h('span', { className: 'dsm-statusLabel' }, t('sleepModelConfig')),
+            h(
+              'span',
+              { className: 'dsm-statusValue' },
+              `${t('sleepModelProvider')}: ${state.drafts.consolidationProviderId || t('sleepProviderAuto')} · ${state.drafts.consolidationModel || '-'}`,
+            ),
           ),
-          h(ScalarField, { field: SCALAR_BY_KEY.get('consolidationModel'), state, actions, t, disabled }),
+          h('p', { className: 'dsm-hint' }, t('sleepModelHint')),
         ),
         h('div', { className: 'dsm-statusList' }, statusRows),
       )
@@ -1844,28 +1899,175 @@ window.__ModuleLoader__.load({
       )
     }
 
-    /** 整理级别参数卡（高级）。 */
-    function LevelsCard({ state, actions, t, disabled }) {
-      const keys = [
-        'level1Ratio',
-        'level1MaxItems',
-        'level2AfterDays',
-        'level2Ratio',
-        'level2MaxItems',
-        'level3AfterDays',
-        'level3Ratio',
-        'level3MaxItems',
-        'consolidationInputMaxChars',
+    /** 功能模型选择行（provider + 模型下拉/手填）。 */
+    function FunctionModelPicker({ idPrefix, label, hint, providerField, modelField, state, actions, t, disabled }) {
+      const providers = state.providers ?? []
+      const providerDraft = String(state.drafts?.[providerField] ?? '')
+      const modelDraft = String(state.drafts?.[modelField] ?? '')
+      const effectiveProviderId = providerDraft || state.activeProvider || providers[0]?.id || ''
+      const provider = providers.find((item) => String(item.id) === effectiveProviderId) ?? null
+      const catalogEntry = state.modelCatalog?.[effectiveProviderId]
+      const options = new Set()
+      for (const model of catalogEntry?.models ?? []) if (model?.id) options.add(model.id)
+      for (const key of ['embedModel', 'visionModel']) {
+        if (provider?.[key]) options.add(String(provider[key]))
+      }
+      if (modelDraft) options.add(modelDraft)
+      const modelOptions = [...options]
+      const providerOptions = [
+        { value: '', label: t('modelProviderAuto') },
+        ...providers.map((item) => ({ value: item.id, label: item.name || item.id })),
       ]
       return h(
-        'section',
-        { className: 'dsm-card' },
-        h('h3', { className: 'dsm-cardTitle' }, t('sectionLevels')),
-        h('p', { className: 'dsm-hint' }, t('sectionLevelsHint')),
+        'div',
+        { className: 'dsm-functionRow' },
+        h('div', { className: 'dsm-functionTitle' }, label),
+        h('p', { className: 'dsm-hint' }, hint),
         h(
           'div',
           { className: 'dsm-grid2' },
-          keys.map((key) => h(ScalarField, { key, field: SCALAR_BY_KEY.get(key), state, actions, t, disabled })),
+          h(
+            Field,
+            { label: t('modelProviderLabel') },
+            h(SelectField, {
+              id: `${idPrefix}-provider`,
+              value: providerDraft,
+              options: providerOptions,
+              disabled,
+              onChange: (value) => actions.editField(providerField, value),
+            }),
+          ),
+          modelOptions.length > 0
+            ? h(
+                Field,
+                { label: t('modelLabel'), hint: t('modelSelectHint') },
+                h(SelectField, {
+                  id: `${idPrefix}-model`,
+                  value: modelDraft,
+                  options: [{ value: '', label: t('modelInheritDefault') }, ...modelOptions.map((id) => ({ value: id, label: id }))],
+                  disabled,
+                  onChange: (value) => actions.editField(modelField, value),
+                }),
+              )
+            : h(
+                Field,
+                { label: t('modelLabel'), hint: t('modelListHint') },
+                h(TextField, {
+                  id: `${idPrefix}-model`,
+                  value: modelDraft,
+                  placeholder: t('modelPlaceholder'),
+                  disabled,
+                  onChange: (value) => actions.editField(modelField, value),
+                }),
+              ),
+        ),
+        catalogEntry?.phase === 'loading' ? h('p', { className: 'dsm-hint' }, t('modelFetching')) : null,
+        catalogEntry?.phase === 'error' ? h('p', { className: 'dsm-hint dsm-err' }, `${t('modelCatalogError')}：${catalogEntry.error}`) : null,
+      )
+    }
+
+    /** 模型列表 Tab：各 provider 的模型 + 功能模型分配。 */
+    function ModelsTab({ state, actions, t, disabled }) {
+      const providers = state.providers ?? []
+      const catalog = state.modelCatalog ?? {}
+      return h(
+        React.Fragment,
+        null,
+        h(
+          'section',
+          { className: 'dsm-card' },
+          h('h3', { className: 'dsm-cardTitle' }, t('sectionModelList')),
+          h('p', { className: 'dsm-hint' }, t('sectionModelListHint')),
+          providers.map((provider, index) => {
+            const id = String(provider.id ?? '')
+            const keyRef = providerKeyRef(provider)
+            const visionRef = providerVisionKeyRef(provider)
+            const entry = catalog[id]
+            const models = entry?.models ?? []
+            return h(
+              'div',
+              { className: 'dsm-provider', key: id || 'provider-' + index },
+              h(
+                'div',
+                { className: 'dsm-providerHead' },
+                h('div', { className: 'dsm-providerTitle' }, provider.name || id, h(Badge, null, id)),
+                h(
+                  'div',
+                  { className: 'dsm-actions' },
+                  h(
+                    'button',
+                    {
+                      type: 'button',
+                      className: 'dsm-btn dsm-btnSmall dsm-btnGhost',
+                      disabled: disabled || entry?.phase === 'loading',
+                      onClick: () => actions.fetchProviderModels(id),
+                    },
+                    entry?.phase === 'loading' ? t('modelFetching') : t('modelFetch'),
+                  ),
+                ),
+              ),
+              h('p', { className: 'dsm-hint' }, provider.baseUrl || ''),
+              h(KeyEditor, { refName: keyRef, label: t('providerKey'), state, actions, t, disabled }),
+              visionRef !== keyRef ? h(KeyEditor, { refName: visionRef, label: t('providerVisionKey'), state, actions, t, disabled }) : null,
+              h('p', { className: 'dsm-hint' }, t('modelKeyHint')),
+              entry?.phase === 'error' ? h('p', { className: 'dsm-hint dsm-err' }, `${t('modelCatalogError')}：${entry.error}`) : null,
+              models.length > 0
+                ? h(
+                    'div',
+                    { className: 'dsm-modelChips' },
+                    h('span', { className: 'dsm-hint' }, t('modelCatalogCount', { count: models.length })),
+                    models.slice(0, 60).map((model) =>
+                      h('code', { className: 'dsm-modelChip', key: model.id, title: model.ownedBy || '' }, model.id),
+                    ),
+                  )
+                : entry?.phase === 'ready'
+                  ? h('p', { className: 'dsm-hint' }, t('modelCatalogEmpty'))
+                  : null,
+            )
+          }),
+        ),
+        h(
+          'section',
+          { className: 'dsm-card' },
+          h('h3', { className: 'dsm-cardTitle' }, t('sectionFunctionModels')),
+          h('p', { className: 'dsm-hint' }, t('sectionFunctionModelsHint')),
+          h(
+            'div',
+            { className: 'dsm-statusList' },
+            h(
+              'div',
+              { className: 'dsm-statusRow', key: 'embedding-function' },
+              h('span', { className: 'dsm-statusLabel' }, t('modelFunctionEmbedding')),
+              h(
+                'span',
+                { className: 'dsm-statusValue' },
+                `${state.activeProvider || '-'} · ${providers.find((p) => p.id === (state.activeProvider || providers[0]?.id))?.embedModel || '-'}`,
+              ),
+            ),
+            h('p', { className: 'dsm-hint' }, t('modelFunctionEmbeddingHint')),
+          ),
+          h(FunctionModelPicker, {
+            idPrefix: 'dsm-caption',
+            label: t('modelFunctionCaption'),
+            hint: t('modelFunctionCaptionHint'),
+            providerField: 'captionProviderId',
+            modelField: 'captionModel',
+            state,
+            actions,
+            t,
+            disabled,
+          }),
+          h(FunctionModelPicker, {
+            idPrefix: 'dsm-consolidation',
+            label: t('modelFunctionConsolidation'),
+            hint: t('modelFunctionConsolidationHint'),
+            providerField: 'consolidationProviderId',
+            modelField: 'consolidationModel',
+            state,
+            actions,
+            t,
+            disabled,
+          }),
         ),
       )
     }
@@ -2241,7 +2443,6 @@ window.__ModuleLoader__.load({
             keys.map((key) => h(ScalarField, { key, field: SCALAR_BY_KEY.get(key), state, actions, t, disabled })),
           ),
         ),
-        h(LevelsCard, { state, actions, t, disabled }),
       )
     }
 
@@ -2250,6 +2451,7 @@ window.__ModuleLoader__.load({
       const tabs = [
         { id: 'overview', label: t('tabOverview') },
         { id: 'model', label: t('tabModel') },
+        { id: 'models', label: t('tabModels') },
         { id: 'behavior', label: t('tabBehavior') },
         { id: 'manage', label: t('tabManage') },
         { id: 'advanced', label: t('tabAdvanced') },
@@ -2320,6 +2522,10 @@ window.__ModuleLoader__.load({
         setMemoriesQuery: props.setMemoriesQuery,
         setMemoriesKind: props.setMemoriesKind,
         setMemoriesRange: props.setMemoriesRange,
+        setMemoriesLevel: props.setMemoriesLevel,
+        refreshConsolidation: props.refreshConsolidation,
+        runSleepManual: props.runSleepManual,
+        fetchProviderModels: props.fetchProviderModels,
         setMemoryAdd: props.setMemoryAdd,
         loadMoreMemories: props.loadMoreMemories,
         refreshMemories: props.refreshMemories,
@@ -2360,6 +2566,7 @@ window.__ModuleLoader__.load({
         h(Tabs, { state, actions, t }),
         tab === 'overview' ? h(StatusCard, { state, actions, t }) : null,
         tab === 'model' ? h(ModelTab, { state, actions, t, disabled }) : null,
+        tab === 'models' ? h(ModelsTab, { state, actions, t, disabled }) : null,
         tab === 'behavior' ? h(BehaviorTab, { state, actions, t, disabled }) : null,
         tab === 'manage' ? h(ManageTab, { state, actions, t, disabled }) : null,
         tab === 'advanced' ? h(AdvancedTab, { state, actions, t, disabled }) : null,
@@ -2371,6 +2578,33 @@ window.__ModuleLoader__.load({
     // 语言包（扁平 key，locale 服务只做扁查找）
     // ---------------------------------------------------------------------
     const zh = {
+      tabModels: '模型列表',
+      sectionModelList: '模型',
+      sectionModelListHint: '填入各提供商的 API 密钥即可使用其模型；也可以点「获取模型列表」从服务商拉取可用模型。',
+      modelFetch: '获取模型列表',
+      modelFetching: '拉取中…',
+      modelCatalogEmpty: '该服务商没有返回模型列表',
+      modelCatalogCount: '共 {count} 个模型',
+      modelCatalogError: '拉取模型列表失败',
+      modelKeyHint: 'API Key 只保存在本机 DSH 凭据里，不会上传到其他服务。',
+      sectionFunctionModels: '功能模型分配',
+      sectionFunctionModelsHint: '为每个功能选择使用的 provider 与模型；嵌入模型由当前激活 provider 决定（在「模型与向量库」里切换）。',
+      modelFunctionEmbedding: '嵌入模型（自动记录 / 召回）',
+      modelFunctionEmbeddingHint: '由当前激活 provider 的嵌入模型决定；更换会导致维度不一致，需同时重建集合。',
+      modelFunctionCaption: '图片概览',
+      modelFunctionCaptionHint: '只在生成图片的一句话概览时使用视觉模型，不保存原图。',
+      modelFunctionConsolidation: '记忆整理',
+      modelFunctionConsolidationHint: '睡眠整理使用该对话模型生成摘要、提炼事实。',
+      modelProviderAuto: '跟随当前激活 provider',
+      modelProviderLabel: 'Provider',
+      modelLabel: '模型',
+      modelInheritDefault: '自动（继承 provider 配置）',
+      modelListHint: '可以先在上一节拉取模型列表，或直接填写模型名。',
+      modelSelectHint: '从已拉取的模型列表中选择，或留空继承 provider 配置。',
+      modelPlaceholder: '例如 Qwen/Qwen2.5-7B-Instruct',
+      sleepModelConfig: '整理模型',
+      sleepModelProvider: 'provider',
+      sleepModelHint: '整理模型与图片概览模型现在在「模型列表」页里选择；保存后生效。',
       statusSleep: '睡眠整理',
       statusLevels: '记忆层级',
       sleepStatus: '状态',
@@ -2426,6 +2660,10 @@ window.__ModuleLoader__.load({
       'field.experimentalEnhancementEnabledHint': '额外保留整理后的 1 级记忆若干天，仅用于事件/按需召回',
       'field.experimentalEnhancementDays': '增强记忆保留天数',
       'field.experimentalEnhancementDaysHint': '到期后自动删除',
+      'field.captionProviderId': '图片概览 provider',
+      'field.captionProviderIdHint': '留空跟随当前激活 provider；图片概览模型在「模型列表」里选择',
+      'field.captionModel': '图片概览模型',
+      'field.captionModelHint': '留空使用该 provider 的 visionModel 配置；建议在「模型列表」里选择',
       'field.level1Ratio': '1 级压缩比例',
       'field.level1RatioHint': '输出条数约等于输入条数 × 比例（含摘要），默认 0.2',
       'field.level1MaxItems': '1 级输出上限',
@@ -2681,6 +2919,33 @@ window.__ModuleLoader__.load({
     }
 
     const en = {
+      tabModels: 'Models',
+      sectionModelList: 'Models',
+      sectionModelListHint: 'Enter each provider API key to use its models; use "Fetch models" to load the provider model list.',
+      modelFetch: 'Fetch models',
+      modelFetching: 'Fetching…',
+      modelCatalogEmpty: 'The provider returned no models',
+      modelCatalogCount: '{count} models',
+      modelCatalogError: 'Failed to fetch models',
+      modelKeyHint: 'API keys stay in local DSH credentials and are never uploaded elsewhere.',
+      sectionFunctionModels: 'Function model assignment',
+      sectionFunctionModelsHint: 'Pick a provider and model for each function; the embedding model comes from the active provider (change it in "Models & storage").',
+      modelFunctionEmbedding: 'Embedding (capture / recall)',
+      modelFunctionEmbeddingHint: 'Determined by the active provider embedding model; switching it changes dimensions and requires recreating the collection.',
+      modelFunctionCaption: 'Image caption',
+      modelFunctionCaptionHint: 'The vision model used only to caption an image; the original image is never stored.',
+      modelFunctionConsolidation: 'Memory consolidation',
+      modelFunctionConsolidationHint: 'The chat model used by sleep consolidation to summarize and extract facts.',
+      modelProviderAuto: 'Follow active provider',
+      modelProviderLabel: 'Provider',
+      modelLabel: 'Model',
+      modelInheritDefault: 'Auto (inherit provider config)',
+      modelListHint: 'Fetch the model list above, or type the model name directly.',
+      modelSelectHint: 'Choose from the fetched model list, or leave blank to inherit the provider config.',
+      modelPlaceholder: 'e.g. Qwen/Qwen2.5-7B-Instruct',
+      sleepModelConfig: 'Consolidation model',
+      sleepModelProvider: 'provider',
+      sleepModelHint: 'Consolidation and image-caption models are now selected in the "Models" tab; save to apply.',
       statusSleep: 'Sleep consolidation',
       statusLevels: 'Memory levels',
       sleepStatus: 'Status',
@@ -2736,6 +3001,10 @@ window.__ModuleLoader__.load({
       'field.experimentalEnhancementEnabledHint': 'Keep level-1 memories for several days for event/on-demand recall only',
       'field.experimentalEnhancementDays': 'Enhanced retention days',
       'field.experimentalEnhancementDaysHint': 'Deleted automatically after this many days',
+      'field.captionProviderId': 'Image caption provider',
+      'field.captionProviderIdHint': 'Blank follows the active provider; pick the caption model in the Models tab',
+      'field.captionModel': 'Image caption model',
+      'field.captionModelHint': 'Blank uses the provider visionModel; recommended to pick in the Models tab',
       'field.level1Ratio': 'Level 1 ratio',
       'field.level1RatioHint': 'Output ≈ input × ratio (including summary); default 0.2',
       'field.level1MaxItems': 'Level 1 max items',

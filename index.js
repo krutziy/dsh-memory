@@ -797,6 +797,16 @@ const Config = z.object({
     .description('召回/列表中显示相对时间（如“3 天前”）'),
 
   // -------------------- 图片 --------------------
+  captionProviderId: z
+    .string()
+    .default('')
+    .volatile()
+    .description('图片概览使用的 provider id；留空跟随当前激活 provider'),
+  captionModel: z
+    .string()
+    .default('')
+    .volatile()
+    .description('图片概览使用的视觉模型；留空使用该 provider 的 visionModel 配置'),
   imageMode: z
     .union([z.const('caption'), z.const('placeholder'), z.const('off')])
     .default('caption')
@@ -926,70 +936,6 @@ const Config = z.object({
     .default('')
     .volatile()
     .description('整理提示词；留空使用内置提示词'),
-  level1Ratio: z
-    .number()
-    .default(0.2)
-    .step(0.01)
-    .min(0.01)
-    .max(1)
-    .volatile()
-    .description('第 1 级（按天）压缩后保留条数比例（默认 0.2，即 100 条→约 20 条）'),
-  level1MaxItems: z
-    .number()
-    .default(30)
-    .step(1)
-    .min(1)
-    .max(200)
-    .volatile()
-    .description('第 1 级压缩后的最大条数'),
-  level2AfterDays: z
-    .number()
-    .default(7)
-    .step(1)
-    .min(0)
-    .max(3650)
-    .volatile()
-    .description('第 1 级批次创建后多少天进行第 2 级压缩'),
-  level2Ratio: z
-    .number()
-    .default(0.25)
-    .step(0.01)
-    .min(0.01)
-    .max(1)
-    .volatile()
-    .description('第 2 级压缩后保留条数比例'),
-  level2MaxItems: z
-    .number()
-    .default(12)
-    .step(1)
-    .min(1)
-    .max(200)
-    .volatile()
-    .description('第 2 级压缩后的最大条数'),
-  level3AfterDays: z
-    .number()
-    .default(30)
-    .step(1)
-    .min(0)
-    .max(3650)
-    .volatile()
-    .description('第 2 级批次创建后多少天进行第 3 级压缩'),
-  level3Ratio: z
-    .number()
-    .default(0.4)
-    .step(0.01)
-    .min(0.01)
-    .max(1)
-    .volatile()
-    .description('第 3 级压缩后保留条数比例'),
-  level3MaxItems: z
-    .number()
-    .default(6)
-    .step(1)
-    .min(1)
-    .max(200)
-    .volatile()
-    .description('第 3 级压缩后的最大条数'),
 
   // -------------------- 实验性功能 --------------------
   experimentalEventMergeEnabled: z
@@ -1153,6 +1099,35 @@ class OpenAICompatClient {
       )
     }
     return embedding
+  }
+
+  /** 拉取该 provider 的模型列表（GET /models，OpenAI 兼容）。 */
+  async listModels({ signal, timeoutMs = 15000 } = {}) {
+    if (!this.baseUrl) throw new Error(`${this.label} 未配置 Base URL`)
+    const url = `${this.baseUrl}/models`
+    let response
+    try {
+      response = await fetch(url, {
+        method: 'GET',
+        headers: { Authorization: `Bearer ${this.apiKey}`, Accept: 'application/json' },
+        signal: combineSignal(signal, timeoutMs),
+      })
+    } catch (error) {
+      if (error?.name === 'TimeoutError' || error?.name === 'AbortError') {
+        throw new Error(`${this.label} 请求超时（${url}）`)
+      }
+      throw new Error(`无法连接 ${this.label} API：${errorText(error)}`)
+    }
+    if (!response.ok) throw new Error(await failure(response, this.label))
+    const payload = await response.json().catch(() => null)
+    const rows = Array.isArray(payload?.data) ? payload.data : Array.isArray(payload) ? payload : []
+    return rows
+      .map((row) => ({
+        id: String(row?.id ?? row?.name ?? '').trim(),
+        ownedBy: row?.owned_by ? String(row.owned_by) : '',
+        created: Number(row?.created) || 0,
+      }))
+      .filter((row) => row.id)
   }
 
   /** 文本嵌入。 */
@@ -1635,6 +1610,29 @@ class MemoryService {
     return { baseUrl: normalizeUrl(base), model: String(provider?.visionModel ?? '').trim(), ref }
   }
 
+  /** 图片概览的目标 provider / 模型（支持在“模型列表”里单独指定）。 */
+  captionTarget() {
+    const cfg = this.cfg()
+    const provider =
+      (cfg.captionProviderId && this.providerById(cfg.captionProviderId)) || this.activeProvider()
+    const vision = this.visionConfigOf(provider)
+    const model = String(cfg.captionModel ?? '').trim() || vision.model
+    return { provider, vision, model }
+  }
+
+  /** 拉取 provider 的模型列表（供设置页“模型列表”使用）。 */
+  async listProviderModels(providerId) {
+    const provider =
+      (providerId && this.providerById(providerId)) || this.activeProvider()
+    const client = await this.clientFor(provider)
+    const models = await client.listModels()
+    return {
+      ok: true,
+      provider: { id: provider.id, name: provider.name, baseUrl: provider.baseUrl },
+      models,
+    }
+  }
+
   /** 读取凭据值（空字符串代表未配置）。 */
   async resolveKey(ref) {
     const name = String(ref ?? '').trim()
@@ -1939,8 +1937,7 @@ class MemoryService {
   async addImageMemory({ ref, sessionId, cwd, turn }) {
     const image = this.imageOptions()
     if (image.imageMode === 'off') return { ok: false, skipped: 'image-mode-off' }
-    const provider = this.activeProvider()
-    const vision = this.visionConfigOf(provider)
+    const { provider, vision, model: captionModel } = this.captionTarget()
     const mediaType = ref?.mediaType || 'image/png'
     const imageMeta = {
       mediaType: String(mediaType),
@@ -1949,11 +1946,12 @@ class MemoryService {
     }
     let text
     let caption = null
-    if (image.imageMode === 'caption' && vision.model) {
+    if (image.imageMode === 'caption' && captionModel) {
       try {
         const stored = await this.ctx.attachments.readImage(ref)
         const dataUri = toDataUri(stored?.data ?? stored, mediaType)
         const client = await this.clientFor(provider)
+        client.visionModel = captionModel
         const result = await client.captionImage(dataUri, {
           prompt: image.captionPrompt,
           maxTokens: image.captionMaxTokens,
@@ -2531,7 +2529,7 @@ class MemoryService {
       ok: true,
       app: {
         name: 'dsh-memory',
-        version: '0.4.0',
+        version: '0.5.0',
         startedAt: this.stats.startedAt,
       },
       time: (() => {
@@ -2558,6 +2556,32 @@ class MemoryService {
       },
       providers: [],
       storage: { ...storage },
+      functions: (() => {
+        const caption = this.captionTarget()
+        let consolidationProvider = null
+        let consolidationModel = String(this.cfg().consolidationModel ?? '').trim()
+        try {
+          consolidationProvider = this.cfg().consolidationProviderId
+            ? this.providerById(this.cfg().consolidationProviderId)
+            : this.activeProvider()
+        } catch {
+          consolidationProvider = null
+        }
+        return {
+          embedding: { providerId: provider.id, model: provider.embedModel, dimensions: provider.dimensions },
+          caption: {
+            providerId: caption.provider?.id ?? '',
+            providerName: caption.provider?.name ?? '',
+            model: caption.model,
+            configured: Boolean(caption.model),
+          },
+          consolidation: {
+            providerId: consolidationProvider?.id ?? '',
+            providerName: consolidationProvider?.name ?? '',
+            model: consolidationModel,
+          },
+        }
+      })(),
       behavior: {
         autoCapture: capture.autoCapture,
         autoRecall: recall.autoRecall,
@@ -2734,9 +2758,9 @@ class MemoryService {
  * 睡眠整理引擎（v0.4）。
  *
  * 把记忆压缩成“批次”，用任务列表调度多级压缩：
- *   L1：每天把原始记忆（level=0）压缩成一个 5 位编号的批次（默认保留约 20% 条数）
- *   L2：L1 批次创建 level2AfterDays 天后，再压缩为 L2 批次（L1 原文删除）
- *   L3：L2 批次创建 level3AfterDays 天后，再压缩为 L3 批次（最终长期摘要）
+ *   L1：每天把原始记忆（level=0）压缩成一个 5 位编号的批次（保留多少条由模型按重要性决定）
+ *   L2：L1 批次创建 7 天后，再压缩为 L2 批次（L1 原文删除）
+ *   L3：L2 批次创建 30 天后，再压缩为 L3 批次（最终长期摘要）
  *
  * 任务列表持久化在 $DSH_HOME/storages/dsh-memory/consolidation.json，
  * 批次编号是随机 5 位数；只要求“待处理/处理中”的编号唯一，完成后的编号可回收复用。
@@ -2762,7 +2786,7 @@ const DEFAULT_PROMPT = [
   '输出必须是严格 JSON（不要输出代码围栏之外的解释）：',
   '{"summary":"一段简短的整体摘要","facts":[{"text":"一条自包含的事实","kind":"fact|preference|project|note","tags":["可选标签"]}],"event":{"summary":"可选：如果这些记忆构成同一事件，写一句事件摘要","tags":["可选"]}}',
   '要求：',
-  '- facts 条数不要超过给定的上限；每条自包含，不要用“他/它/这个”等指代。',
+  '- facts 条数由你根据信息的重要性和密度自行决定（不要为了凑数而保留琐碎内容，也不要丢失关键事实）；每条自包含，不要用“他/它/这个”等指代。',
   '- 保留关键事实、偏好、决定、时间、人名、项目名；丢弃噪音。',
   '- summary 与 facts 用中文（除非原文主要是其他语言）。',
 ].join('\n')
@@ -2799,30 +2823,12 @@ class ConsolidationEngine {
 
   /** 配置级别定义（level1 为每日原始记忆压缩，level2/3 为后续批次压缩）。 */
   stages() {
-    const cfg = this.service.cfg()
-    const clampNumber = (value, fallback, min, max) => {
-      const n = Number.isFinite(Number(value)) ? Number(value) : fallback
-      return Math.min(max, Math.max(min, n))
-    }
+    // 保留条数交由模型按内容重要性决定；这里只保留安全上限（防止模型输出失控）。
+    // 7 天 / 30 天的触发间隔是固定的整理节奏，未来要扩展更多级只需在数组里追加。
     return [
-      {
-        level: 1,
-        ratio: clampNumber(cfg.level1Ratio, 0.2, 0.01, 1),
-        maxItems: Math.max(1, Math.round(clampNumber(cfg.level1MaxItems, 30, 1, 200))),
-        afterDays: 0,
-      },
-      {
-        level: 2,
-        ratio: clampNumber(cfg.level2Ratio, 0.25, 0.01, 1),
-        maxItems: Math.max(1, Math.round(clampNumber(cfg.level2MaxItems, 12, 1, 200))),
-        afterDays: Math.max(0, Math.round(clampNumber(cfg.level2AfterDays, 7, 0, 3650))),
-      },
-      {
-        level: 3,
-        ratio: clampNumber(cfg.level3Ratio, 0.4, 0.01, 1),
-        maxItems: Math.max(1, Math.round(clampNumber(cfg.level3MaxItems, 6, 1, 200))),
-        afterDays: Math.max(0, Math.round(clampNumber(cfg.level3AfterDays, 30, 0, 3650))),
-      },
+      { level: 1, maxItems: 40, afterDays: 0 },
+      { level: 2, maxItems: 20, afterDays: 7 },
+      { level: 3, maxItems: 10, afterDays: 30 },
     ]
   }
 
@@ -3165,11 +3171,9 @@ class ConsolidationEngine {
       const facts = Array.isArray(combined?.facts) ? combined.facts : []
       const event = combined?.event && typeof combined.event === 'object' ? combined.event : null
 
-      // 控制输出条数：summary + facts 的总量不超过「压缩比目标」与 maxItems 的较小者，
-      // 从而保证每一级都在真正减少条数（100 → 约 20 → 约 5 …）。
+      // 保留条数由模型决定；这里只兜底安全上限，避免模型异常输出过多条目。
       const maxItems = Math.max(1, stage.maxItems ?? 20)
-      const targetTotal = Math.max(1, Math.min(maxItems, Math.ceil(inputCount * (stage.ratio ?? 0.25))))
-      const factLimit = Math.max(0, targetTotal - (summary ? 1 : 0))
+      const factLimit = Math.max(0, maxItems - (summary ? 1 : 0))
       const selectedFacts = facts
         .filter((fact) => fact && typeof fact.text === 'string' && fact.text.trim())
         .slice(0, factLimit)
@@ -3274,7 +3278,6 @@ class ConsolidationEngine {
         sourceIdsCount: sourceIds.length,
         inputCount,
         outputCount: written.length,
-        levelRatioTarget: stage.ratio,
         maxItems,
         llmCalls,
         latencyMs,
@@ -3355,7 +3358,8 @@ class ConsolidationEngine {
     const system = customPrompt || DEFAULT_PROMPT
     const user = [
       `这是第 ${level} 级记忆整理。本批共 ${items.length} 条记忆。`,
-      `请输出 JSON：summary、facts（最多 ${maxFacts} 条）、可选 event。`,
+      `请输出 JSON：summary、facts（条数由你按重要性决定，最多 ${maxFacts} 条）、可选 event。`,
+      '精简是默认目标：优先保留关键事实、偏好、决定、时间和人名；重复、寒暄和流水账直接丢弃。',
       '',
       '【本批记忆】',
       rendered,
@@ -4356,6 +4360,7 @@ function registerMemoryTools(service) {
  *   GET  /__dsh_memory__/sleep               睡眠状态 + 整理任务列表摘要
  *   POST /__dsh_memory__/sleep/run           手动触发一次睡眠整理
  *   GET  /__dsh_memory__/consolidation       整理任务列表与历史
+ *   GET  /__dsh_memory__/models?providerId=  拉取某个 provider 的模型列表
  *
  * POST 请求要求自定义头 x-dsh-memory: 1，避免跨站请求伪造（跨域预检会拦下）。
  */
@@ -4625,8 +4630,25 @@ function registerHttpRoutes(ctx, service) {
       respond(res, 200, { ok: true, ...service.consolidation.summary() })
     },
   }
+  const modelsRoute = {
+    kind: 'exact',
+    path: '/__dsh_memory__/models',
+    handler: async (req, res) => {
+      if (req.method !== 'GET') {
+        respond(res, 405, { ok: false, error: 'method not allowed' })
+        return
+      }
+      try {
+        const query = parseQuery(req)
+        respond(res, 200, await service.listProviderModels(query.get('providerId') ?? ''))
+      } catch (error) {
+        respond(res, 500, { ok: false, error: errorText(error) })
+      }
+    },
+  }
   const routes = [
     statusRoute,
+    modelsRoute,
     memoriesRoute,
     memoriesDeleteRoute,
     exportRoute,
@@ -4750,7 +4772,7 @@ function apply(ctx, config) {
 
   const provider = service.activeProvider()
   logger.info?.(
-    `[dsh-memory] 已加载 v0.4.0：provider=${provider.id}（${provider.embedModel}，${provider.dimensions} 维）→ Qdrant ${service.storage().qdrantUrl} / ${service.storage().collection}`,
+    `[dsh-memory] 已加载 v0.5.0：provider=${provider.id}（${provider.embedModel}，${provider.dimensions} 维）→ Qdrant ${service.storage().qdrantUrl} / ${service.storage().collection}`,
   )
 
   // 6) 启动自检：确保 collection 存在（失败只告警，不阻塞 DSH 启动），并补齐旧记忆标签

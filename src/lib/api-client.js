@@ -122,6 +122,35 @@ export class OpenAICompatClient {
     return embedding
   }
 
+  /** 拉取该 provider 的模型列表（GET /models，OpenAI 兼容）。 */
+  async listModels({ signal, timeoutMs = 15000 } = {}) {
+    if (!this.baseUrl) throw new Error(`${this.label} 未配置 Base URL`)
+    const url = `${this.baseUrl}/models`
+    let response
+    try {
+      response = await fetch(url, {
+        method: 'GET',
+        headers: { Authorization: `Bearer ${this.apiKey}`, Accept: 'application/json' },
+        signal: combineSignal(signal, timeoutMs),
+      })
+    } catch (error) {
+      if (error?.name === 'TimeoutError' || error?.name === 'AbortError') {
+        throw new Error(`${this.label} 请求超时（${url}）`)
+      }
+      throw new Error(`无法连接 ${this.label} API：${errorText(error)}`)
+    }
+    if (!response.ok) throw new Error(await failure(response, this.label))
+    const payload = await response.json().catch(() => null)
+    const rows = Array.isArray(payload?.data) ? payload.data : Array.isArray(payload) ? payload : []
+    return rows
+      .map((row) => ({
+        id: String(row?.id ?? row?.name ?? '').trim(),
+        ownedBy: row?.owned_by ? String(row.owned_by) : '',
+        created: Number(row?.created) || 0,
+      }))
+      .filter((row) => row.id)
+  }
+
   /** 文本嵌入。 */
   async embedText(text, { signal, timeoutMs = 15000 } = {}) {
     if (!this.embeddingConfigured) {

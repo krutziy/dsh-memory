@@ -190,6 +190,16 @@ export const Config = z.object({
     .description('召回/列表中显示相对时间（如“3 天前”）'),
 
   // -------------------- 图片 --------------------
+  captionProviderId: z
+    .string()
+    .default('')
+    .volatile()
+    .description('图片概览使用的 provider id；留空跟随当前激活 provider'),
+  captionModel: z
+    .string()
+    .default('')
+    .volatile()
+    .description('图片概览使用的视觉模型；留空使用该 provider 的 visionModel 配置'),
   imageMode: z
     .union([z.const('caption'), z.const('placeholder'), z.const('off')])
     .default('caption')
@@ -319,70 +329,6 @@ export const Config = z.object({
     .default('')
     .volatile()
     .description('整理提示词；留空使用内置提示词'),
-  level1Ratio: z
-    .number()
-    .default(0.2)
-    .step(0.01)
-    .min(0.01)
-    .max(1)
-    .volatile()
-    .description('第 1 级（按天）压缩后保留条数比例（默认 0.2，即 100 条→约 20 条）'),
-  level1MaxItems: z
-    .number()
-    .default(30)
-    .step(1)
-    .min(1)
-    .max(200)
-    .volatile()
-    .description('第 1 级压缩后的最大条数'),
-  level2AfterDays: z
-    .number()
-    .default(7)
-    .step(1)
-    .min(0)
-    .max(3650)
-    .volatile()
-    .description('第 1 级批次创建后多少天进行第 2 级压缩'),
-  level2Ratio: z
-    .number()
-    .default(0.25)
-    .step(0.01)
-    .min(0.01)
-    .max(1)
-    .volatile()
-    .description('第 2 级压缩后保留条数比例'),
-  level2MaxItems: z
-    .number()
-    .default(12)
-    .step(1)
-    .min(1)
-    .max(200)
-    .volatile()
-    .description('第 2 级压缩后的最大条数'),
-  level3AfterDays: z
-    .number()
-    .default(30)
-    .step(1)
-    .min(0)
-    .max(3650)
-    .volatile()
-    .description('第 2 级批次创建后多少天进行第 3 级压缩'),
-  level3Ratio: z
-    .number()
-    .default(0.4)
-    .step(0.01)
-    .min(0.01)
-    .max(1)
-    .volatile()
-    .description('第 3 级压缩后保留条数比例'),
-  level3MaxItems: z
-    .number()
-    .default(6)
-    .step(1)
-    .min(1)
-    .max(200)
-    .volatile()
-    .description('第 3 级压缩后的最大条数'),
 
   // -------------------- 实验性功能 --------------------
   experimentalEventMergeEnabled: z

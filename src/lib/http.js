@@ -12,6 +12,7 @@
  *   GET  /__dsh_memory__/sleep               睡眠状态 + 整理任务列表摘要
  *   POST /__dsh_memory__/sleep/run           手动触发一次睡眠整理
  *   GET  /__dsh_memory__/consolidation       整理任务列表与历史
+ *   GET  /__dsh_memory__/models?providerId=  拉取某个 provider 的模型列表
  *
  * POST 请求要求自定义头 x-dsh-memory: 1，避免跨站请求伪造（跨域预检会拦下）。
  */
@@ -281,8 +282,25 @@ export function registerHttpRoutes(ctx, service) {
       respond(res, 200, { ok: true, ...service.consolidation.summary() })
     },
   }
+  const modelsRoute = {
+    kind: 'exact',
+    path: '/__dsh_memory__/models',
+    handler: async (req, res) => {
+      if (req.method !== 'GET') {
+        respond(res, 405, { ok: false, error: 'method not allowed' })
+        return
+      }
+      try {
+        const query = parseQuery(req)
+        respond(res, 200, await service.listProviderModels(query.get('providerId') ?? ''))
+      } catch (error) {
+        respond(res, 500, { ok: false, error: errorText(error) })
+      }
+    },
+  }
   const routes = [
     statusRoute,
+    modelsRoute,
     memoriesRoute,
     memoriesDeleteRoute,
     exportRoute,

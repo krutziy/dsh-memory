@@ -190,6 +190,29 @@ export class MemoryService {
     return { baseUrl: normalizeUrl(base), model: String(provider?.visionModel ?? '').trim(), ref }
   }
 
+  /** 图片概览的目标 provider / 模型（支持在“模型列表”里单独指定）。 */
+  captionTarget() {
+    const cfg = this.cfg()
+    const provider =
+      (cfg.captionProviderId && this.providerById(cfg.captionProviderId)) || this.activeProvider()
+    const vision = this.visionConfigOf(provider)
+    const model = String(cfg.captionModel ?? '').trim() || vision.model
+    return { provider, vision, model }
+  }
+
+  /** 拉取 provider 的模型列表（供设置页“模型列表”使用）。 */
+  async listProviderModels(providerId) {
+    const provider =
+      (providerId && this.providerById(providerId)) || this.activeProvider()
+    const client = await this.clientFor(provider)
+    const models = await client.listModels()
+    return {
+      ok: true,
+      provider: { id: provider.id, name: provider.name, baseUrl: provider.baseUrl },
+      models,
+    }
+  }
+
   /** 读取凭据值（空字符串代表未配置）。 */
   async resolveKey(ref) {
     const name = String(ref ?? '').trim()
@@ -494,8 +517,7 @@ export class MemoryService {
   async addImageMemory({ ref, sessionId, cwd, turn }) {
     const image = this.imageOptions()
     if (image.imageMode === 'off') return { ok: false, skipped: 'image-mode-off' }
-    const provider = this.activeProvider()
-    const vision = this.visionConfigOf(provider)
+    const { provider, vision, model: captionModel } = this.captionTarget()
     const mediaType = ref?.mediaType || 'image/png'
     const imageMeta = {
       mediaType: String(mediaType),
@@ -504,11 +526,12 @@ export class MemoryService {
     }
     let text
     let caption = null
-    if (image.imageMode === 'caption' && vision.model) {
+    if (image.imageMode === 'caption' && captionModel) {
       try {
         const stored = await this.ctx.attachments.readImage(ref)
         const dataUri = toDataUri(stored?.data ?? stored, mediaType)
         const client = await this.clientFor(provider)
+        client.visionModel = captionModel
         const result = await client.captionImage(dataUri, {
           prompt: image.captionPrompt,
           maxTokens: image.captionMaxTokens,
@@ -1086,7 +1109,7 @@ export class MemoryService {
       ok: true,
       app: {
         name: 'dsh-memory',
-        version: '0.4.0',
+        version: '0.5.0',
         startedAt: this.stats.startedAt,
       },
       time: (() => {
@@ -1113,6 +1136,32 @@ export class MemoryService {
       },
       providers: [],
       storage: { ...storage },
+      functions: (() => {
+        const caption = this.captionTarget()
+        let consolidationProvider = null
+        let consolidationModel = String(this.cfg().consolidationModel ?? '').trim()
+        try {
+          consolidationProvider = this.cfg().consolidationProviderId
+            ? this.providerById(this.cfg().consolidationProviderId)
+            : this.activeProvider()
+        } catch {
+          consolidationProvider = null
+        }
+        return {
+          embedding: { providerId: provider.id, model: provider.embedModel, dimensions: provider.dimensions },
+          caption: {
+            providerId: caption.provider?.id ?? '',
+            providerName: caption.provider?.name ?? '',
+            model: caption.model,
+            configured: Boolean(caption.model),
+          },
+          consolidation: {
+            providerId: consolidationProvider?.id ?? '',
+            providerName: consolidationProvider?.name ?? '',
+            model: consolidationModel,
+          },
+        }
+      })(),
       behavior: {
         autoCapture: capture.autoCapture,
         autoRecall: recall.autoRecall,

@@ -2,9 +2,9 @@
  * 睡眠整理引擎（v0.4）。
  *
  * 把记忆压缩成“批次”，用任务列表调度多级压缩：
- *   L1：每天把原始记忆（level=0）压缩成一个 5 位编号的批次（默认保留约 20% 条数）
- *   L2：L1 批次创建 level2AfterDays 天后，再压缩为 L2 批次（L1 原文删除）
- *   L3：L2 批次创建 level3AfterDays 天后，再压缩为 L3 批次（最终长期摘要）
+ *   L1：每天把原始记忆（level=0）压缩成一个 5 位编号的批次（保留多少条由模型按重要性决定）
+ *   L2：L1 批次创建 7 天后，再压缩为 L2 批次（L1 原文删除）
+ *   L3：L2 批次创建 30 天后，再压缩为 L3 批次（最终长期摘要）
  *
  * 任务列表持久化在 $DSH_HOME/storages/dsh-memory/consolidation.json，
  * 批次编号是随机 5 位数；只要求“待处理/处理中”的编号唯一，完成后的编号可回收复用。
@@ -43,7 +43,7 @@ const DEFAULT_PROMPT = [
   '输出必须是严格 JSON（不要输出代码围栏之外的解释）：',
   '{"summary":"一段简短的整体摘要","facts":[{"text":"一条自包含的事实","kind":"fact|preference|project|note","tags":["可选标签"]}],"event":{"summary":"可选：如果这些记忆构成同一事件，写一句事件摘要","tags":["可选"]}}',
   '要求：',
-  '- facts 条数不要超过给定的上限；每条自包含，不要用“他/它/这个”等指代。',
+  '- facts 条数由你根据信息的重要性和密度自行决定（不要为了凑数而保留琐碎内容，也不要丢失关键事实）；每条自包含，不要用“他/它/这个”等指代。',
   '- 保留关键事实、偏好、决定、时间、人名、项目名；丢弃噪音。',
   '- summary 与 facts 用中文（除非原文主要是其他语言）。',
 ].join('\n')
@@ -80,30 +80,12 @@ export class ConsolidationEngine {
 
   /** 配置级别定义（level1 为每日原始记忆压缩，level2/3 为后续批次压缩）。 */
   stages() {
-    const cfg = this.service.cfg()
-    const clampNumber = (value, fallback, min, max) => {
-      const n = Number.isFinite(Number(value)) ? Number(value) : fallback
-      return Math.min(max, Math.max(min, n))
-    }
+    // 保留条数交由模型按内容重要性决定；这里只保留安全上限（防止模型输出失控）。
+    // 7 天 / 30 天的触发间隔是固定的整理节奏，未来要扩展更多级只需在数组里追加。
     return [
-      {
-        level: 1,
-        ratio: clampNumber(cfg.level1Ratio, 0.2, 0.01, 1),
-        maxItems: Math.max(1, Math.round(clampNumber(cfg.level1MaxItems, 30, 1, 200))),
-        afterDays: 0,
-      },
-      {
-        level: 2,
-        ratio: clampNumber(cfg.level2Ratio, 0.25, 0.01, 1),
-        maxItems: Math.max(1, Math.round(clampNumber(cfg.level2MaxItems, 12, 1, 200))),
-        afterDays: Math.max(0, Math.round(clampNumber(cfg.level2AfterDays, 7, 0, 3650))),
-      },
-      {
-        level: 3,
-        ratio: clampNumber(cfg.level3Ratio, 0.4, 0.01, 1),
-        maxItems: Math.max(1, Math.round(clampNumber(cfg.level3MaxItems, 6, 1, 200))),
-        afterDays: Math.max(0, Math.round(clampNumber(cfg.level3AfterDays, 30, 0, 3650))),
-      },
+      { level: 1, maxItems: 40, afterDays: 0 },
+      { level: 2, maxItems: 20, afterDays: 7 },
+      { level: 3, maxItems: 10, afterDays: 30 },
     ]
   }
 
@@ -446,11 +428,9 @@ export class ConsolidationEngine {
       const facts = Array.isArray(combined?.facts) ? combined.facts : []
       const event = combined?.event && typeof combined.event === 'object' ? combined.event : null
 
-      // 控制输出条数：summary + facts 的总量不超过「压缩比目标」与 maxItems 的较小者，
-      // 从而保证每一级都在真正减少条数（100 → 约 20 → 约 5 …）。
+      // 保留条数由模型决定；这里只兜底安全上限，避免模型异常输出过多条目。
       const maxItems = Math.max(1, stage.maxItems ?? 20)
-      const targetTotal = Math.max(1, Math.min(maxItems, Math.ceil(inputCount * (stage.ratio ?? 0.25))))
-      const factLimit = Math.max(0, targetTotal - (summary ? 1 : 0))
+      const factLimit = Math.max(0, maxItems - (summary ? 1 : 0))
       const selectedFacts = facts
         .filter((fact) => fact && typeof fact.text === 'string' && fact.text.trim())
         .slice(0, factLimit)
@@ -555,7 +535,6 @@ export class ConsolidationEngine {
         sourceIdsCount: sourceIds.length,
         inputCount,
         outputCount: written.length,
-        levelRatioTarget: stage.ratio,
         maxItems,
         llmCalls,
         latencyMs,
@@ -636,7 +615,8 @@ export class ConsolidationEngine {
     const system = customPrompt || DEFAULT_PROMPT
     const user = [
       `这是第 ${level} 级记忆整理。本批共 ${items.length} 条记忆。`,
-      `请输出 JSON：summary、facts（最多 ${maxFacts} 条）、可选 event。`,
+      `请输出 JSON：summary、facts（条数由你按重要性决定，最多 ${maxFacts} 条）、可选 event。`,
+      '精简是默认目标：优先保留关键事实、偏好、决定、时间和人名；重复、寒暄和流水账直接丢弃。',
       '',
       '【本批记忆】',
       rendered,
