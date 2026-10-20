@@ -17,16 +17,14 @@
  */
 import { randomUUID } from 'node:crypto'
 import { join } from 'node:path'
+import { nextBatchId } from '../domain/ids.js'
+import { CONSOLIDATION_LEVELS, levelMaxItems } from '../domain/levels.js'
+import { dayKey, dayBoundsFromKey, formatDuration, formatTimeInZone } from '../domain/time.js'
 import {
   chunkByChars,
-  dayKey,
-  dayBoundsFromKey,
   dshHome,
   errorText,
   extractJson,
-  formatDuration,
-  formatTimeInZone,
-  nextBatchId,
   readJsonFile,
   renderMemoryLines,
   writeJsonFileAtomic,
@@ -84,11 +82,11 @@ export class ConsolidationEngine {
     // 只有在设置页显式开启「限制每级整理条数」时才套用内部安全上限。
     // 7 天 / 30 天的触发间隔是固定的整理节奏，未来要扩展更多级只需在数组里追加。
     const limitEnabled = this.service.cfg().consolidationLimitItems === true
-    return [
-      { level: 1, maxItems: limitEnabled ? 40 : null, afterDays: 0 },
-      { level: 2, maxItems: limitEnabled ? 20 : null, afterDays: 7 },
-      { level: 3, maxItems: limitEnabled ? 10 : null, afterDays: 30 },
-    ]
+    return CONSOLIDATION_LEVELS.map((stage) => ({
+      level: stage.level,
+      afterDays: stage.afterDays,
+      maxItems: levelMaxItems(stage.level, limitEnabled),
+    }))
   }
 
   stage(level) {

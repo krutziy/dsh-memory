@@ -10,7 +10,7 @@
  */
 import { randomUUID } from 'node:crypto'
 import { SLEEP_SOURCE, WAKE_SOURCE } from '../../shared/protocol.js'
-import { dayKey, formatDuration, isAtOrAfterTime, parseHhMm } from '../util/index.js'
+import { dayKey, formatDuration, isAtOrAfterTime, parseHhMm } from '../domain/time.js'
 
 /** 构造一条 source.kind 为指定值的 user 消息。 */
 function contextMessage(kind, id, text) {
