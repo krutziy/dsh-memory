@@ -154,6 +154,17 @@ timer/空闲 → SleepScheduler → ConsolidationService → TaskBoard(JSON) + C
 
 ---
 
+## 6.5 重构进度（实时）
+
+| 步骤 | 状态 |
+|---|---|
+| R1 目录分层 + shared/protocol + 拓扑构建 + 测试入库 | ✅ commit 1a6dc06 |
+| R2 domain（time/ids/levels）抽取 | ✅ commit 6dec84f |
+| R3 app 用例拆分（model-router / maintenance-service），MemoryService 降到 ~945 行 | ✅ commit c8f2f9f |
+| R4 entry 拆分（bootstrap/prompt/maintenance-timer），index.js 降到 32 行 | ✅ commit c8f2f9f |
+| R5 client 模块化（src/ui/*.js + client-build.mjs） | ✅ 本提交 |
+| 行为验证 | host 81/81、整理 47/47、GUI 76/76、浏览器 57/57 |
+
 ## 7. 重构步骤（每步行为不变、测试全绿才进入下一步）
 
 | 步骤 | 内容 | 验收 |

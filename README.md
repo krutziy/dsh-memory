@@ -187,6 +187,21 @@ POST 需要请求头 `x-dsh-memory: 1`。
 - 因 DSH HMR 限制，Host 代码改动需通过 `node build.mjs` 重新生成 `index.js` 后才生效。
 - 时间显示基于记录的 epoch 时间戳，切换时区只影响显示与“今天/近 7 天”等自然日边界，不改变已存数据。
 
+## 开发与构建
+
+```bash
+# Host 半：src/ → 单文件 index.js（拓扑排序）
+node build.mjs
+# 浏览器半：src/ui/*.js → 单文件 client.js
+node client-build.mjs
+# 或一起
+node build.mjs && node client-build.mjs
+```
+
+- 分层/依赖规则见 `docs/ARCHITECTURE.md`；记忆流程与召回模型见 `docs/MEMORY-FLOW.md`。
+- Host 测试：`SF_KEY=... node tests/host-selftest.mjs`（真实嵌入+Qdrant，测试集合 `dsh_memory_test`）。
+- 整理测试：`SF_KEY=... node tests/consolidation.mjs`（与 Host 测试使用同一集合，**不要并行运行**）。
+
 ## 更新记录
 
 - **v0.6.0**：①「模型列表」直接读取 DSH 已配置的供应商与模型（`ctx.llm`），记忆整理/图片概览默认使用 DSH 模型（Key 由 DSH 管理），

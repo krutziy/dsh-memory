@@ -1,19 +1,12 @@
-/**
- * dsh-memory 浏览器半（v0.2）：Settings → 长期记忆 设置页。
- *
- * 数据来源：
- * - 插件配置：ctx.configForms（DSH Settings 服务，写回 profile patch，热生效）
- * - API Key：ctx.remote.credentials（写入 DSH 凭据库，不回传密钥本身）
- * - 运行状态 / 记忆管理 / 测试：同源 HTTP 接口 /__dsh_memory__/*
- *
- * 纯 JS，无构建步骤；只使用 React 基础能力与主题 CSS 变量。
- */
+// ⚠️ 本文件由 client-build.mjs 从 src/ui/ 生成，请修改 src/ui/ 下的源码后重新构建。
+// 生成命令：node client-build.mjs
 window.__ModuleLoader__.load({
   id: 'dsh-memory',
   factory(require) {
     const React = require('react')
     const h = React.createElement
 
+// ===== src/ui/00-constants.js =====
     /** 本页面的 locale 命名空间。 */
     const NS = 'settings.memory'
     /** 插件配置在 Loader 中的行 id（命名空间可能带 include: 前缀，运行时动态解析）。 */
@@ -289,6 +282,7 @@ window.__ModuleLoader__.load({
       return value && typeof value === 'string' ? value : ''
     }
 
+// ===== src/ui/01-controller.js =====
     // ---------------------------------------------------------------------
     // 页面控制器
     // ---------------------------------------------------------------------
@@ -1100,6 +1094,7 @@ window.__ModuleLoader__.load({
       }
     }
 
+// ===== src/ui/02-components.js =====
     // ---------------------------------------------------------------------
     // 样式（只用主题 token）与基础组件
     // ---------------------------------------------------------------------
@@ -2767,6 +2762,7 @@ window.__ModuleLoader__.load({
       )
     }
 
+// ===== src/ui/03-locales.js =====
     // ---------------------------------------------------------------------
     // 语言包（扁平 key，locale 服务只做扁查找）
     // ---------------------------------------------------------------------
@@ -3518,9 +3514,10 @@ window.__ModuleLoader__.load({
       'option.imageMode.off': 'Ignore images',
     }
 
-    return {
-      inject: ['slots', 'locale', 'remote', 'remote.credentials', 'configForms'],
-      apply(ctx) {
+// ===== src/ui/04-apply.js =====
+const inject = ['slots', 'locale', 'remote', 'remote.credentials', 'configForms']
+
+    function apply(ctx) {
         const t = ctx.locale.bind(NS)
         ctx.effect(() => ctx.locale.register(NS, { zh, en }), 'dsh-memory: dictionaries')
         const controller = new MemoryPageController(ctx)
@@ -3547,7 +3544,8 @@ window.__ModuleLoader__.load({
             ),
           'dsh-memory: settings page',
         )
-      },
     }
+
+    return { inject, apply }
   },
 })

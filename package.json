@@ -41,6 +41,8 @@
     }
   },
   "scripts": {
-    "build": "node build.mjs"
+    "build": "node build.mjs && node client-build.mjs",
+    "build:host": "node build.mjs",
+    "build:client": "node client-build.mjs"
   }
 }
