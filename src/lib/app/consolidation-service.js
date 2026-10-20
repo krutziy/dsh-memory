@@ -18,6 +18,7 @@
 import { randomUUID } from 'node:crypto'
 import { join } from 'node:path'
 import { nextBatchId } from '../domain/ids.js'
+import { normalizeConfidence, normalizeImportance } from '../domain/memory-values.js'
 import { CONSOLIDATION_LEVELS, levelMaxItems } from '../domain/levels.js'
 import { dayKey, dayBoundsFromKey, formatDuration, formatTimeInZone } from '../domain/time.js'
 import {
@@ -459,6 +460,19 @@ export class ConsolidationEngine {
       // 压缩比统计：输入条数 → 输出条数（source 删除，目标比例仅作为提示）
       const now = Date.now()
       const sourceIds = cleanSources.map((item) => item.id)
+      const avgValue = (pick) => {
+        const values = cleanSources
+          .map((item) => Number(pick(item.payload ?? {})))
+          .filter((value) => Number.isFinite(value))
+        if (values.length === 0) return null
+        return values.reduce((sum, value) => sum + value, 0) / values.length
+      }
+      const importanceAvg = avgValue((payload) => normalizeImportance(payload.importance, payload.kind))
+      const confidenceAvg = avgValue((payload) => normalizeConfidence(payload.confidence, payload.kind))
+      const sourceTimes = cleanSources
+        .map((item) => Number(item.payload?.anchorTs) || Number(item.payload?.ts) || 0)
+        .filter((value) => value > 0)
+      const anchorTs = Number(meta?.dayRange?.from) || (sourceTimes.length > 0 ? Math.min(...sourceTimes) : now)
       const baseMeta = {
         level,
         batch: batchId,
@@ -468,6 +482,9 @@ export class ConsolidationEngine {
         dayRange: meta?.dayRange ?? null,
         consolidatedAt: now,
         relatedCount: related.length,
+        anchorTs,
+        importance: importanceAvg === null ? undefined : Number(importanceAvg.toFixed(3)),
+        confidence: confidenceAvg === null ? undefined : Number(confidenceAvg.toFixed(3)),
       }
 
       const written = []

@@ -4,6 +4,7 @@
  * 相似检索辅助、旧记忆迁移、保留策略与定期维护。
  * 依赖注入 MemoryService 的基础设施方法（ensureReady/qdrant/storage/maintenanceOptions/stats）。
  */
+import { defaultConfidence, defaultImportance } from '../domain/memory-values.js'
 import { errorText } from '../util/index.js'
 
 export class MaintenanceService {
@@ -199,6 +200,53 @@ export class MaintenanceService {
       return legacy.length
     } catch (error) {
       this.logger.warn?.(`[dsh-memory] 旧记忆迁移失败：${errorText(error)}`)
+      return 0
+    }
+  }
+
+  /** 给 v0.6 旧记忆补齐动态召回字段（anchorTs/importance/confidence/accessEvents/exposureCount）。 */
+  async migrateDynamicFields() {
+    try {
+      await this.ensureReady()
+      const qdrant = await this.qdrant()
+      const storage = this.storage()
+      const patches = []
+      let offset
+      for (let page = 0; page < 100; page += 1) {
+        const { points, nextOffset } = await qdrant.scroll(storage.collection, {
+          limit: 256,
+          offset,
+          withPayload: true,
+          withVector: false,
+        })
+        for (const point of points) {
+          const payload = point.payload ?? {}
+          if (payload.anchorTs !== undefined && payload.importance !== undefined && payload.confidence !== undefined) continue
+          const kind = payload.kind ?? 'note'
+          patches.push({
+            id: String(point.id),
+            payload: {
+              anchorTs: Number(payload.dayRange?.from) || Number(payload.ts) || Date.now(),
+              importance: defaultImportance(kind),
+              confidence: defaultConfidence(kind),
+              accessEvents: Array.isArray(payload.accessEvents) ? payload.accessEvents : [],
+              exposureCount: Number(payload.exposureCount) || 0,
+              lastAccessAt: Number(payload.lastAccessAt) || 0,
+              lastExposedAt: Number(payload.lastExposedAt) || 0,
+              needsReview: payload.needsReview === true,
+            },
+          })
+        }
+        if (!nextOffset || points.length === 0) break
+        offset = nextOffset
+      }
+      for (const patch of patches) {
+        await qdrant.setPayload(storage.collection, patch.payload, [patch.id])
+      }
+      if (patches.length > 0) this.logger.info?.(`[dsh-memory] 已为 ${patches.length} 条旧记忆补齐动态召回字段`)
+      return patches.length
+    } catch (error) {
+      this.logger.warn?.(`[dsh-memory] 动态召回字段迁移失败：${errorText(error)}`)
       return 0
     }
   }

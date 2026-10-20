@@ -45,6 +45,20 @@ export class RecallController {
     this.service = service
     this.ctx = service.ctx
     this.logger = service.logger
+    /** sessionId → { ids, at }：上一轮注入的记忆（用于 D/E 确认/纠正检测）。 */
+    this.lastInjected = new Map()
+  }
+
+  /** 识别用户确认/纠正的简单规则（D/E 类复述）。 */
+  static detectFeedback(text) {
+    const value = String(text ?? '').trim()
+    if (!value) return ''
+    // 只对短句/明确措辞生效，避免长句误判
+    const confirm = /^(对|对呀|对的|没错|是的|嗯对|记住了|记一下|记住这个|yes|correct|right)[。！!,.，\s]*$/i
+    const correct = /(不对|不是这样|不是的|错了|应该是|改成|纠正|说错了|actually,? no|not correct)/i
+    if (correct.test(value)) return 'correct'
+    if (confirm.test(value) || /^(没错|对的|记住了)/.test(value)) return 'confirm'
+    return ''
   }
 
   start() {
@@ -80,6 +94,18 @@ export class RecallController {
     const options = this.service.recallOptions()
     if (!options.autoRecall) return decision
     const agentId = String(payload?.agent?.id ?? '')
+
+    // D/E：检查上一轮注入后用户的确认/纠正（仅当门控开启时记录复述）
+    if (options.ageGateEnabled && payload?.step === 1) {
+      const text = lastUserText(decision.messages) || lastUserText(payload.messages)
+      const prior = this.lastInjected.get(agentId)
+      const feedback = text ? RecallController.detectFeedback(text) : ''
+      if (prior && feedback && Date.now() - prior.at < 10 * 60 * 1000) {
+        const weight = feedback === 'confirm' ? 2.0 : 1.0
+        void this.service.recordRehearsal(prior.ids, feedback, weight)
+        this.lastInjected.delete(agentId)
+      }
+    }
     if (!this.service.captureOptions().includeSubagents && agentId) {
       const session = this.service.ctx.sessions?.get?.(agentId)
       if (session?.header?.origin === 'subagent') return decision
@@ -102,7 +128,10 @@ export class RecallController {
     })
     if (!block || hits.length === 0) return decision
     this.service.stats.lastRecallInjectAt = Date.now()
-    this.service.debugLog(`自动召回 ${hits.length} 条记忆（score ${hits[0].score.toFixed(3)}）`)
+    this.service.debugLog(`自动召回 ${hits.length} 条记忆（score ${Number(hits[0].score).toFixed(3)}）`)
+    if (options.ageGateEnabled) {
+      this.lastInjected.set(agentId, { ids: hits.map((hit) => hit.id), at: Date.now() })
+    }
     return {
       ...decision,
       messages: [...decision.messages, createMemoryMessage(block)],

@@ -18,6 +18,13 @@ import { MaintenanceService } from './maintenance-service.js'
 import { ModelRouter } from './model-router.js'
 import { QdrantClient } from '../adapters/qdrant/client.js'
 import { memoryPointId } from '../domain/ids.js'
+import {
+  defaultConfidence,
+  defaultImportance,
+  normalizeConfidence,
+  normalizeImportance,
+} from '../domain/memory-values.js'
+import { RECALL_POLICY_DEFAULTS, rankHits as rankRecallHits } from '../domain/recall-policy.js'
 import { rangeBounds, resolveTimeZone, timeInfo } from '../domain/time.js'
 import {
   SerialQueue,
@@ -128,6 +135,7 @@ export class MemoryService {
   listExpiredEnhanced(now) { return this.maintenanceService.listExpiredEnhanced(now) }
   searchSimilar(vector, options) { return this.maintenanceService.searchSimilar(vector, options) }
   migrateLegacyMemories() { return this.maintenanceService.migrateLegacyMemories() }
+  migrateDynamicFields() { return this.maintenanceService.migrateDynamicFields() }
   maintenance(options) { return this.maintenanceService.maintenance(options) }
 
   // ------------------------------------------------------------------
@@ -173,6 +181,26 @@ export class MemoryService {
       recallMaxChars: clampInt(cfg.recallMaxChars, 600, 100, 4000),
       recallIncludeCurrentSession: cfg.recallIncludeCurrentSession === true,
       recallTimeoutMs: clampInt(cfg.recallTimeoutMs, 3000, 500, 20000),
+      // 动态相关度（v0.7）
+      ageGateEnabled: cfg.recallAgeGateEnabled !== false,
+      strictness: clampNumber(cfg.recallStrictness, 0.35, 0, 1),
+      maxRequired: clampNumber(cfg.recallMaxRequired, 0.9, 0.1, 1),
+      toolBaseMinScore: clampNumber(cfg.recallToolBaseMinScore, 0.3, 0, 1),
+      toolStrictness: clampNumber(cfg.recallToolStrictness, 0.2, 0, 1),
+      weightImportance: clampNumber(cfg.recallWeightImportance, 0.2, 0, 1),
+      weightRehearsal: clampNumber(cfg.recallWeightRehearsal, 0.15, 0, 1),
+      weightConfidence: clampNumber(cfg.recallWeightConfidence, 0.1, 0, 1),
+      decayTauDays: {
+        0: clampNumber(cfg.recallDecayTauL0, 7, 1, 10000),
+        1: clampNumber(cfg.recallDecayTauL1, 30, 1, 10000),
+        2: clampNumber(cfg.recallDecayTauL2, 180, 1, 10000),
+        3: clampNumber(cfg.recallDecayTauL3, 365, 1, 10000),
+      },
+      rehearsalTauDays: clampNumber(cfg.recallRehearsalTauDays, 90, 1, 10000),
+      rehearsalMaxEvents: clampInt(cfg.recallRehearsalMaxEvents, 20, 1, 100),
+      naturalRepeatEnabled: cfg.recallNaturalRepeatEnabled !== false,
+      naturalRepeatThreshold: clampNumber(cfg.recallNaturalRepeatThreshold, 0.85, 0.5, 1),
+      candidates: clampInt(cfg.recallCandidates, 20, 3, 100),
     }
   }
 
@@ -344,15 +372,25 @@ export class MemoryService {
     const storage = this.storage()
     const { idSeed, ...payloadMeta } = meta ?? {}
     const id = memoryPointId(idSeed ? `${kind}|${idSeed}|${body}` : `${kind}|${body}`)
+    const baseTs = Number(meta?.ts) > 0 ? Number(meta.ts) : Date.now()
     const payload = sanitizeMeta({
       text: body,
       kind,
-      ts: Date.now(),
+      ts: baseTs,
       provider: provider.id,
       model: provider.embedModel,
       dimensions: provider.dimensions,
       level: 0,
       batch: '',
+      // v0.7 动态召回字段
+      importance: normalizeImportance(meta?.importance, kind),
+      confidence: normalizeConfidence(meta?.confidence, kind),
+      anchorTs: Number(meta?.anchorTs) > 0 ? Number(meta.anchorTs) : baseTs,
+      accessEvents: Array.isArray(meta?.accessEvents) ? meta.accessEvents.slice(-20) : [],
+      exposureCount: clampInt(meta?.exposureCount, 0, 0, 1000000),
+      lastAccessAt: Number(meta?.lastAccessAt) > 0 ? Number(meta.lastAccessAt) : 0,
+      lastExposedAt: Number(meta?.lastExposedAt) > 0 ? Number(meta.lastExposedAt) : 0,
+      needsReview: meta?.needsReview === true,
       ...payloadMeta,
     })
     await qdrant.upsert(storage.collection, [{ id, vector: embedded.vector, payload }], { signal })
@@ -360,7 +398,35 @@ export class MemoryService {
     this.stats.lastWriteAt = payload.ts
     this.stats.lastWriteKind = kind
     this.debugLog(`写入 ${kind} 记忆 ${id}（${body.length} 字，provider=${provider.id}）`)
+    // 自然复述检测（用户再次提及同一事实）：异步，不阻塞写入
+    if (this.recallOptions().ageGateEnabled && this.recallOptions().naturalRepeatEnabled) {
+      void this.detectNaturalRepeat({ vector: embedded.vector, selfId: id, kind })
+    }
     return { ok: true, id, text: body }
+  }
+
+  /** C 类复述：新写入内容与已有记忆高度相似时，给旧记忆记一次“自然复述”。 */
+  async detectNaturalRepeat({ vector, selfId, kind }) {
+    if (!Array.isArray(vector)) return
+    const options = this.recallOptions()
+    if (!options.ageGateEnabled || !options.naturalRepeatEnabled) return
+    if (!['turn', 'fact', 'preference', 'note', 'project'].includes(String(kind ?? ''))) return
+    try {
+      const qdrant = await this.qdrant()
+      const storage = this.storage()
+      const points = await qdrant.search(storage.collection, {
+        vector,
+        limit: 3,
+        scoreThreshold: options.naturalRepeatThreshold,
+        withPayload: false,
+      })
+      const ids = points
+        .map((point) => String(point.id ?? ''))
+        .filter((id) => id && id !== String(selfId))
+      if (ids.length > 0) await this.recordRehearsal(ids, 'repeat', 1.5)
+    } catch (error) {
+      this.debugLog(`自然复述检测失败：${errorText(error)}`)
+    }
   }
 
   /** 记录一轮对话要点。 */
@@ -513,32 +579,130 @@ export class MemoryService {
         level: Number(payload.level) || 0,
         batch: payload.batch ? String(payload.batch) : '',
         enhanced: payload.enhanced === true,
+        ...this.#dynamicPayload(payload),
       }
     })
     return { hits, query: text, usage: embedded.usage }
   }
 
   /** 自动召回：检索并组装成注入上下文块。 */
+  /** 批量更新 payload（按 id 分别写，内部串行避免打爆 Qdrant）。 */
+  async patchMemoryPayloads(patches) {
+    if (!Array.isArray(patches) || patches.length === 0) return
+    const qdrant = await this.qdrant()
+    const storage = this.storage()
+    for (const patch of patches) {
+      await qdrant.setPayload(storage.collection, patch.payload, [patch.id])
+    }
+  }
+
+  /** A 类：被动曝光（自动召回注入）。只记 exposureCount / lastExposedAt，不进入有效复述。 */
+  async recordExposure(ids) {
+    const list = (ids ?? []).map(String).filter(Boolean).slice(0, 20)
+    if (list.length === 0) return
+    try {
+      const items = await this.collectMemories({ filter: { must: [{ has_id: list }] }, withVector: false, maxItems: list.length })
+      const now = Date.now()
+      await this.patchMemoryPayloads(
+        items.map((item) => ({
+          id: item.id,
+          payload: {
+            exposureCount: clampInt(item.payload?.exposureCount, 0, 0, 1000000) + 1,
+            lastExposedAt: now,
+          },
+        })),
+      )
+    } catch (error) {
+      this.debugLog(`记录曝光失败：${errorText(error)}`)
+    }
+  }
+
+  /**
+   * B/C/D/E 类：有效复述。
+   * @param {string[]} ids 记忆 id
+   * @param {'search'|'repeat'|'confirm'|'correct'} type
+   * @param {number} weight 分类权重
+   */
+  async recordRehearsal(ids, type, weight = 1) {
+    const list = (ids ?? []).map(String).filter(Boolean).slice(0, 20)
+    if (list.length === 0) return
+    try {
+      const options = this.recallOptions()
+      const items = await this.collectMemories({ filter: { must: [{ has_id: list }] }, withVector: false, maxItems: list.length })
+      const now = Date.now()
+      const maxEvents = options.rehearsalMaxEvents
+      const patches = []
+      for (const item of items) {
+        const payload = item.payload ?? {}
+        const events = Array.isArray(payload.accessEvents) ? payload.accessEvents.slice(-(maxEvents - 1)) : []
+        const nextEvents = [...events, { type, at: now, weight: Math.max(0, Number(weight) || 0) }]
+        let confidence = normalizeConfidence(payload.confidence, payload.kind)
+        const patch = { accessEvents: nextEvents, lastAccessAt: now }
+        if (type === 'confirm') {
+          confidence = Math.min(0.95, confidence + 0.1)
+          patch.confidence = confidence
+        } else if (type === 'correct') {
+          confidence = Math.max(0.05, confidence - 0.2)
+          patch.confidence = confidence
+          patch.needsReview = true
+        }
+        patches.push({ id: item.id, payload: patch })
+      }
+      await this.patchMemoryPayloads(patches)
+    } catch (error) {
+      this.debugLog(`记录复述失败（${type}）：${errorText(error)}`)
+    }
+  }
+
+  /** 动态召回排序/门控（auto=自动召回；tool=memory_search）。 */
+  rankHits(hits, mode = 'auto') {
+    const options = this.recallOptions()
+    if (!options.ageGateEnabled) {
+      const pass = [...(hits ?? [])].sort((a, b) => (Number(b.score) || 0) - (Number(a.score) || 0))
+      return { pass, dropped: [] }
+    }
+    const policy = {
+      mode,
+      baseMinScore: mode === 'tool' ? options.toolBaseMinScore : options.recallMinScore,
+      strictness: mode === 'tool' ? options.toolStrictness : options.strictness,
+      maxRequired: options.maxRequired,
+      weightImportance: options.weightImportance,
+      weightRehearsal: options.weightRehearsal,
+      weightConfidence: options.weightConfidence,
+      decayTauDays: options.decayTauDays,
+      rehearsalTauDays: options.rehearsalTauDays,
+    }
+    return rankRecallHits(hits ?? [], policy, Date.now())
+  }
+
   async recall(query, { signal, sessionId = '', cwd = '' } = {}) {
     const options = this.recallOptions()
     const { hits } = await this.search(query, {
-      limit: options.recallTopK,
-      minScore: options.recallMinScore,
+      limit: options.ageGateEnabled ? options.candidates : options.recallTopK,
+      minScore: options.ageGateEnabled ? undefined : options.recallMinScore,
       mode: options.memoryScope,
       sessionId,
       cwd,
       includeCurrentSession: options.recallIncludeCurrentSession,
       signal,
     })
-    const filtered = hits.filter((hit) => hit.text.length > 0 && hit.enhanced !== true)
+    let candidates = hits.filter((hit) => hit.text.length > 0 && hit.enhanced !== true)
+    if (options.ageGateEnabled) {
+      const ranked = this.rankHits(candidates, 'auto')
+      candidates = ranked.pass
+    }
+    const filtered = candidates.slice(0, options.recallTopK)
     if (filtered.length === 0) return { hits: [], block: '' }
+    // A 类：被动曝光只记录，不计入有效复述、不影响排序
+    if (options.ageGateEnabled) void this.recordExposure(filtered.map((hit) => hit.id))
     const timeOptions = this.timeOptions()
     const lines = []
     for (const [index, hit] of filtered.entries()) {
       const kindLabel =
         hit.kind === 'image' ? '图片' : hit.kind === 'fact' ? '事实' : hit.kind === 'turn' ? '对话' : '记忆'
       const relative = hit.relative ? `·${hit.relative}` : ''
-      lines.push(`${index + 1}. [${hit.time}${relative}·${kindLabel}] ${truncate(hit.text, 220)}`)
+      const confidence = Number.isFinite(hit.confidence) ? `·可信度${Math.round(hit.confidence * 100)}%` : ''
+      lines.push(`${index + 1}. [${hit.time}${relative}·${kindLabel}${confidence}] ${truncate(hit.text, 220)}`)
     }
     const timeLine = timeOptions.injectCurrentTime
       ? `当前时间：${this.formatTs(Date.now())}（时区：${timeOptions.timeZoneLabel}；记忆时间均按此时区显示）\n`
@@ -555,6 +719,26 @@ export class MemoryService {
   // ------------------------------------------------------------------
 
   /** 把 Qdrant point 映射成管理界面用的条目。 */
+  /** 动态召回字段（统一读取缺省值，兼容 v0.6 旧记忆）。 */
+  #dynamicPayload(payload) {
+    const accessEvents = Array.isArray(payload?.accessEvents)
+      ? payload.accessEvents
+          .map((event) => ({ type: String(event?.type ?? ''), at: Number(event?.at) || 0, weight: Number(event?.weight) || 0 }))
+          .filter((event) => event.at > 0 && event.weight > 0)
+          .slice(-20)
+      : []
+    return {
+      importance: normalizeImportance(payload?.importance, payload?.kind),
+      confidence: normalizeConfidence(payload?.confidence, payload?.kind),
+      anchorTs: Number(payload?.anchorTs) || Number(payload?.ts) || 0,
+      accessEvents,
+      exposureCount: clampInt(payload?.exposureCount, 0, 0, 1000000),
+      lastAccessAt: Number(payload?.lastAccessAt) || 0,
+      lastExposedAt: Number(payload?.lastExposedAt) || 0,
+      needsReview: payload?.needsReview === true,
+    }
+  }
+
   #pointToItem(point, score) {
     const payload = point?.payload ?? {}
     const ts = Number(payload.ts) || 0
@@ -573,6 +757,7 @@ export class MemoryService {
       level: Number(payload.level) || 0,
       batch: payload.batch ? String(payload.batch) : '',
       enhanced: payload.enhanced === true,
+      ...this.#dynamicPayload(payload),
       ...(Number.isFinite(score) ? { score } : {}),
     }
   }
@@ -687,7 +872,7 @@ export class MemoryService {
       ok: true,
       app: {
         name: 'dsh-memory',
-        version: '0.6.0',
+        version: '0.7.0',
         startedAt: this.stats.startedAt,
       },
       time: (() => {
@@ -773,6 +958,17 @@ export class MemoryService {
         }
       })(),
       behavior: {
+        dynamicRecall: {
+          enabled: recall.ageGateEnabled,
+          strictness: recall.strictness,
+          maxRequired: recall.maxRequired,
+          weights: {
+            importance: recall.weightImportance,
+            rehearsal: recall.weightRehearsal,
+            confidence: recall.weightConfidence,
+          },
+          decayTauDays: recall.decayTauDays,
+        },
         autoCapture: capture.autoCapture,
         autoRecall: recall.autoRecall,
         memoryScope: recall.memoryScope,

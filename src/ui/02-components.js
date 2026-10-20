@@ -1168,6 +1168,19 @@
             behaviorKeys.map((key) => h(ScalarField, { key, field: SCALAR_BY_KEY.get(key), state, actions, t, disabled })),
           ),
         ),
+        h(
+          'section',
+          { className: 'dsm-card' },
+          h('h3', { className: 'dsm-cardTitle' }, t('sectionDynamicRecall')),
+          h('p', { className: 'dsm-hint' }, t('sectionDynamicRecallHint')),
+          h(
+            'div',
+            { className: 'dsm-grid2' },
+            ['recallAgeGateEnabled', 'recallStrictness', 'recallMaxRequired', 'recallWeightImportance', 'recallWeightRehearsal', 'recallWeightConfidence', 'recallNaturalRepeatEnabled'].map((key) =>
+              h(ScalarField, { key, field: SCALAR_BY_KEY.get(key), state, actions, t, disabled }),
+            ),
+          ),
+        ),
         h(SleepCard, { state, actions, t, disabled }),
         h(
           'section',
@@ -1286,6 +1299,8 @@
               { className: 'dsm-memMeta' },
               h(Badge, null, t('kind.' + (item.kind || 'note'))),
               h(Badge, null, 'L' + (item.level ?? 0)),
+              Number.isFinite(Number(item.importance)) ? h(Badge, null, 'I' + Math.round(Number(item.importance) * 100)) : null,
+              Number.isFinite(Number(item.confidence)) ? h(Badge, null, 'C' + Math.round(Number(item.confidence) * 100)) : null,
               item.batch ? h('span', { title: t('memoryBatch') }, '#' + item.batch) : null,
               item.enhanced ? h('span', { className: 'dsm-warn' }, t('memoryEnhanced')) : null,
               h('span', null, item.time),
@@ -1519,6 +1534,18 @@
     /** 高级 Tab。 */
     function AdvancedTab({ state, actions, t, disabled }) {
       const keys = ['captureUserChars', 'captureAssistantChars', 'captureMinChars', 'includeSubagents', 'debug']
+      const recallKeys = [
+        'recallToolBaseMinScore',
+        'recallToolStrictness',
+        'recallDecayTauL0',
+        'recallDecayTauL1',
+        'recallDecayTauL2',
+        'recallDecayTauL3',
+        'recallRehearsalTauDays',
+        'recallRehearsalMaxEvents',
+        'recallNaturalRepeatThreshold',
+        'recallCandidates',
+      ]
       return h(
         React.Fragment,
         null,
@@ -1531,6 +1558,17 @@
             'div',
             { className: 'dsm-grid2' },
             keys.map((key) => h(ScalarField, { key, field: SCALAR_BY_KEY.get(key), state, actions, t, disabled })),
+          ),
+        ),
+        h(
+          'section',
+          { className: 'dsm-card' },
+          h('h3', { className: 'dsm-cardTitle' }, t('sectionRecallAdvanced')),
+          h('p', { className: 'dsm-hint' }, t('sectionRecallAdvancedHint')),
+          h(
+            'div',
+            { className: 'dsm-grid2' },
+            recallKeys.map((key) => h(ScalarField, { key, field: SCALAR_BY_KEY.get(key), state, actions, t, disabled })),
           ),
         ),
       )

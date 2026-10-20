@@ -7,6 +7,7 @@
  * 使用原始 ctx.tools.register（不依赖 DSH 内部工具包），参数 schema 只使用
  * DSH 支持的 JSON Schema 子集：type/oneOf/properties/required/items/enum/const。
  */
+import { MANUAL_SAVE } from '../domain/memory-values.js'
 import { cleanText, errorText } from '../util/index.js'
 
 /** 统一的文本型工具输出渲染。 */
@@ -77,6 +78,11 @@ function searchTool(service) {
                 sessionId: { type: 'string' },
                 cwd: { type: 'string' },
                 tags: { type: 'array', items: { type: 'string' } },
+                importance: { type: 'number' },
+                confidence: { type: 'number' },
+                ageDays: { type: 'number' },
+                requiredScore: { type: 'number' },
+                effectiveScore: { type: 'number' },
               },
               required: ['id', 'text', 'kind', 'time', 'score'],
             },
@@ -99,10 +105,17 @@ function searchTool(service) {
         signal: exec?.signal,
         ...scope,
       })
+      const recallOptions = service.recallOptions()
+      const ranked = recallOptions.ageGateEnabled ? service.rankHits(hits, 'tool').pass : hits
+      const selected = ranked.slice(0, limit)
+      // B 类：模型主动线索检索命中 = 有效复述（强化，而不是被动曝光）
+      if (recallOptions.ageGateEnabled && selected.length > 0) {
+        void service.recordRehearsal(selected.map((hit) => hit.id), 'search', 1.0)
+      }
       return {
-        count: hits.length,
-        scope: `${options.toolsEnabled ? '' : ''}${scope.mode}`,
-        results: hits.map((hit) => ({
+        count: selected.length,
+        scope: scope.mode,
+        results: selected.map((hit) => ({
           id: hit.id,
           text: hit.text,
           kind: hit.kind,
@@ -112,6 +125,11 @@ function searchTool(service) {
           sessionId: hit.sessionId,
           cwd: hit.cwd,
           tags: hit.tags,
+          importance: Number.isFinite(hit.importance) ? Number(hit.importance.toFixed(3)) : undefined,
+          confidence: Number.isFinite(hit.confidence) ? Number(hit.confidence.toFixed(3)) : undefined,
+          ageDays: Number.isFinite(hit.ageDays) ? hit.ageDays : undefined,
+          requiredScore: Number.isFinite(hit.requiredScore) ? hit.requiredScore : undefined,
+          effectiveScore: Number.isFinite(hit.effectiveScore) ? hit.effectiveScore : undefined,
         })),
       }
     },
@@ -175,6 +193,8 @@ function saveTool(service) {
           source: 'memory_save',
           sessionId: context.sessionId,
           cwd: context.cwd,
+          importance: MANUAL_SAVE.importance,
+          confidence: MANUAL_SAVE.confidence,
         },
         signal: exec?.signal,
       })

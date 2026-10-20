@@ -11,5 +11,11 @@ SF_KEY=sk-... node tests/host-selftest.mjs
 SF_KEY=sk-... node tests/consolidation.mjs
 ```
 
+# 3) 动态召回纯策略（无需 API）
+node tests/recall-policy.mjs
+
+# 4) 动态召回字段/复述记录集成（需要 SF_KEY；独立集合 dsh_memory_test_dynamic）
+SF_KEY=sk-... node tests/recall-record.mjs
+
 GUI 无头与真实浏览器测试需要本机测试依赖（React/Playwright/Chromium），
 开发环境路径见脚本头注释，暂时保留在开发机上。

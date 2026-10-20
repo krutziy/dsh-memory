@@ -167,6 +167,138 @@ export const Config = z.object({
     .volatile()
     .description('自动召回的超时时间（毫秒）；超时则本轮跳过召回'),
 
+  // -------------------- 动态相关度召回（实验） --------------------
+  recallAgeGateEnabled: z
+    .boolean()
+    .default(true)
+    .volatile()
+    .description('启用动态相关度门槛（越久越严格）；关闭=旧的固定阈值行为，可一键回滚'),
+  recallStrictness: z
+    .number()
+    .default(0.35)
+    .step(0.01)
+    .min(0)
+    .max(1)
+    .volatile()
+    .description('自动召回时“越久越严格”的强度（0=旧行为，越大旧记忆越难召回）'),
+  recallMaxRequired: z
+    .number()
+    .default(0.9)
+    .step(0.01)
+    .min(0.1)
+    .max(1)
+    .volatile()
+    .description('动态门槛的上限，防止老记忆永远召不回'),
+  recallWeightImportance: z
+    .number()
+    .default(0.2)
+    .step(0.01)
+    .min(0)
+    .max(1)
+    .volatile()
+    .description('importance（重要性）对召回的补偿权重'),
+  recallWeightRehearsal: z
+    .number()
+    .default(0.15)
+    .step(0.01)
+    .min(0)
+    .max(1)
+    .volatile()
+    .description('有效复述对召回的补偿权重'),
+  recallWeightConfidence: z
+    .number()
+    .default(0.1)
+    .step(0.01)
+    .min(0)
+    .max(1)
+    .volatile()
+    .description('confidence（置信度）对召回的补偿权重'),
+  recallToolBaseMinScore: z
+    .number()
+    .default(0.3)
+    .step(0.01)
+    .min(0)
+    .max(1)
+    .volatile()
+    .description('工具检索（memory_search）的基础门槛；比自动召回宽松'),
+  recallToolStrictness: z
+    .number()
+    .default(0.2)
+    .step(0.01)
+    .min(0)
+    .max(1)
+    .volatile()
+    .description('工具检索的“越久越严格”强度'),
+  recallDecayTauL0: z
+    .number()
+    .default(7)
+    .step(1)
+    .min(1)
+    .max(10000)
+    .volatile()
+    .description('原始记忆（L0）的遗忘时间常数 τ（天）'),
+  recallDecayTauL1: z
+    .number()
+    .default(30)
+    .step(1)
+    .min(1)
+    .max(10000)
+    .volatile()
+    .description('日摘要（L1）的遗忘时间常数 τ（天）'),
+  recallDecayTauL2: z
+    .number()
+    .default(180)
+    .step(1)
+    .min(1)
+    .max(10000)
+    .volatile()
+    .description('周摘要（L2）的遗忘时间常数 τ（天）'),
+  recallDecayTauL3: z
+    .number()
+    .default(365)
+    .step(1)
+    .min(1)
+    .max(10000)
+    .volatile()
+    .description('长期摘要（L3）的遗忘时间常数 τ（天）'),
+  recallRehearsalTauDays: z
+    .number()
+    .default(90)
+    .step(1)
+    .min(1)
+    .max(10000)
+    .volatile()
+    .description('有效复述事件的记忆效力衰减时间（天）'),
+  recallRehearsalMaxEvents: z
+    .number()
+    .default(20)
+    .step(1)
+    .min(1)
+    .max(100)
+    .volatile()
+    .description('每条记忆保留的复述事件上限'),
+  recallNaturalRepeatEnabled: z
+    .boolean()
+    .default(true)
+    .volatile()
+    .description('写入时检测“用户再次提及相同事实”并计入自然复述（默认开）'),
+  recallNaturalRepeatThreshold: z
+    .number()
+    .default(0.85)
+    .step(0.01)
+    .min(0.5)
+    .max(1)
+    .volatile()
+    .description('自然复述检测的相似度阈值'),
+  recallCandidates: z
+    .number()
+    .default(20)
+    .step(1)
+    .min(3)
+    .max(100)
+    .volatile()
+    .description('动态门控前的候选数量（先宽后严）'),
+
   // -------------------- 时间与时区 --------------------
   timezone: z
     .string()
