@@ -478,438 +478,6 @@ const Config = z.object({
   // -------------------- 其他 --------------------
   debug: z.boolean().default(false).volatile().description('在 DSH 日志中输出插件调试信息'),
 })
-// ===== src/lib/util/index.js =====
-/**
- * 通用小工具：配置解包、截断、哈希、UUID、data URI、超时。
- */
-
-
-
-/** 配置字段可能是 volatile 包装（Ref），统一解包。 */
-function val(value) {
-  if (value && typeof value.get === 'function') return value.get()
-  return value
-}
-
-/** 把 @deepseek-ai/schemastery 的 Config 实例解包成普通对象。 */
-function readConfig(config) {
-  const out = {}
-  if (config === null || typeof config !== 'object') return out
-  for (const key of Object.keys(config)) out[key] = val(config[key])
-  return out
-}
-
-/** 读取配置值，undefined/null 时回退。 */
-function cfgValue(config, key, fallback) {
-  const v = val(config?.[key])
-  return v === undefined || v === null ? fallback : v
-}
-
-/** 去掉 URL 末尾斜杠。 */
-function normalizeUrl(url) {
-  const text = String(url ?? '').trim()
-  return text.replace(/\/+$/, '')
-}
-
-/** 去掉首尾空白并压缩多余空白，保留换行。 */
-function cleanText(text) {
-  return String(text ?? '')
-    .replace(/\r\n?/g, '\n')
-    .replace(/[ \t]+\n/g, '\n')
-    .replace(/\n{3,}/g, '\n\n')
-    .trim()
-}
-
-/** 截断到 max 个字符（max<=0 视为不截断）。 */
-function truncate(text, max) {
-  const value = String(text ?? '')
-  if (!max || max <= 0 || value.length <= max) return value
-  return value.slice(0, Math.max(0, max - 1)).trimEnd() + '…'
-}
-
-/** Uint8Array → data URI（硅基流动图片输入要求 data URI 或可访问 URL）。 */
-function toDataUri(bytes, mediaType) {
-  const buffer = Buffer.isBuffer(bytes) ? bytes : Buffer.from(bytes)
-  return `data:${mediaType || 'image/png'};base64,${buffer.toString('base64')}`
-}
-
-/** 本地时间字符串，形如 2026-10-17 11:22。 */
-function formatTime(ts) {
-  const value = typeof ts === 'number' && Number.isFinite(ts) ? ts : Date.now()
-  const d = new Date(value)
-  const pad = (n) => String(n).padStart(2, '0')
-  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}`
-}
-
-/** 把任意错误转成可读文本。 */
-function errorText(error) {
-  if (error === null || error === undefined) return ''
-  if (error instanceof Error) return error.message || String(error)
-  if (typeof error === 'string') return error
-  try {
-    return JSON.stringify(error)
-  } catch {
-    return String(error)
-  }
-}
-
-/** 常见密钥/令牌模式；命中后替换为 [已脱敏]。 */
-const SECRET_PATTERNS = [
-  /\bsk-[A-Za-z0-9_-]{10,}\b/g,
-  /\b(?:ghp|gho|ghu|ghs|github_pat)_[A-Za-z0-9_]{20,}\b/g,
-  /\b(Bearer\s+)[A-Za-z0-9._~+/=-]{16,}\b/gi,
-  /((?:api[_ -]?key|access[_ -]?token|secret|password|passwd|pwd)\s*[:=：]\s*)([^\s,，。;；]{6,})/gi,
-]
-
-/** 把文本里明显的密钥/令牌/密码替换为 [已脱敏]，避免记忆库保存敏感凭据。 */
-function redactSecrets(text) {
-  let out = String(text ?? '')
-  for (const pattern of SECRET_PATTERNS) {
-    out = out.replace(pattern, (match, prefix) => (typeof prefix === 'string' && prefix !== '' ? prefix + '[已脱敏]' : '[已脱敏]'))
-  }
-  return out
-}
-
-/** 简单并发安全队列：串行执行，失败只记录不打断后续任务。 */
-class SerialQueue {
-  #logger
-  #tasks = []
-  #running = false
-  #lastError = null
-  #lastErrorAt = 0
-  #done = 0
-  #failed = 0
-
-  constructor(logger) {
-    this.#logger = logger ?? console
-  }
-
-  /** 待处理任务数（含正在执行的一个）。 */
-  get pending() {
-    return this.#tasks.length + (this.#running ? 1 : 0)
-  }
-
-  /** 已完成任务数。 */
-  get done() {
-    return this.#done
-  }
-
-  /** 失败任务数。 */
-  get failed() {
-    return this.#failed
-  }
-
-  /** 最近一次失败。 */
-  get lastError() {
-    return this.#lastError
-  }
-
-  get lastErrorAt() {
-    return this.#lastErrorAt
-  }
-
-  /** 入队一个异步任务。 */
-  push(label, task, options = {}) {
-    const retries = Number.isFinite(options.retries) ? Math.max(0, options.retries) : 0
-    this.#tasks.push({ label, task, retries, attempt: 0 })
-    this.#drain()
-  }
-
-  async #drain() {
-    if (this.#running) return
-    this.#running = true
-    while (this.#tasks.length > 0) {
-      const job = this.#tasks.shift()
-      try {
-        await job.task()
-        this.#done += 1
-      } catch (error) {
-        if (job.attempt < job.retries) {
-          job.attempt += 1
-          this.#tasks.push(job)
-          await new Promise((resolve) => setTimeout(resolve, 1500))
-          continue
-        }
-        this.#failed += 1
-        this.#lastError = `${job.label}: ${errorText(error)}`
-        this.#lastErrorAt = Date.now()
-        this.#logger?.warn?.(`[dsh-memory] 任务失败 (${job.label}): ${errorText(error)}`)
-      }
-    }
-    this.#running = false
-  }
-}
-
-/** 把 provider id 规范化成凭据引用名前缀。 */
-function providerIdToEnv(id) {
-  const text = String(id ?? '')
-    .trim()
-    .replace(/[^A-Za-z0-9]+/g, '_')
-    .replace(/^_+|_+$/g, '')
-    .toUpperCase()
-  return (text || 'CUSTOM') + '_API_KEY'
-}
-
-/** 取整并夹在范围内。 */
-function clampInt(value, fallback, min, max) {
-  const number = Number.isFinite(Number(value)) ? Math.round(Number(value)) : fallback
-  return Math.min(max, Math.max(min, number))
-}
-
-/** 取浮点数并夹在范围内。 */
-function clampNumber(value, fallback, min, max) {
-  const number = Number.isFinite(Number(value)) ? Number(value) : fallback
-  return Math.min(max, Math.max(min, number))
-}
-
-/** 宽松解析布尔。 */
-function asBool(value, fallback = false) {
-  if (typeof value === 'boolean') return value
-  if (value === 'true' || value === 1 || value === '1') return true
-  if (value === 'false' || value === 0 || value === '0') return false
-  return fallback
-}
-
-// ---------------------------------------------------------------------------
-// 文件 / 任务批次 / 日程时间辅助
-// ---------------------------------------------------------------------------
-
-/** DSH harness home（默认 ~/.dsh）。 */
-function dshHome() {
-  const env = process.env.DSH_HOME
-  if (env && env.trim()) return env.trim()
-  const home = process.env.HOME || '/root'
-  return join(home, '.dsh')
-}
-
-/** 读取 JSON 文件；不存在或损坏时返回 fallback。 */
-function readJsonFile(path, fallback) {
-  try {
-    if (!existsSync(path)) return fallback
-    return JSON.parse(readFileSync(path, 'utf8'))
-  } catch {
-    return fallback
-  }
-}
-
-/** 原子写入 JSON 文件（先写临时文件再 rename）。 */
-function writeJsonFileAtomic(path, value) {
-  const dir = dirname(path)
-  if (!existsSync(dir)) mkdirSync(dir, { recursive: true })
-  const tmp = `${path}.${process.pid}.tmp`
-  writeFileSync(tmp, JSON.stringify(value, null, 2), 'utf8')
-  renameSync(tmp, path)
-}
-
-/** 把条目列表按字符预算切成若干块。 */
-function chunkByChars(items, maxChars, render) {
-  const chunks = []
-  let current = []
-  let size = 0
-  for (const item of items) {
-    const text = render ? render(item) : String(item)
-    if (size + text.length > maxChars && current.length > 0) {
-      chunks.push(current)
-      current = []
-      size = 0
-    }
-    current.push(item)
-    size += text.length + 1
-  }
-  if (current.length > 0) chunks.push(current)
-  return chunks
-}
-
-/** 从模型输出中提取 JSON（容忍 ```json 围栏与前后说明文字）。 */
-function extractJson(text) {
-  const raw = String(text ?? '').trim()
-  if (!raw) return null
-  const fenced = /```(?:json)?\s*([\s\S]*?)```/i.exec(raw)
-  const candidate = fenced ? fenced[1].trim() : raw
-  try {
-    return JSON.parse(candidate)
-  } catch {
-    /* continue */
-  }
-  const start = candidate.indexOf('{')
-  const end = candidate.lastIndexOf('}')
-  if (start >= 0 && end > start) {
-    try {
-      return JSON.parse(candidate.slice(start, end + 1))
-    } catch {
-      return null
-    }
-  }
-  return null
-}
-
-/** 截断长文本列表的渲染文本到预算。 */
-function renderMemoryLines(items, maxChars, formatter) {
-  const lines = []
-  let size = 0
-  for (const item of items) {
-    const line = formatter ? formatter(item) : String(item)
-    if (size + line.length > maxChars && lines.length > 0) break
-    lines.push(line)
-    size += line.length + 1
-  }
-  return lines.join('\n')
-}
-// ===== src/lib/entry/capture-controller.js =====
-/**
- * 自动记录：监听 session/event，在每轮结束时把“用户要点 + 助手回答要点”
- * 以及用户图片的一句话概览写入长期记忆。
- *
- * 只记录 source.kind === 'user' 的真实人类消息；插件自己注入的
- * long-term-memory 上下文、运行时上下文、工具结果等一律不记录。
- */
-
-
-/** 从 content blocks 里提取纯文本。 */
-function textFromContent(content) {
-  if (!Array.isArray(content)) return ''
-  const parts = []
-  for (const block of content) {
-    if (!block || typeof block !== 'object') continue
-    if (block.type === 'text' && typeof block.text === 'string') parts.push(block.text)
-  }
-  return cleanText(parts.join('\n'))
-}
-
-class CaptureController {
-  /**
-   * @param {import('./service.js').MemoryService} service
-   */
-  constructor(service) {
-    this.service = service
-    this.ctx = service.ctx
-    this.logger = service.logger
-    /** sessionId -> { turn, users: string[], assistant: string, images: ImageAttachmentRef[], cwd } */
-    this.buffers = new Map()
-  }
-
-  /** 注册事件监听（由插件 effect 持有）。 */
-  start() {
-    this.ctx.effect(
-      () =>
-        this.ctx.on('session/event', (session, event) => {
-          try {
-            this.observe(session, event)
-          } catch (error) {
-            this.logger.warn?.(`[dsh-memory] 记录会话事件失败：${error?.message ?? error}`)
-          }
-        }),
-      'dsh-memory: session capture',
-    )
-    this.ctx.effect(
-      () =>
-        this.ctx.on('session/disposed', (session) => {
-          this.buffers.delete(String(session?.id ?? ''))
-        }),
-      'dsh-memory: capture cleanup',
-    )
-  }
-
-  observe(session, event) {
-    // 睡眠整理期间不记录（避免把 zzzZZ 对话写进长期记忆）
-    if (this.service.sleep?.isSleeping?.()) return
-    const options = this.service.captureOptions()
-    if (!options.autoCapture) return
-    const sessionId = String(session?.id ?? '')
-    if (!sessionId) return
-    const header = session?.header
-    if (!options.includeSubagents && header?.origin === 'subagent') return
-
-    switch (event?.type) {
-      case 'turn/start': {
-        this.buffers.set(sessionId, {
-          turn: Number(event.data?.turn) || 0,
-          users: [],
-          assistant: '',
-          images: [],
-          cwd: String(header?.cwd ?? ''),
-        })
-        break
-      }
-      case 'user/message': {
-        const buffer = this.buffers.get(sessionId)
-        if (!buffer) return
-        const message = event.data
-        if (message?.source?.kind !== 'user') return
-        const text = textFromContent(message?.content)
-        if (text) buffer.users.push(text)
-        if (Array.isArray(message?.content)) {
-          for (const block of message.content) {
-            if (block?.type === 'image' && block.attachment) buffer.images.push(block.attachment)
-          }
-        }
-        break
-      }
-      case 'assistant/message': {
-        const buffer = this.buffers.get(sessionId)
-        if (!buffer) return
-        const text = textFromContent(event.data?.message?.content)
-        if (text) buffer.assistant = text
-        break
-      }
-      case 'turn/end': {
-        const buffer = this.buffers.get(sessionId)
-        this.buffers.delete(sessionId)
-        if (!buffer) return
-        if (buffer.turn !== (Number(event.data?.turn) || 0)) return
-        const reason = event.data?.reason?.kind
-        if (reason !== 'completed') return
-        this.finalize(sessionId, buffer)
-        break
-      }
-      default:
-        break
-    }
-  }
-
-  /** 一轮结束：入队写入任务（不阻塞 agent 回合）。 */
-  finalize(sessionId, buffer) {
-    const service = this.service
-    const options = service.captureOptions()
-    const userText = truncate(cleanText(buffer.users.join('\n\n')), options.captureUserChars)
-    const assistantText = truncate(cleanText(buffer.assistant), options.captureAssistantChars)
-    const summaryLength = (userText + assistantText).length
-    const imageCount = buffer.images.length
-    if (summaryLength >= options.captureMinChars) {
-      service.queue.push(
-        'capture-turn',
-        () =>
-          service.addTurnMemory({
-            userText,
-            assistantText,
-            sessionId,
-            cwd: buffer.cwd,
-            turn: buffer.turn,
-            imageCount,
-          }),
-        { retries: 1 },
-      )
-    }
-    // 图片：每张单独生成概览并写入（同一轮内按 attachmentId 去重）
-    const seen = new Set()
-    for (const ref of buffer.images) {
-      const attachmentId = String(ref?.attachmentId ?? '')
-      if (!attachmentId || seen.has(attachmentId)) continue
-      seen.add(attachmentId)
-      service.queue.push(
-        `capture-image:${attachmentId}`,
-        () =>
-          service.addImageMemory({
-            ref,
-            sessionId,
-            cwd: buffer.cwd,
-            turn: buffer.turn,
-          }),
-        { retries: 0 },
-      )
-    }
-  }
-}
 // ===== src/lib/domain/ids.js =====
 /**
  * 纯 ID 领域逻辑：内容哈希记忆 id、5 位批次号。
@@ -1190,6 +758,283 @@ function formatDuration(ms) {
   if (minutes < 60) return `${minutes}m ${seconds}s`
   const hours = Math.floor(minutes / 60)
   return `${hours}h ${minutes % 60}m`
+}
+// ===== src/lib/util/index.js =====
+/**
+ * 通用小工具：配置解包、截断、哈希、UUID、data URI、超时。
+ */
+
+
+
+/** 配置字段可能是 volatile 包装（Ref），统一解包。 */
+function val(value) {
+  if (value && typeof value.get === 'function') return value.get()
+  return value
+}
+
+/** 把 @deepseek-ai/schemastery 的 Config 实例解包成普通对象。 */
+function readConfig(config) {
+  const out = {}
+  if (config === null || typeof config !== 'object') return out
+  for (const key of Object.keys(config)) out[key] = val(config[key])
+  return out
+}
+
+/** 读取配置值，undefined/null 时回退。 */
+function cfgValue(config, key, fallback) {
+  const v = val(config?.[key])
+  return v === undefined || v === null ? fallback : v
+}
+
+/** 去掉 URL 末尾斜杠。 */
+function normalizeUrl(url) {
+  const text = String(url ?? '').trim()
+  return text.replace(/\/+$/, '')
+}
+
+/** 去掉首尾空白并压缩多余空白，保留换行。 */
+function cleanText(text) {
+  return String(text ?? '')
+    .replace(/\r\n?/g, '\n')
+    .replace(/[ \t]+\n/g, '\n')
+    .replace(/\n{3,}/g, '\n\n')
+    .trim()
+}
+
+/** 截断到 max 个字符（max<=0 视为不截断）。 */
+function truncate(text, max) {
+  const value = String(text ?? '')
+  if (!max || max <= 0 || value.length <= max) return value
+  return value.slice(0, Math.max(0, max - 1)).trimEnd() + '…'
+}
+
+/** Uint8Array → data URI（硅基流动图片输入要求 data URI 或可访问 URL）。 */
+function toDataUri(bytes, mediaType) {
+  const buffer = Buffer.isBuffer(bytes) ? bytes : Buffer.from(bytes)
+  return `data:${mediaType || 'image/png'};base64,${buffer.toString('base64')}`
+}
+
+/** 本地时间字符串，形如 2026-10-17 11:22。 */
+function formatTime(ts) {
+  const value = typeof ts === 'number' && Number.isFinite(ts) ? ts : Date.now()
+  const d = new Date(value)
+  const pad = (n) => String(n).padStart(2, '0')
+  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}`
+}
+
+/** 把任意错误转成可读文本。 */
+function errorText(error) {
+  if (error === null || error === undefined) return ''
+  if (error instanceof Error) return error.message || String(error)
+  if (typeof error === 'string') return error
+  try {
+    return JSON.stringify(error)
+  } catch {
+    return String(error)
+  }
+}
+
+/** 常见密钥/令牌模式；命中后替换为 [已脱敏]。 */
+const SECRET_PATTERNS = [
+  /\bsk-[A-Za-z0-9_-]{10,}\b/g,
+  /\b(?:ghp|gho|ghu|ghs|github_pat)_[A-Za-z0-9_]{20,}\b/g,
+  /\b(Bearer\s+)[A-Za-z0-9._~+/=-]{16,}\b/gi,
+  /((?:api[_ -]?key|access[_ -]?token|secret|password|passwd|pwd)\s*[:=：]\s*)([^\s,，。;；]{6,})/gi,
+]
+
+/** 把文本里明显的密钥/令牌/密码替换为 [已脱敏]，避免记忆库保存敏感凭据。 */
+function redactSecrets(text) {
+  let out = String(text ?? '')
+  for (const pattern of SECRET_PATTERNS) {
+    out = out.replace(pattern, (match, prefix) => (typeof prefix === 'string' && prefix !== '' ? prefix + '[已脱敏]' : '[已脱敏]'))
+  }
+  return out
+}
+
+/** 简单并发安全队列：串行执行，失败只记录不打断后续任务。 */
+class SerialQueue {
+  #logger
+  #tasks = []
+  #running = false
+  #lastError = null
+  #lastErrorAt = 0
+  #done = 0
+  #failed = 0
+
+  constructor(logger) {
+    this.#logger = logger ?? console
+  }
+
+  /** 待处理任务数（含正在执行的一个）。 */
+  get pending() {
+    return this.#tasks.length + (this.#running ? 1 : 0)
+  }
+
+  /** 已完成任务数。 */
+  get done() {
+    return this.#done
+  }
+
+  /** 失败任务数。 */
+  get failed() {
+    return this.#failed
+  }
+
+  /** 最近一次失败。 */
+  get lastError() {
+    return this.#lastError
+  }
+
+  get lastErrorAt() {
+    return this.#lastErrorAt
+  }
+
+  /** 入队一个异步任务。 */
+  push(label, task, options = {}) {
+    const retries = Number.isFinite(options.retries) ? Math.max(0, options.retries) : 0
+    this.#tasks.push({ label, task, retries, attempt: 0 })
+    this.#drain()
+  }
+
+  async #drain() {
+    if (this.#running) return
+    this.#running = true
+    while (this.#tasks.length > 0) {
+      const job = this.#tasks.shift()
+      try {
+        await job.task()
+        this.#done += 1
+      } catch (error) {
+        if (job.attempt < job.retries) {
+          job.attempt += 1
+          this.#tasks.push(job)
+          await new Promise((resolve) => setTimeout(resolve, 1500))
+          continue
+        }
+        this.#failed += 1
+        this.#lastError = `${job.label}: ${errorText(error)}`
+        this.#lastErrorAt = Date.now()
+        this.#logger?.warn?.(`[dsh-memory] 任务失败 (${job.label}): ${errorText(error)}`)
+      }
+    }
+    this.#running = false
+  }
+}
+
+/** 把 provider id 规范化成凭据引用名前缀。 */
+function providerIdToEnv(id) {
+  const text = String(id ?? '')
+    .trim()
+    .replace(/[^A-Za-z0-9]+/g, '_')
+    .replace(/^_+|_+$/g, '')
+    .toUpperCase()
+  return (text || 'CUSTOM') + '_API_KEY'
+}
+
+/** 取整并夹在范围内。 */
+function clampInt(value, fallback, min, max) {
+  const number = Number.isFinite(Number(value)) ? Math.round(Number(value)) : fallback
+  return Math.min(max, Math.max(min, number))
+}
+
+/** 取浮点数并夹在范围内。 */
+function clampNumber(value, fallback, min, max) {
+  const number = Number.isFinite(Number(value)) ? Number(value) : fallback
+  return Math.min(max, Math.max(min, number))
+}
+
+/** 宽松解析布尔。 */
+function asBool(value, fallback = false) {
+  if (typeof value === 'boolean') return value
+  if (value === 'true' || value === 1 || value === '1') return true
+  if (value === 'false' || value === 0 || value === '0') return false
+  return fallback
+}
+
+// ---------------------------------------------------------------------------
+// 文件 / 任务批次 / 日程时间辅助
+// ---------------------------------------------------------------------------
+
+/** DSH harness home（默认 ~/.dsh）。 */
+function dshHome() {
+  const env = process.env.DSH_HOME
+  if (env && env.trim()) return env.trim()
+  const home = process.env.HOME || '/root'
+  return join(home, '.dsh')
+}
+
+/** 读取 JSON 文件；不存在或损坏时返回 fallback。 */
+function readJsonFile(path, fallback) {
+  try {
+    if (!existsSync(path)) return fallback
+    return JSON.parse(readFileSync(path, 'utf8'))
+  } catch {
+    return fallback
+  }
+}
+
+/** 原子写入 JSON 文件（先写临时文件再 rename）。 */
+function writeJsonFileAtomic(path, value) {
+  const dir = dirname(path)
+  if (!existsSync(dir)) mkdirSync(dir, { recursive: true })
+  const tmp = `${path}.${process.pid}.tmp`
+  writeFileSync(tmp, JSON.stringify(value, null, 2), 'utf8')
+  renameSync(tmp, path)
+}
+
+/** 把条目列表按字符预算切成若干块。 */
+function chunkByChars(items, maxChars, render) {
+  const chunks = []
+  let current = []
+  let size = 0
+  for (const item of items) {
+    const text = render ? render(item) : String(item)
+    if (size + text.length > maxChars && current.length > 0) {
+      chunks.push(current)
+      current = []
+      size = 0
+    }
+    current.push(item)
+    size += text.length + 1
+  }
+  if (current.length > 0) chunks.push(current)
+  return chunks
+}
+
+/** 从模型输出中提取 JSON（容忍 ```json 围栏与前后说明文字）。 */
+function extractJson(text) {
+  const raw = String(text ?? '').trim()
+  if (!raw) return null
+  const fenced = /```(?:json)?\s*([\s\S]*?)```/i.exec(raw)
+  const candidate = fenced ? fenced[1].trim() : raw
+  try {
+    return JSON.parse(candidate)
+  } catch {
+    /* continue */
+  }
+  const start = candidate.indexOf('{')
+  const end = candidate.lastIndexOf('}')
+  if (start >= 0 && end > start) {
+    try {
+      return JSON.parse(candidate.slice(start, end + 1))
+    } catch {
+      return null
+    }
+  }
+  return null
+}
+
+/** 截断长文本列表的渲染文本到预算。 */
+function renderMemoryLines(items, maxChars, formatter) {
+  const lines = []
+  let size = 0
+  for (const item of items) {
+    const line = formatter ? formatter(item) : String(item)
+    if (size + line.length > maxChars && lines.length > 0) break
+    lines.push(line)
+    size += line.length + 1
+  }
+  return lines.join('\n')
 }
 // ===== src/lib/app/consolidation-service.js =====
 /**
@@ -1927,339 +1772,6 @@ class ConsolidationEngine {
     }
   }
 }
-// ===== src/lib/entry/http/routes.js =====
-/**
- * 设置页使用的 Host HTTP 接口（与 DSH Web 同源，仅本机可访问）：
- *
- *   GET  /__dsh_memory__/status              运行状态
- *   GET  /__dsh_memory__/memories?q&limit&offset&kind   记忆列表/检索
- *   GET  /__dsh_memory__/export              导出全部记忆 JSON
- *   POST /__dsh_memory__/test                测试激活 provider（可带 providerId）
- *   POST /__dsh_memory__/memories            手动新增记忆
- *   POST /__dsh_memory__/memories/delete     删除记忆 {ids:[...]}
- *   POST /__dsh_memory__/recreate            重建集合（需要 confirm:"DELETE"）
- *   POST /__dsh_memory__/maintenance         立即执行一次维护
- *   GET  /__dsh_memory__/sleep               睡眠状态 + 整理任务列表摘要
- *   POST /__dsh_memory__/sleep/run           手动触发一次睡眠整理
- *   GET  /__dsh_memory__/consolidation       整理任务列表与历史
- *   GET  /__dsh_memory__/models?providerId=  拉取某个 provider 的模型列表
- *
- * POST 请求要求自定义头 x-dsh-memory: 1，避免跨站请求伪造（跨域预检会拦下）。
- */
-
-
-/** 读取 JSON 请求体（限制大小）。 */
-function readJsonBody(req, limit = 64 * 1024) {
-  return new Promise((resolve, reject) => {
-    let size = 0
-    const chunks = []
-    req.on('data', (chunk) => {
-      size += chunk.length
-      if (size > limit) {
-        reject(new Error('请求体过大'))
-        req.destroy()
-        return
-      }
-      chunks.push(chunk)
-    })
-    req.on('end', () => {
-      if (chunks.length === 0) {
-        resolve(undefined)
-        return
-      }
-      try {
-        resolve(JSON.parse(Buffer.concat(chunks).toString('utf8')))
-      } catch (error) {
-        reject(new Error(`请求体不是合法 JSON：${errorText(error)}`))
-      }
-    })
-    req.on('error', reject)
-  })
-}
-
-/** 统一 JSON 响应。 */
-function respond(res, status, value) {
-  const body = JSON.stringify(value)
-  res.statusCode = status
-  res.setHeader('Content-Type', 'application/json; charset=utf-8')
-  res.setHeader('Cache-Control', 'no-store')
-  res.end(body)
-}
-
-/** 是否是带自定义头的 POST（基础 CSRF 防护）。 */
-function trustedPost(req) {
-  return req.method === 'POST' && req.headers['x-dsh-memory'] === '1'
-}
-
-/** 解析 URL 查询参数。 */
-function parseQuery(req) {
-  try {
-    const url = new URL(String(req.url ?? '/'), 'http://127.0.0.1')
-    return url.searchParams
-  } catch {
-    return new URLSearchParams()
-  }
-}
-
-/**
- * @param {object} ctx DSH 插件上下文
- * @param {import('./service.js').MemoryService} service
- */
-function registerHttpRoutes(ctx, service) {
-  const log = service.logger
-  const statusRoute = {
-    kind: 'exact',
-    path: '/__dsh_memory__/status',
-    handler: async (req, res) => {
-      if (req.method !== 'GET') {
-        respond(res, 405, { ok: false, error: 'method not allowed' })
-        return
-      }
-      try {
-        respond(res, 200, await service.status())
-      } catch (error) {
-        respond(res, 500, { ok: false, error: errorText(error) })
-      }
-    },
-  }
-  const memoriesRoute = {
-    kind: 'exact',
-    path: '/__dsh_memory__/memories',
-    handler: async (req, res) => {
-      try {
-        if (req.method === 'GET') {
-          const query = parseQuery(req)
-          const result = await service.listMemories({
-            query: query.get('q') ?? '',
-            limit: Number(query.get('limit') ?? 20),
-            offset: query.get('offset') ?? null,
-            kind: query.get('kind') ?? '',
-            range: query.get('range') ?? '',
-            level: query.get('level') ?? '',
-            batch: query.get('batch') ?? '',
-          })
-          respond(res, 200, { ok: true, ...result })
-          return
-        }
-        if (!trustedPost(req)) {
-          respond(res, 403, { ok: false, error: 'forbidden' })
-          return
-        }
-        const body = await readJsonBody(req)
-        const text = cleanText(body?.text ?? '')
-        if (!text) {
-          respond(res, 400, { ok: false, error: '缺少要保存的 text' })
-          return
-        }
-        const kind = typeof body?.kind === 'string' && body.kind.trim() ? body.kind.trim() : 'note'
-        const tags = Array.isArray(body?.tags)
-          ? body.tags.filter((tag) => typeof tag === 'string').slice(0, 12)
-          : []
-        const saved = await service.addMemory({ kind, text, meta: { tags, source: 'settings' } })
-        respond(res, 200, { ok: true, item: saved })
-      } catch (error) {
-        respond(res, 500, { ok: false, error: errorText(error) })
-      }
-    },
-  }
-  const memoriesDeleteRoute = {
-    kind: 'exact',
-    path: '/__dsh_memory__/memories/delete',
-    handler: async (req, res) => {
-      if (!trustedPost(req)) {
-        respond(res, 403, { ok: false, error: 'forbidden' })
-        return
-      }
-      try {
-        const body = await readJsonBody(req)
-        const ids = Array.isArray(body?.ids) ? body.ids : body?.id ? [body.id] : []
-        const result = await service.forget(ids)
-        respond(res, 200, result)
-      } catch (error) {
-        respond(res, 400, { ok: false, error: errorText(error) })
-      }
-    },
-  }
-  const exportRoute = {
-    kind: 'exact',
-    path: '/__dsh_memory__/export',
-    handler: async (req, res) => {
-      if (req.method !== 'GET') {
-        respond(res, 405, { ok: false, error: 'method not allowed' })
-        return
-      }
-      try {
-        respond(res, 200, await service.exportMemories())
-      } catch (error) {
-        respond(res, 500, { ok: false, error: errorText(error) })
-      }
-    },
-  }
-  const testRoute = {
-    kind: 'exact',
-    path: '/__dsh_memory__/test',
-    handler: async (req, res) => {
-      if (!trustedPost(req)) {
-        respond(res, 403, { ok: false, error: 'forbidden' })
-        return
-      }
-      try {
-        const body = await readJsonBody(req)
-        respond(res, 200, await service.test(typeof body?.providerId === 'string' ? body.providerId : undefined))
-      } catch (error) {
-        log.warn?.(`[dsh-memory] 连接测试失败：${errorText(error)}`)
-        respond(res, 500, { ok: false, error: errorText(error) })
-      }
-    },
-  }
-  const recreateRoute = {
-    kind: 'exact',
-    path: '/__dsh_memory__/recreate',
-    handler: async (req, res) => {
-      if (!trustedPost(req)) {
-        respond(res, 403, { ok: false, error: 'forbidden' })
-        return
-      }
-      try {
-        const body = await readJsonBody(req)
-        if (body?.confirm !== 'DELETE') {
-          respond(res, 400, { ok: false, error: '需要 confirm: "DELETE" 才能重建集合' })
-          return
-        }
-        const result = await service.recreateCollection()
-        if (!result.ok) {
-          respond(res, 500, { ok: false, error: result.error ?? '重建失败' })
-          return
-        }
-        respond(res, 200, { ok: true, collection: result.info })
-      } catch (error) {
-        log.warn?.(`[dsh-memory] 重建集合失败：${errorText(error)}`)
-        respond(res, 500, { ok: false, error: errorText(error) })
-      }
-    },
-  }
-  const maintenanceRoute = {
-    kind: 'exact',
-    path: '/__dsh_memory__/maintenance',
-    handler: async (req, res) => {
-      if (!trustedPost(req)) {
-        respond(res, 403, { ok: false, error: 'forbidden' })
-        return
-      }
-      try {
-        await readJsonBody(req)
-        respond(res, 200, await service.maintenance({ force: true }))
-      } catch (error) {
-        respond(res, 500, { ok: false, error: errorText(error) })
-      }
-    },
-  }
-  const sleepRoute = {
-    kind: 'exact',
-    path: '/__dsh_memory__/sleep',
-    handler: async (req, res) => {
-      if (req.method !== 'GET') {
-        respond(res, 405, { ok: false, error: 'method not allowed' })
-        return
-      }
-      if (!service.sleep || !service.consolidation) {
-        respond(res, 503, { ok: false, error: '睡眠整理组件未加载' })
-        return
-      }
-      respond(res, 200, {
-        ok: true,
-        sleep: service.sleep.status(),
-        consolidation: service.consolidation.summary(),
-      })
-    },
-  }
-  const sleepRunRoute = {
-    kind: 'exact',
-    path: '/__dsh_memory__/sleep/run',
-    handler: async (req, res) => {
-      if (!trustedPost(req)) {
-        respond(res, 403, { ok: false, error: 'forbidden' })
-        return
-      }
-      if (!service.sleep) {
-        respond(res, 503, { ok: false, error: '睡眠整理组件未加载' })
-        return
-      }
-      try {
-        const body = await readJsonBody(req)
-        if (body?.confirm === 'run') {
-          respond(res, 200, service.sleep.requestManual())
-          return
-        }
-        respond(res, 200, service.sleep.requestManual())
-      } catch (error) {
-        respond(res, 500, { ok: false, error: errorText(error) })
-      }
-    },
-  }
-  const consolidationRoute = {
-    kind: 'exact',
-    path: '/__dsh_memory__/consolidation',
-    handler: async (req, res) => {
-      if (req.method !== 'GET') {
-        respond(res, 405, { ok: false, error: 'method not allowed' })
-        return
-      }
-      if (!service.consolidation) {
-        respond(res, 503, { ok: false, error: '整理引擎未加载' })
-        return
-      }
-      respond(res, 200, { ok: true, ...service.consolidation.summary() })
-    },
-  }
-  const modelsRoute = {
-    kind: 'exact',
-    path: '/__dsh_memory__/models',
-    handler: async (req, res) => {
-      if (req.method !== 'GET') {
-        respond(res, 405, { ok: false, error: 'method not allowed' })
-        return
-      }
-      try {
-        const query = parseQuery(req)
-        respond(res, 200, await service.listProviderModels(query.get('providerId') ?? ''))
-      } catch (error) {
-        respond(res, 500, { ok: false, error: errorText(error) })
-      }
-    },
-  }
-  const dshModelsRoute = {
-    kind: 'exact',
-    path: '/__dsh_memory__/dsh-models',
-    handler: async (req, res) => {
-      if (req.method !== 'GET') {
-        respond(res, 405, { ok: false, error: 'method not allowed' })
-        return
-      }
-      try {
-        respond(res, 200, { ok: true, ...(await service.dshCatalog()) })
-      } catch (error) {
-        respond(res, 500, { ok: false, error: errorText(error) })
-      }
-    },
-  }
-
-  const routes = [
-    statusRoute,
-    memoriesRoute,
-    memoriesDeleteRoute,
-    exportRoute,
-    testRoute,
-    recreateRoute,
-    maintenanceRoute,
-    sleepRoute,
-    sleepRunRoute,
-    consolidationRoute,
-    modelsRoute,
-    dshModelsRoute,
-  ]
-  return routes.map((route) => ctx.effect(() => ctx.webServer.register(route), `dsh-memory: route ${route.path}`))
-}
 // ===== src/shared/protocol.js =====
 /**
  * Host 与 client 共用的协议常量（单一事实源）。
@@ -2272,118 +1784,6 @@ const POST_HEADER_VALUE = '1'
 const MEMORY_SOURCE = 'long-term-memory'
 const SLEEP_SOURCE = 'dsh-memory-sleep'
 const WAKE_SOURCE = 'dsh-memory-wake'
-// ===== src/lib/entry/recall-controller.js =====
-/**
- * 自动召回：在每轮第一步之前，用最后一条真实用户消息做向量检索，
- * 把相关记忆作为一条 source.kind = 'long-term-memory' 的上下文消息
- * 追加进本步的 messages。
- *
- * 该消息会进入会话日志（可回放/可 fork），DSH Web 会把它显示成
- * “上下文注入”行，而不是用户气泡。
- */
-
-
-
-
-/** 从消息列表里取出最后一条真实人类消息的文本。 */
-function lastUserText(messages) {
-  if (!Array.isArray(messages)) return ''
-  for (let index = messages.length - 1; index >= 0; index -= 1) {
-    const message = messages[index]
-    if (!message || message.role !== 'user') continue
-    if (message.source?.kind !== 'user') continue
-    const parts = []
-    for (const block of message.content ?? []) {
-      if (block?.type === 'text' && typeof block.text === 'string') parts.push(block.text)
-    }
-    const text = parts.join('\n').trim()
-    if (text) return text
-  }
-  return ''
-}
-
-/** 构造注入用的上下文消息。 */
-function createMemoryMessage(text) {
-  return {
-    id: `memory-${randomUUID()}`,
-    role: 'user',
-    content: [{ type: 'text', text }],
-    source: { kind: MEMORY_SOURCE },
-  }
-}
-
-class RecallController {
-  /**
-   * @param {import('./service.js').MemoryService} service
-   */
-  constructor(service) {
-    this.service = service
-    this.ctx = service.ctx
-    this.logger = service.logger
-  }
-
-  start() {
-    this.ctx.effect(
-      () =>
-        this.ctx.on('agent/pre-step', async (payload, next) => {
-          const decision = await next()
-          try {
-            return await this.augment(payload, decision)
-          } catch (error) {
-            this.service.stats.lastRecallError = errorText(error)
-            this.service.debugLog(`自动召回失败：${errorText(error)}`)
-            return decision
-          }
-        }),
-      'dsh-memory: auto recall',
-    )
-  }
-
-  async augment(payload, decision) {
-    // 睡眠整理期间：不召回，改为让模型只回复 zzzZZ，并把用户原话排队到睡醒后继续处理
-    const sleep = this.service.sleep
-    if (sleep?.isSleeping?.()) {
-      if (payload?.step !== 1) return decision
-      if (payload?.signal?.aborted) return decision
-      if (decision?.kind !== 'enter') return decision
-      const intercepted = sleep.interceptPreStep(payload, decision)
-      if (intercepted?.message) {
-        return { ...decision, messages: [...decision.messages, intercepted.message] }
-      }
-      return decision
-    }
-    const options = this.service.recallOptions()
-    if (!options.autoRecall) return decision
-    const agentId = String(payload?.agent?.id ?? '')
-    if (!this.service.captureOptions().includeSubagents && agentId) {
-      const session = this.service.ctx.sessions?.get?.(agentId)
-      if (session?.header?.origin === 'subagent') return decision
-    }
-    if (payload?.step !== 1) return decision
-    if (payload?.signal?.aborted) return decision
-    if (decision?.kind !== 'enter') return decision
-    const query = lastUserText(decision.messages) || lastUserText(payload.messages)
-    this.service.stats.recallChecks += 1
-    this.service.stats.lastRecallQuery = query.slice(0, 120)
-    this.service.stats.lastRecallError = ''
-    if (!query || query.length < 2) return decision
-    const context = this.service.sessionContext(agentId)
-    const timeout = AbortSignal.timeout(options.recallTimeoutMs)
-    const signal = payload?.signal === undefined ? timeout : AbortSignal.any([payload.signal, timeout])
-    const { block, hits } = await this.service.recall(query, {
-      signal,
-      sessionId: context.sessionId,
-      cwd: context.cwd,
-    })
-    if (!block || hits.length === 0) return decision
-    this.service.stats.lastRecallInjectAt = Date.now()
-    this.service.debugLog(`自动召回 ${hits.length} 条记忆（score ${hits[0].score.toFixed(3)}）`)
-    return {
-      ...decision,
-      messages: [...decision.messages, createMemoryMessage(block)],
-    }
-  }
-}
 // ===== src/lib/adapters/openai/client.js =====
 /**
  * OpenAI 兼容的云端 API 客户端：
@@ -2616,257 +2016,360 @@ class OpenAICompatClient {
     }
   }
 }
-// ===== src/lib/adapters/qdrant/client.js =====
+// ===== src/lib/app/maintenance-service.js =====
 /**
- * Qdrant REST 客户端（只用 HTTP API，不需要额外依赖）。
- * 与 Qdrant 同机部署时默认 http://127.0.0.1:6333，无需 API Key；
- * 如需鉴权，可从 DSH 凭据库读取 api-key。
+ * MaintenanceService：记忆集合的读取/维护/迁移（v0.7 R3）。
+ * 负责：按层级统计、收集记忆（含向量）、批量删除/更新、增强记忆到期清理、
+ * 相似检索辅助、旧记忆迁移、保留策略与定期维护。
+ * 依赖注入 MemoryService 的基础设施方法（ensureReady/qdrant/storage/maintenanceOptions/stats）。
  */
 
 
-function joinUrl(base, path) {
-  return `${String(base ?? '').replace(/\/+$/, '')}${path}`
-}
-
-class QdrantClient {
-  constructor(options = {}) {
-    this.url = String(options.url ?? 'http://127.0.0.1:6333').replace(/\/+$/, '')
-    this.apiKey = options.apiKey ? String(options.apiKey) : ''
-    this.timeoutMs = Number.isFinite(options.timeoutMs) ? options.timeoutMs : 8000
-    this.logger = options.logger ?? console
+class MaintenanceService {
+  /** @param {import('./memory-service.js').MemoryService} service */
+  constructor(service) {
+    this.service = service
+    this.logger = service.logger
   }
 
-  async request(method, path, body, { timeoutMs = this.timeoutMs, signal } = {}) {
-    const timeout = AbortSignal.timeout(Math.max(500, timeoutMs))
-    const combined = signal === undefined ? timeout : AbortSignal.any([signal, timeout])
-    const headers = {}
-    if (body !== undefined) headers['Content-Type'] = 'application/json'
-    if (this.apiKey) headers['api-key'] = this.apiKey
-    let response
+  get stats() {
+    return this.service.stats
+  }
+
+  ensureReady(...args) { return this.service.ensureReady(...args) }
+  qdrant() { return this.service.qdrant() }
+  storage() { return this.service.storage() }
+  maintenanceOptions() { return this.service.maintenanceOptions() }
+
+  async countByLevel() {
+    const counts = { 0: 0, 1: 0, 2: 0, 3: 0 }
     try {
-      response = await fetch(joinUrl(this.url, path), {
-        method,
-        headers,
-        body: body === undefined ? undefined : JSON.stringify(body),
-        signal: combined,
-      })
-    } catch (error) {
-      if (error?.name === 'TimeoutError' || error?.name === 'AbortError') {
-        throw new Error(`Qdrant 请求超时（${method} ${path}）`)
+      await this.ensureReady()
+      const qdrant = await this.qdrant()
+      const storage = this.storage()
+      for (const level of [0, 1, 2, 3]) {
+        try {
+          counts[level] = await qdrant.count(storage.collection, {
+            filter: { must: [{ key: 'level', match: { value: level } }] },
+            exact: true,
+          })
+        } catch {
+          /* ignore */
+        }
       }
-      throw new Error(`无法连接 Qdrant（${this.url}）：${errorText(error)}`)
-    }
-    const text = await response.text()
-    let payload
-    try {
-      payload = text === '' ? undefined : JSON.parse(text)
     } catch {
-      payload = text.slice(0, 400)
+      /* collection 不可用时保持 0 */
     }
-    if (!response.ok) {
-      const detail = typeof payload === 'string' ? payload : JSON.stringify(payload ?? {}).slice(0, 500)
-      throw new Error(`Qdrant 返回 ${response.status}（${method} ${path}）：${detail}`)
-    }
-    return payload
+    return counts
   }
 
-  /** Qdrant 版本与健康状态。 */
-  async health() {
-    const payload = await this.request('GET', '/', undefined, { timeoutMs: 4000 })
-    return { ok: true, title: payload?.title ?? 'qdrant', version: payload?.version ?? null }
-  }
-
-  /** 集合信息；不存在返回 null。 */
-  async collectionInfo(collection) {
-    try {
-      const payload = await this.request('GET', `/collections/${encodeURIComponent(collection)}`)
-      const result = payload?.result
-      if (result === undefined || result === null) return null
-      const vectors = result?.config?.params?.vectors
-      return {
-        name: collection,
-        points: result?.points_count ?? 0,
-        indexed: result?.indexed_vectors_count ?? 0,
-        status: result?.status ?? null,
-        size: typeof vectors?.size === 'number' ? vectors.size : null,
-        distance: vectors?.distance ?? null,
-        payloadIndexes: Object.keys(result?.payload_schema ?? {}),
-      }
-    } catch (error) {
-      const message = errorText(error)
-      if (message.includes('404') || message.includes('Not found') || message.includes('not found')) {
-        return null
-      }
-      throw error
-    }
-  }
-
-  /** 确保集合存在且维度正确。 */
-  async ensureCollection(collection, size) {
-    const existing = await this.collectionInfo(collection)
-    if (existing === null) {
-      await this.request('PUT', `/collections/${encodeURIComponent(collection)}`, {
-        vectors: { size, distance: 'Cosine' },
-        on_disk_payload: true,
+  /**
+   * 滚动收集符合过滤条件的记忆（含向量，供整理/事件合并使用）。
+   * @returns {Promise<Array<{id:string, vector:number[]|null, payload:object}>>}
+   */
+  async collectMemories({ filter, withVector = false, maxItems = 2000, orderBy } = {}) {
+    await this.ensureReady()
+    const qdrant = await this.qdrant()
+    const storage = this.storage()
+    const items = []
+    let offset
+    for (let page = 0; page < 200 && items.length < maxItems; page += 1) {
+      const { points, nextOffset } = await qdrant.scroll(storage.collection, {
+        limit: Math.min(256, maxItems - items.length),
+        offset,
+        orderBy,
+        filter,
+        withPayload: true,
+        withVector,
       })
-      const info = { name: collection, points: 0, size, distance: 'Cosine', payloadIndexes: [] }
-      await this.ensurePayloadIndexes(collection)
-      return { ok: true, created: true, info: { ...info, payloadIndexes: ['kind', 'sessionId', 'cwd', 'ts'] } }
-    }
-    if (existing.size !== null && existing.size !== size) {
-      return {
-        ok: false,
-        created: false,
-        error: `集合 "${collection}" 的向量维度是 ${existing.size}，而当前激活 provider 的维度是 ${size}。请在设置页点“重建集合”，或切换到维度匹配的 provider。`,
-        info: existing,
-      }
-    }
-    await this.ensurePayloadIndexes(collection)
-    return { ok: true, created: false, info: existing }
-  }
-
-  /** 确保列表/排序/过滤需要的 payload 索引存在（幂等、尽力而为）。 */
-  async ensurePayloadIndexes(collection) {
-    const indexes = [
-      { field_name: 'kind', field_schema: 'keyword' },
-      { field_name: 'sessionId', field_schema: 'keyword' },
-      { field_name: 'cwd', field_schema: 'keyword' },
-      { field_name: 'ts', field_schema: 'integer' },
-    ]
-    for (const index of indexes) {
-      try {
-        await this.request('PUT', `/collections/${encodeURIComponent(collection)}/index`, index, {
-          timeoutMs: 5000,
+      for (const point of points) {
+        items.push({
+          id: String(point.id),
+          vector: Array.isArray(point.vector) ? point.vector : (point.vector?.default ?? null),
+          payload: point.payload ?? {},
         })
-      } catch (error) {
-        this.logger?.warn?.(`[dsh-memory] 创建 Qdrant 索引 ${index.field_name} 失败：${errorText(error)}`)
       }
+      if (!nextOffset || points.length === 0) break
+      offset = nextOffset
     }
+    return items
   }
 
-  /** 写入/覆盖 points。 */
-  async upsert(collection, points, { wait = true, signal } = {}) {
-    return this.request(
-      'PUT',
-      `/collections/${encodeURIComponent(collection)}/points?wait=${wait ? 'true' : 'false'}`,
-      { points },
-      { signal },
-    )
+  /** 收集某一天（按配置时区）的原始记忆（level=0）。 */
+  async collectRawForDay(dayStart, dayEnd, { withVector = false, maxItems = 2000 } = {}) {
+    return this.collectMemories({
+      filter: {
+        must: [
+          { key: 'level', match: { value: 0 } },
+          { key: 'ts', range: { gte: dayStart, lte: dayEnd } },
+        ],
+      },
+      withVector,
+      maxItems,
+      orderBy: { key: 'ts', direction: 'asc' },
+    })
   }
 
-  /** 向量检索。 */
-  async search(collection, { vector, limit = 5, scoreThreshold, filter, withPayload = true }, { signal } = {}) {
-    const body = { vector, limit, with_payload: withPayload, with_vector: false }
-    if (Number.isFinite(scoreThreshold)) body.score_threshold = scoreThreshold
-    if (filter !== undefined) body.filter = filter
-    const payload = await this.request(
-      'POST',
-      `/collections/${encodeURIComponent(collection)}/points/search`,
-      body,
-      { signal },
-    )
-    return Array.isArray(payload?.result) ? payload.result : []
+  /** 收集某个批次产出的记忆。 */
+  async collectBatchMemories(batch, { withVector = false, maxItems = 2000 } = {}) {
+    return this.collectMemories({
+      filter: { must: [{ key: 'batch', match: { value: String(batch) } }] },
+      withVector,
+      maxItems,
+      orderBy: { key: 'ts', direction: 'asc' },
+    })
   }
 
-  /** 统计 points 数量（可带过滤条件）。 */
-  async count(collection, { filter, exact = false, signal } = {}) {
-    const body = { exact }
-    if (filter !== undefined) body.filter = filter
-    const payload = await this.request(
-      'POST',
-      `/collections/${encodeURIComponent(collection)}/points/count`,
-      body,
-      { signal },
-    )
-    return payload?.result?.count ?? 0
+  /** 批量删除记忆（整理后清理原文）。 */
+  async deleteMemoryIds(ids) {
+    const list = (ids ?? []).map(String).filter(Boolean)
+    if (list.length === 0) return 0
+    await this.ensureReady()
+    const qdrant = await this.qdrant()
+    const storage = this.storage()
+    for (let index = 0; index < list.length; index += 200) {
+      await qdrant.deletePoints(storage.collection, list.slice(index, index + 200))
+    }
+    return list.length
   }
 
-  /** 按时间/过滤条件滚动读取 points（游标分页）。 */
-  async scroll(collection, { limit = 20, offset, orderBy, filter, withPayload = true, withVector = false } = {}) {
-    const body = { limit, with_payload: withPayload, with_vector: withVector }
-    if (offset !== undefined && offset !== null) body.offset = offset
-    if (orderBy !== undefined) body.order_by = orderBy
-    if (filter !== undefined) body.filter = filter
-    const payload = await this.request(
-      'POST',
-      `/collections/${encodeURIComponent(collection)}/points/scroll`,
-      body,
-      { timeoutMs: 12000 },
-    )
-    const points = payload?.result?.points ?? []
-    return { points, nextOffset: payload?.result?.next_page_offset ?? null }
+  /** 批量更新记忆 payload（迁移/增强到期等）。 */
+  async updateMemoryPayload(ids, payload) {
+    const list = (ids ?? []).map(String).filter(Boolean)
+    if (list.length === 0) return 0
+    await this.ensureReady()
+    const qdrant = await this.qdrant()
+    const storage = this.storage()
+    for (let index = 0; index < list.length; index += 200) {
+      await qdrant.setPayload(storage.collection, payload, list.slice(index, index + 200))
+    }
+    return list.length
   }
 
-  /** 给指定 id 覆盖/合并 payload 字段（用于迁移与增强记忆到期标记）。 */
-  async setPayload(collection, payload, ids, { signal } = {}) {
-    return this.request(
-      'POST',
-      `/collections/${encodeURIComponent(collection)}/points/payload?wait=true`,
-      { payload, points: ids },
-      { signal },
-    )
+  /** 列出已到期的增强记忆 id。 */
+  async listExpiredEnhanced(now = Date.now()) {
+    const items = await this.collectMemories({
+      filter: {
+        must: [
+          { key: 'enhanced', match: { value: true } },
+          { key: 'expiresAt', range: { lt: now } },
+        ],
+      },
+      withVector: false,
+      maxItems: 5000,
+    })
+    return items.map((item) => item.id)
   }
 
-  /** 删除指定 id 的 points。 */
-  async deletePoints(collection, ids, { signal } = {}) {
-    return this.request(
-      'POST',
-      `/collections/${encodeURIComponent(collection)}/points/delete?wait=true`,
-      { points: ids },
-      { signal },
-    )
+  /** 向量相似检索（供事件合并使用）。 */
+  async searchSimilar(vector, { limit = 5, threshold = 0.85, excludeIds = [] } = {}) {
+    await this.ensureReady()
+    const qdrant = await this.qdrant()
+    const storage = this.storage()
+    const exclude = new Set((excludeIds ?? []).map(String))
+    const points = await qdrant.search(storage.collection, {
+      vector,
+      limit: Math.max(limit + exclude.size, limit),
+      scoreThreshold: threshold,
+      withPayload: true,
+    })
+    return points
+      .filter((point) => !exclude.has(String(point.id)))
+      .slice(0, limit)
+      .map((point) => ({
+        id: String(point.id),
+        score: Number(point.score) || 0,
+        text: String(point.payload?.text ?? ''),
+        kind: String(point.payload?.kind ?? ''),
+        ts: Number(point.payload?.ts) || 0,
+        level: Number(point.payload?.level) || 0,
+        batch: point.payload?.batch ? String(point.payload.batch) : '',
+        enhanced: point.payload?.enhanced === true,
+      }))
   }
 
-  /** 按过滤条件删除 points（保留策略使用）。 */
-  async deleteByFilter(collection, filter, { signal } = {}) {
-    return this.request(
-      'POST',
-      `/collections/${encodeURIComponent(collection)}/points/delete?wait=true`,
-      { filter },
-      { signal },
-    )
-  }
+  /** 整理用的 LLM 客户端（provider 可单独配置，模型名覆盖）。 */
 
-  /** 删除集合。 */
-  async deleteCollection(collection) {
-    return this.request('DELETE', `/collections/${encodeURIComponent(collection)}`)
-  }
-
-  /** 删除并重建集合（维度变更 / 清空记忆时使用）。 */
-  async recreateCollection(collection, size) {
+  /** 迁移：给旧记忆补 level=0 / batch=''（只对缺失 level 的记录处理一次）。 */
+  async migrateLegacyMemories() {
     try {
-      await this.deleteCollection(collection)
-    } catch {
-      /* 不存在时忽略 */
+      await this.ensureReady()
+      const qdrant = await this.qdrant()
+      const storage = this.storage()
+      const legacy = []
+      let offset
+      for (let page = 0; page < 100; page += 1) {
+        const { points, nextOffset } = await qdrant.scroll(storage.collection, {
+          limit: 256,
+          offset,
+          withPayload: true,
+          withVector: false,
+        })
+        for (const point of points) {
+          if (point.payload === undefined || point.payload?.level === undefined) legacy.push(String(point.id))
+        }
+        if (!nextOffset || points.length === 0) break
+        offset = nextOffset
+      }
+      if (legacy.length > 0) {
+        await this.updateMemoryPayload(legacy, { level: 0, batch: '' })
+        this.logger.info?.(`[dsh-memory] 已为 ${legacy.length} 条旧记忆补齐整理标签`)
+      }
+      return legacy.length
+    } catch (error) {
+      this.logger.warn?.(`[dsh-memory] 旧记忆迁移失败：${errorText(error)}`)
+      return 0
     }
-    return this.ensureCollection(collection, size)
   }
+
+  // ------------------------------------------------------------------
+  // 定期维护
+  // ------------------------------------------------------------------
+
+  /**
+   * 定期维护：过期清理 → 超限淘汰 → 相似重复合并 → 索引重建。
+   * @returns {Promise<object>} 维护结果
+   */
+  async maintenance({ force = false } = {}) {
+    const options = this.maintenanceOptions()
+    const info = await this.ensureReady()
+    const qdrant = await this.qdrant()
+    const storage = this.storage()
+    const result = {
+      ok: true,
+      startedAt: Date.now(),
+      collection: storage.collection,
+      pointsBefore: info?.points ?? null,
+      expired: 0,
+      overflow: 0,
+      duplicates: 0,
+      errors: [],
+    }
+    try {
+      // 1) 过期清理
+      if (options.retentionDays > 0 || force) {
+        const cutoff = Date.now() - options.retentionDays * 86400000
+        if (options.retentionDays > 0) {
+          const before = await qdrant.count(storage.collection, { exact: true })
+          await qdrant.deleteByFilter(storage.collection, {
+            must: [{ key: 'ts', range: { lt: cutoff } }],
+          })
+          const after = await qdrant.count(storage.collection, { exact: true })
+          result.expired = Math.max(0, before - after)
+        }
+      }
+      // 2) 条数上限淘汰（从最旧开始）
+      if (options.maxMemories > 0) {
+        let count = await qdrant.count(storage.collection, { exact: true })
+        let guard = 0
+        while (count > options.maxMemories && guard < 100) {
+          guard += 1
+          const excess = count - options.maxMemories
+          const { points } = await qdrant.scroll(storage.collection, {
+            limit: Math.min(256, excess),
+            orderBy: { key: 'ts', direction: 'asc' },
+          })
+          if (points.length === 0) break
+          const ids = points.map((point) => String(point.id))
+          await qdrant.deletePoints(storage.collection, ids)
+          result.overflow += ids.length
+          count -= ids.length
+        }
+      }
+      // 3) 相似重复合并（只扫描最近的 N 条）
+      if (options.maintenanceDedupe) {
+        const { points } = await qdrant.scroll(storage.collection, {
+          limit: options.dedupeMaxScan,
+          orderBy: { key: 'ts', direction: 'desc' },
+          withPayload: true,
+          withVector: true,
+        })
+        const deleted = new Set()
+        const byId = new Map(points.map((point) => [String(point.id), point]))
+        for (const point of points) {
+          const id = String(point.id)
+          if (deleted.has(id)) continue
+          const vector = Array.isArray(point.vector) ? point.vector : point.vector?.default ?? null
+          if (!Array.isArray(vector)) continue
+          let similar = []
+          try {
+            similar = await qdrant.search(storage.collection, {
+              vector,
+              limit: 5,
+              scoreThreshold: options.dedupeThreshold,
+            })
+          } catch (error) {
+            result.errors.push(`dedupe search: ${errorText(error)}`)
+            break
+          }
+          for (const candidate of similar) {
+            const candidateId = String(candidate.id)
+            if (candidateId === id || deleted.has(candidateId)) continue
+            const other = byId.get(candidateId)
+            const otherTs = Number(other?.payload?.ts) || Number(candidate?.payload?.ts) || 0
+            const selfTs = Number(point?.payload?.ts) || 0
+            const olderId = otherTs < selfTs ? candidateId : id
+            const keepId = olderId === candidateId ? id : candidateId
+            if (olderId === id) {
+              // 自己更旧：删自己，跳出（也把 candidate 标记为已处理）
+              deleted.add(id)
+              try {
+                await qdrant.deletePoints(storage.collection, [id])
+                result.duplicates += 1
+              } catch (error) {
+                result.errors.push(`dedupe delete: ${errorText(error)}`)
+              }
+              break
+            }
+            deleted.add(candidateId)
+            try {
+              await qdrant.deletePoints(storage.collection, [candidateId])
+              result.duplicates += 1
+            } catch (error) {
+              result.errors.push(`dedupe delete: ${errorText(error)}`)
+            }
+            void keepId
+          }
+        }
+      }
+      // 4) 索引重建（幂等）
+      await qdrant.ensurePayloadIndexes(storage.collection)
+    } catch (error) {
+      result.ok = false
+      result.errors.push(errorText(error))
+    }
+    result.finishedAt = Date.now()
+    result.durationMs = result.finishedAt - result.startedAt
+    this.stats.lastMaintenanceAt = result.finishedAt
+    this.stats.lastMaintenance = result
+    if (options.debug || result.errors.length > 0) {
+      this.logger.info?.(
+        `[dsh-memory] 维护完成：过期 ${result.expired}，超限 ${result.overflow}，重复 ${result.duplicates}，错误 ${result.errors.length}`,
+      )
+    }
+    return result
+  }
+
+  // ------------------------------------------------------------------
+  // 状态 / 测试
+  // ------------------------------------------------------------------
+
+  /** 设置页状态快照。 */
 }
-// ===== src/lib/app/memory-service.js =====
+// ===== src/lib/app/model-router.js =====
 /**
- * MemoryService：插件核心业务对象（v0.2）。
+ * ModelRouter：provider / 凭据 / 模型路由（v0.7 R3）。
  *
- * 职责：
- * - 读取（会热更新的）插件配置；
- * - 多 provider 档案：解析激活的 provider、凭据、视觉模型；
- * - 嵌入文本并写入 Qdrant；
- * - 自动记录一轮对话要点 / 图片概览；
- * - 按记忆范围检索（全局 / 工作区 / 会话）；
- * - 记忆管理：列表、搜索、删除、导出、重建；
- * - 保留策略与定期维护（过期清理、超限淘汰、相似重复合并、索引重建）；
- * - 状态、测试、后台队列。
+ * 负责：
+ * - 多 provider 档案解析与凭据读取；
+ * - 嵌入/视觉客户端构造；
+ * - DSH 模型目录读取（ctx.llm）与对话调用；
+ * - 功能模型来源路由（整理：DSH / 自定义；图片概览：DSH / 自定义）。
+ *
+ * 依赖注入：构造时传入 MemoryService（读取 cfg/logger/ctx），不反向依赖 service 的其他业务方法。
  */
 
 
-
-
-
-
-
-
-/** 自动召回注入消息的 source.kind；DSH 会把它渲染成“上下文注入”行而不是用户气泡。 */
-/** 自动召回上下文消息的标题前缀。 */
-const RECALL_HEADER = '【长期记忆·自动召回】'
 
 /** provider 列表为空时的内置兜底配置（与 bundle 默认值一致）。 */
 const BUILTIN_PROVIDER = {
@@ -2920,69 +2423,19 @@ function normalizeProvider(raw, index) {
   }
 }
 
-/** 选择合法的向量维度。 */
-function pickDimensions(value) {
-  const n = clampInt(value, 1024, 1, 65536)
-  return DIMENSIONS.includes(n) ? n : n
-}
-
-/** 去掉 meta 里的 undefined / null，保证 payload 是纯 JSON。 */
-function sanitizeMeta(meta) {
-  const out = {}
-  for (const [key, value] of Object.entries(meta ?? {})) {
-    if (value === undefined || value === null) continue
-    out[key] = value
+class ModelRouter {
+  /** @param {import('./memory-service.js').MemoryService} service */
+  constructor(service) {
+    this.service = service
+    this.ctx = service.ctx
+    this.logger = service.logger
   }
-  return out
-}
-
-class MemoryService {
-  /**
-   * @param {object} ctx DSH 插件上下文
-   * @param {object} config schemastery Config 实例（字段可能包着 volatile Ref）
-   */
-  constructor(ctx, config) {
-    this.ctx = ctx
-    this.config = config
-    this.logger = ctx.logger ?? console
-    this.queue = new SerialQueue(this.logger)
-    this.stats = {
-      startedAt: Date.now(),
-      writes: 0,
-      lastWriteAt: 0,
-      lastWriteKind: null,
-      lastRecallAt: 0,
-      lastRecallCount: 0,
-      recallChecks: 0,
-      lastRecallQuery: '',
-      lastRecallError: '',
-      lastRecallInjectAt: 0,
-      captions: 0,
-      lastMaintenanceAt: 0,
-      lastMaintenance: null,
-    }
-    this.collectionState = {
-      signature: null,
-      ok: false,
-      error: null,
-      checkedAt: 0,
-      info: null,
-    }
-    /** 由 index.js 注入的睡眠控制器与整理引擎（避免循环依赖）。 */
-    this.sleep = null
-    this.consolidation = null
-  }
-
-  // ------------------------------------------------------------------
-  // 配置与 provider
-  // ------------------------------------------------------------------
 
   /** 当前配置（解包 volatile）。 */
   cfg() {
-    return readConfig(this.config)
+    return this.service.cfg()
   }
 
-  /** 全部 provider 档案（空列表时回退内置 SiliconFlow）。 */
   providers() {
     const raw = this.cfg().providers
     const list = Array.isArray(raw) ? raw : []
@@ -3278,6 +2731,374 @@ class MemoryService {
   // ------------------------------------------------------------------
 
   /** 存储配置。 */
+
+  async consolidationClient() {
+    const cfg = this.cfg()
+    const provider =
+      (cfg.consolidationProviderId && this.providerById(cfg.consolidationProviderId)) || this.activeProvider()
+    const model = String(cfg.consolidationModel ?? '').trim()
+    if (!model) return null
+    const client = await this.clientFor(provider)
+    return { client, provider, model }
+  }
+}
+// ===== src/lib/adapters/qdrant/client.js =====
+/**
+ * Qdrant REST 客户端（只用 HTTP API，不需要额外依赖）。
+ * 与 Qdrant 同机部署时默认 http://127.0.0.1:6333，无需 API Key；
+ * 如需鉴权，可从 DSH 凭据库读取 api-key。
+ */
+
+
+function joinUrl(base, path) {
+  return `${String(base ?? '').replace(/\/+$/, '')}${path}`
+}
+
+class QdrantClient {
+  constructor(options = {}) {
+    this.url = String(options.url ?? 'http://127.0.0.1:6333').replace(/\/+$/, '')
+    this.apiKey = options.apiKey ? String(options.apiKey) : ''
+    this.timeoutMs = Number.isFinite(options.timeoutMs) ? options.timeoutMs : 8000
+    this.logger = options.logger ?? console
+  }
+
+  async request(method, path, body, { timeoutMs = this.timeoutMs, signal } = {}) {
+    const timeout = AbortSignal.timeout(Math.max(500, timeoutMs))
+    const combined = signal === undefined ? timeout : AbortSignal.any([signal, timeout])
+    const headers = {}
+    if (body !== undefined) headers['Content-Type'] = 'application/json'
+    if (this.apiKey) headers['api-key'] = this.apiKey
+    let response
+    try {
+      response = await fetch(joinUrl(this.url, path), {
+        method,
+        headers,
+        body: body === undefined ? undefined : JSON.stringify(body),
+        signal: combined,
+      })
+    } catch (error) {
+      if (error?.name === 'TimeoutError' || error?.name === 'AbortError') {
+        throw new Error(`Qdrant 请求超时（${method} ${path}）`)
+      }
+      throw new Error(`无法连接 Qdrant（${this.url}）：${errorText(error)}`)
+    }
+    const text = await response.text()
+    let payload
+    try {
+      payload = text === '' ? undefined : JSON.parse(text)
+    } catch {
+      payload = text.slice(0, 400)
+    }
+    if (!response.ok) {
+      const detail = typeof payload === 'string' ? payload : JSON.stringify(payload ?? {}).slice(0, 500)
+      throw new Error(`Qdrant 返回 ${response.status}（${method} ${path}）：${detail}`)
+    }
+    return payload
+  }
+
+  /** Qdrant 版本与健康状态。 */
+  async health() {
+    const payload = await this.request('GET', '/', undefined, { timeoutMs: 4000 })
+    return { ok: true, title: payload?.title ?? 'qdrant', version: payload?.version ?? null }
+  }
+
+  /** 集合信息；不存在返回 null。 */
+  async collectionInfo(collection) {
+    try {
+      const payload = await this.request('GET', `/collections/${encodeURIComponent(collection)}`)
+      const result = payload?.result
+      if (result === undefined || result === null) return null
+      const vectors = result?.config?.params?.vectors
+      return {
+        name: collection,
+        points: result?.points_count ?? 0,
+        indexed: result?.indexed_vectors_count ?? 0,
+        status: result?.status ?? null,
+        size: typeof vectors?.size === 'number' ? vectors.size : null,
+        distance: vectors?.distance ?? null,
+        payloadIndexes: Object.keys(result?.payload_schema ?? {}),
+      }
+    } catch (error) {
+      const message = errorText(error)
+      if (message.includes('404') || message.includes('Not found') || message.includes('not found')) {
+        return null
+      }
+      throw error
+    }
+  }
+
+  /** 确保集合存在且维度正确。 */
+  async ensureCollection(collection, size) {
+    const existing = await this.collectionInfo(collection)
+    if (existing === null) {
+      await this.request('PUT', `/collections/${encodeURIComponent(collection)}`, {
+        vectors: { size, distance: 'Cosine' },
+        on_disk_payload: true,
+      })
+      const info = { name: collection, points: 0, size, distance: 'Cosine', payloadIndexes: [] }
+      await this.ensurePayloadIndexes(collection)
+      return { ok: true, created: true, info: { ...info, payloadIndexes: ['kind', 'sessionId', 'cwd', 'ts'] } }
+    }
+    if (existing.size !== null && existing.size !== size) {
+      return {
+        ok: false,
+        created: false,
+        error: `集合 "${collection}" 的向量维度是 ${existing.size}，而当前激活 provider 的维度是 ${size}。请在设置页点“重建集合”，或切换到维度匹配的 provider。`,
+        info: existing,
+      }
+    }
+    await this.ensurePayloadIndexes(collection)
+    return { ok: true, created: false, info: existing }
+  }
+
+  /** 确保列表/排序/过滤需要的 payload 索引存在（幂等、尽力而为）。 */
+  async ensurePayloadIndexes(collection) {
+    const indexes = [
+      { field_name: 'kind', field_schema: 'keyword' },
+      { field_name: 'sessionId', field_schema: 'keyword' },
+      { field_name: 'cwd', field_schema: 'keyword' },
+      { field_name: 'ts', field_schema: 'integer' },
+    ]
+    for (const index of indexes) {
+      try {
+        await this.request('PUT', `/collections/${encodeURIComponent(collection)}/index`, index, {
+          timeoutMs: 5000,
+        })
+      } catch (error) {
+        this.logger?.warn?.(`[dsh-memory] 创建 Qdrant 索引 ${index.field_name} 失败：${errorText(error)}`)
+      }
+    }
+  }
+
+  /** 写入/覆盖 points。 */
+  async upsert(collection, points, { wait = true, signal } = {}) {
+    return this.request(
+      'PUT',
+      `/collections/${encodeURIComponent(collection)}/points?wait=${wait ? 'true' : 'false'}`,
+      { points },
+      { signal },
+    )
+  }
+
+  /** 向量检索。 */
+  async search(collection, { vector, limit = 5, scoreThreshold, filter, withPayload = true }, { signal } = {}) {
+    const body = { vector, limit, with_payload: withPayload, with_vector: false }
+    if (Number.isFinite(scoreThreshold)) body.score_threshold = scoreThreshold
+    if (filter !== undefined) body.filter = filter
+    const payload = await this.request(
+      'POST',
+      `/collections/${encodeURIComponent(collection)}/points/search`,
+      body,
+      { signal },
+    )
+    return Array.isArray(payload?.result) ? payload.result : []
+  }
+
+  /** 统计 points 数量（可带过滤条件）。 */
+  async count(collection, { filter, exact = false, signal } = {}) {
+    const body = { exact }
+    if (filter !== undefined) body.filter = filter
+    const payload = await this.request(
+      'POST',
+      `/collections/${encodeURIComponent(collection)}/points/count`,
+      body,
+      { signal },
+    )
+    return payload?.result?.count ?? 0
+  }
+
+  /** 按时间/过滤条件滚动读取 points（游标分页）。 */
+  async scroll(collection, { limit = 20, offset, orderBy, filter, withPayload = true, withVector = false } = {}) {
+    const body = { limit, with_payload: withPayload, with_vector: withVector }
+    if (offset !== undefined && offset !== null) body.offset = offset
+    if (orderBy !== undefined) body.order_by = orderBy
+    if (filter !== undefined) body.filter = filter
+    const payload = await this.request(
+      'POST',
+      `/collections/${encodeURIComponent(collection)}/points/scroll`,
+      body,
+      { timeoutMs: 12000 },
+    )
+    const points = payload?.result?.points ?? []
+    return { points, nextOffset: payload?.result?.next_page_offset ?? null }
+  }
+
+  /** 给指定 id 覆盖/合并 payload 字段（用于迁移与增强记忆到期标记）。 */
+  async setPayload(collection, payload, ids, { signal } = {}) {
+    return this.request(
+      'POST',
+      `/collections/${encodeURIComponent(collection)}/points/payload?wait=true`,
+      { payload, points: ids },
+      { signal },
+    )
+  }
+
+  /** 删除指定 id 的 points。 */
+  async deletePoints(collection, ids, { signal } = {}) {
+    return this.request(
+      'POST',
+      `/collections/${encodeURIComponent(collection)}/points/delete?wait=true`,
+      { points: ids },
+      { signal },
+    )
+  }
+
+  /** 按过滤条件删除 points（保留策略使用）。 */
+  async deleteByFilter(collection, filter, { signal } = {}) {
+    return this.request(
+      'POST',
+      `/collections/${encodeURIComponent(collection)}/points/delete?wait=true`,
+      { filter },
+      { signal },
+    )
+  }
+
+  /** 删除集合。 */
+  async deleteCollection(collection) {
+    return this.request('DELETE', `/collections/${encodeURIComponent(collection)}`)
+  }
+
+  /** 删除并重建集合（维度变更 / 清空记忆时使用）。 */
+  async recreateCollection(collection, size) {
+    try {
+      await this.deleteCollection(collection)
+    } catch {
+      /* 不存在时忽略 */
+    }
+    return this.ensureCollection(collection, size)
+  }
+}
+// ===== src/lib/app/memory-service.js =====
+/**
+ * MemoryService：插件核心业务对象（v0.2）。
+ *
+ * 职责：
+ * - 读取（会热更新的）插件配置；
+ * - 多 provider 档案：解析激活的 provider、凭据、视觉模型；
+ * - 嵌入文本并写入 Qdrant；
+ * - 自动记录一轮对话要点 / 图片概览；
+ * - 按记忆范围检索（全局 / 工作区 / 会话）；
+ * - 记忆管理：列表、搜索、删除、导出、重建；
+ * - 保留策略与定期维护（过期清理、超限淘汰、相似重复合并、索引重建）；
+ * - 状态、测试、后台队列。
+ */
+
+
+
+
+
+
+
+
+
+
+/** 自动召回注入消息的 source.kind；DSH 会把它渲染成“上下文注入”行而不是用户气泡。 */
+/** 自动召回上下文消息的标题前缀。 */
+const RECALL_HEADER = '【长期记忆·自动召回】'
+
+/** 选择合法的向量维度。 */
+function pickDimensions(value) {
+  const n = clampInt(value, 1024, 1, 65536)
+  return DIMENSIONS.includes(n) ? n : n
+}
+
+/** 去掉 meta 里的 undefined / null，保证 payload 是纯 JSON。 */
+function sanitizeMeta(meta) {
+  const out = {}
+  for (const [key, value] of Object.entries(meta ?? {})) {
+    if (value === undefined || value === null) continue
+    out[key] = value
+  }
+  return out
+}
+
+class MemoryService {
+  /**
+   * @param {object} ctx DSH 插件上下文
+   * @param {object} config schemastery Config 实例（字段可能包着 volatile Ref）
+   */
+  constructor(ctx, config) {
+    this.ctx = ctx
+    this.config = config
+    this.logger = ctx.logger ?? console
+    this.models = new ModelRouter(this)
+    this.maintenanceService = new MaintenanceService(this)
+    this.queue = new SerialQueue(this.logger)
+    this.stats = {
+      startedAt: Date.now(),
+      writes: 0,
+      lastWriteAt: 0,
+      lastWriteKind: null,
+      lastRecallAt: 0,
+      lastRecallCount: 0,
+      recallChecks: 0,
+      lastRecallQuery: '',
+      lastRecallError: '',
+      lastRecallInjectAt: 0,
+      captions: 0,
+      lastMaintenanceAt: 0,
+      lastMaintenance: null,
+    }
+    this.collectionState = {
+      signature: null,
+      ok: false,
+      error: null,
+      checkedAt: 0,
+      info: null,
+    }
+    /** 由 index.js 注入的睡眠控制器与整理引擎（避免循环依赖）。 */
+    this.sleep = null
+    this.consolidation = null
+  }
+
+  // ------------------------------------------------------------------
+  // 模型 / provider 路由（R3：实现移到 app/model-router.js）
+  // ------------------------------------------------------------------
+
+  providers() { return this.models.providers() }
+  activeProvider() { return this.models.activeProvider() }
+  providerById(id) { return this.models.providerById(id) }
+  credentialRef(provider) { return this.models.credentialRef(provider) }
+  visionConfigOf(provider) { return this.models.visionConfigOf(provider) }
+  async dshProviders() { return this.models.dshProviders() }
+  async dshCatalog() { return this.models.dshCatalog() }
+  dshDefaultSelection() { return this.models.dshDefaultSelection() }
+  dshTarget(...args) { return this.models.dshTarget(...args) }
+  async dshChat(options) { return this.models.dshChat(options) }
+  async dshCaption(options) { return this.models.dshCaption(options) }
+  async consolidationChat(options) { return this.models.consolidationChat(options) }
+  captionTarget() { return this.models.captionTarget() }
+  async listProviderModels(providerId) { return this.models.listProviderModels(providerId) }
+  async resolveKey(ref) { return this.models.resolveKey(ref) }
+  async credentialInfo(ref) { return this.models.credentialInfo(ref) }
+  async clientFor(provider) { return this.models.clientFor(provider) }
+  async consolidationClient() { return this.models.consolidationClient() }
+
+  // ------------------------------------------------------------------
+  // 维护 / 集合读取（R3：实现移到 app/maintenance-service.js）
+  // ------------------------------------------------------------------
+
+  countByLevel() { return this.maintenanceService.countByLevel() }
+  collectMemories(options) { return this.maintenanceService.collectMemories(options) }
+  collectRawForDay(...args) { return this.maintenanceService.collectRawForDay(...args) }
+  collectBatchMemories(...args) { return this.maintenanceService.collectBatchMemories(...args) }
+  deleteMemoryIds(ids) { return this.maintenanceService.deleteMemoryIds(ids) }
+  updateMemoryPayload(ids, payload) { return this.maintenanceService.updateMemoryPayload(ids, payload) }
+  listExpiredEnhanced(now) { return this.maintenanceService.listExpiredEnhanced(now) }
+  searchSimilar(vector, options) { return this.maintenanceService.searchSimilar(vector, options) }
+  migrateLegacyMemories() { return this.maintenanceService.migrateLegacyMemories() }
+  maintenance(options) { return this.maintenanceService.maintenance(options) }
+
+  // ------------------------------------------------------------------
+  // 配置与 provider
+  // ------------------------------------------------------------------
+
+  /** 当前配置（解包 volatile）。 */
+  cfg() {
+    return readConfig(this.config)
+  }
+
+  /** 全部 provider 档案（空列表时回退内置 SiliconFlow）。 */
   storage() {
     const cfg = this.cfg()
     return {
@@ -3814,329 +3635,6 @@ class MemoryService {
   // ------------------------------------------------------------------
 
   /** 按 level 统计条数（0=原始，1/2/3=整理级别）。 */
-  async countByLevel() {
-    const counts = { 0: 0, 1: 0, 2: 0, 3: 0 }
-    try {
-      await this.ensureReady()
-      const qdrant = await this.qdrant()
-      const storage = this.storage()
-      for (const level of [0, 1, 2, 3]) {
-        try {
-          counts[level] = await qdrant.count(storage.collection, {
-            filter: { must: [{ key: 'level', match: { value: level } }] },
-            exact: true,
-          })
-        } catch {
-          /* ignore */
-        }
-      }
-    } catch {
-      /* collection 不可用时保持 0 */
-    }
-    return counts
-  }
-
-  /**
-   * 滚动收集符合过滤条件的记忆（含向量，供整理/事件合并使用）。
-   * @returns {Promise<Array<{id:string, vector:number[]|null, payload:object}>>}
-   */
-  async collectMemories({ filter, withVector = false, maxItems = 2000, orderBy } = {}) {
-    await this.ensureReady()
-    const qdrant = await this.qdrant()
-    const storage = this.storage()
-    const items = []
-    let offset
-    for (let page = 0; page < 200 && items.length < maxItems; page += 1) {
-      const { points, nextOffset } = await qdrant.scroll(storage.collection, {
-        limit: Math.min(256, maxItems - items.length),
-        offset,
-        orderBy,
-        filter,
-        withPayload: true,
-        withVector,
-      })
-      for (const point of points) {
-        items.push({
-          id: String(point.id),
-          vector: Array.isArray(point.vector) ? point.vector : (point.vector?.default ?? null),
-          payload: point.payload ?? {},
-        })
-      }
-      if (!nextOffset || points.length === 0) break
-      offset = nextOffset
-    }
-    return items
-  }
-
-  /** 收集某一天（按配置时区）的原始记忆（level=0）。 */
-  async collectRawForDay(dayStart, dayEnd, { withVector = false, maxItems = 2000 } = {}) {
-    return this.collectMemories({
-      filter: {
-        must: [
-          { key: 'level', match: { value: 0 } },
-          { key: 'ts', range: { gte: dayStart, lte: dayEnd } },
-        ],
-      },
-      withVector,
-      maxItems,
-      orderBy: { key: 'ts', direction: 'asc' },
-    })
-  }
-
-  /** 收集某个批次产出的记忆。 */
-  async collectBatchMemories(batch, { withVector = false, maxItems = 2000 } = {}) {
-    return this.collectMemories({
-      filter: { must: [{ key: 'batch', match: { value: String(batch) } }] },
-      withVector,
-      maxItems,
-      orderBy: { key: 'ts', direction: 'asc' },
-    })
-  }
-
-  /** 批量删除记忆（整理后清理原文）。 */
-  async deleteMemoryIds(ids) {
-    const list = (ids ?? []).map(String).filter(Boolean)
-    if (list.length === 0) return 0
-    await this.ensureReady()
-    const qdrant = await this.qdrant()
-    const storage = this.storage()
-    for (let index = 0; index < list.length; index += 200) {
-      await qdrant.deletePoints(storage.collection, list.slice(index, index + 200))
-    }
-    return list.length
-  }
-
-  /** 批量更新记忆 payload（迁移/增强到期等）。 */
-  async updateMemoryPayload(ids, payload) {
-    const list = (ids ?? []).map(String).filter(Boolean)
-    if (list.length === 0) return 0
-    await this.ensureReady()
-    const qdrant = await this.qdrant()
-    const storage = this.storage()
-    for (let index = 0; index < list.length; index += 200) {
-      await qdrant.setPayload(storage.collection, payload, list.slice(index, index + 200))
-    }
-    return list.length
-  }
-
-  /** 列出已到期的增强记忆 id。 */
-  async listExpiredEnhanced(now = Date.now()) {
-    const items = await this.collectMemories({
-      filter: {
-        must: [
-          { key: 'enhanced', match: { value: true } },
-          { key: 'expiresAt', range: { lt: now } },
-        ],
-      },
-      withVector: false,
-      maxItems: 5000,
-    })
-    return items.map((item) => item.id)
-  }
-
-  /** 向量相似检索（供事件合并使用）。 */
-  async searchSimilar(vector, { limit = 5, threshold = 0.85, excludeIds = [] } = {}) {
-    await this.ensureReady()
-    const qdrant = await this.qdrant()
-    const storage = this.storage()
-    const exclude = new Set((excludeIds ?? []).map(String))
-    const points = await qdrant.search(storage.collection, {
-      vector,
-      limit: Math.max(limit + exclude.size, limit),
-      scoreThreshold: threshold,
-      withPayload: true,
-    })
-    return points
-      .filter((point) => !exclude.has(String(point.id)))
-      .slice(0, limit)
-      .map((point) => ({
-        id: String(point.id),
-        score: Number(point.score) || 0,
-        text: String(point.payload?.text ?? ''),
-        kind: String(point.payload?.kind ?? ''),
-        ts: Number(point.payload?.ts) || 0,
-        level: Number(point.payload?.level) || 0,
-        batch: point.payload?.batch ? String(point.payload.batch) : '',
-        enhanced: point.payload?.enhanced === true,
-      }))
-  }
-
-  /** 整理用的 LLM 客户端（provider 可单独配置，模型名覆盖）。 */
-  async consolidationClient() {
-    const cfg = this.cfg()
-    const provider =
-      (cfg.consolidationProviderId && this.providerById(cfg.consolidationProviderId)) || this.activeProvider()
-    const model = String(cfg.consolidationModel ?? '').trim()
-    if (!model) return null
-    const client = await this.clientFor(provider)
-    return { client, provider, model }
-  }
-
-  /** 迁移：给旧记忆补 level=0 / batch=''（只对缺失 level 的记录处理一次）。 */
-  async migrateLegacyMemories() {
-    try {
-      await this.ensureReady()
-      const qdrant = await this.qdrant()
-      const storage = this.storage()
-      const legacy = []
-      let offset
-      for (let page = 0; page < 100; page += 1) {
-        const { points, nextOffset } = await qdrant.scroll(storage.collection, {
-          limit: 256,
-          offset,
-          withPayload: true,
-          withVector: false,
-        })
-        for (const point of points) {
-          if (point.payload === undefined || point.payload?.level === undefined) legacy.push(String(point.id))
-        }
-        if (!nextOffset || points.length === 0) break
-        offset = nextOffset
-      }
-      if (legacy.length > 0) {
-        await this.updateMemoryPayload(legacy, { level: 0, batch: '' })
-        this.logger.info?.(`[dsh-memory] 已为 ${legacy.length} 条旧记忆补齐整理标签`)
-      }
-      return legacy.length
-    } catch (error) {
-      this.logger.warn?.(`[dsh-memory] 旧记忆迁移失败：${errorText(error)}`)
-      return 0
-    }
-  }
-
-  // ------------------------------------------------------------------
-  // 定期维护
-  // ------------------------------------------------------------------
-
-  /**
-   * 定期维护：过期清理 → 超限淘汰 → 相似重复合并 → 索引重建。
-   * @returns {Promise<object>} 维护结果
-   */
-  async maintenance({ force = false } = {}) {
-    const options = this.maintenanceOptions()
-    const info = await this.ensureReady()
-    const qdrant = await this.qdrant()
-    const storage = this.storage()
-    const result = {
-      ok: true,
-      startedAt: Date.now(),
-      collection: storage.collection,
-      pointsBefore: info?.points ?? null,
-      expired: 0,
-      overflow: 0,
-      duplicates: 0,
-      errors: [],
-    }
-    try {
-      // 1) 过期清理
-      if (options.retentionDays > 0 || force) {
-        const cutoff = Date.now() - options.retentionDays * 86400000
-        if (options.retentionDays > 0) {
-          const before = await qdrant.count(storage.collection, { exact: true })
-          await qdrant.deleteByFilter(storage.collection, {
-            must: [{ key: 'ts', range: { lt: cutoff } }],
-          })
-          const after = await qdrant.count(storage.collection, { exact: true })
-          result.expired = Math.max(0, before - after)
-        }
-      }
-      // 2) 条数上限淘汰（从最旧开始）
-      if (options.maxMemories > 0) {
-        let count = await qdrant.count(storage.collection, { exact: true })
-        let guard = 0
-        while (count > options.maxMemories && guard < 100) {
-          guard += 1
-          const excess = count - options.maxMemories
-          const { points } = await qdrant.scroll(storage.collection, {
-            limit: Math.min(256, excess),
-            orderBy: { key: 'ts', direction: 'asc' },
-          })
-          if (points.length === 0) break
-          const ids = points.map((point) => String(point.id))
-          await qdrant.deletePoints(storage.collection, ids)
-          result.overflow += ids.length
-          count -= ids.length
-        }
-      }
-      // 3) 相似重复合并（只扫描最近的 N 条）
-      if (options.maintenanceDedupe) {
-        const { points } = await qdrant.scroll(storage.collection, {
-          limit: options.dedupeMaxScan,
-          orderBy: { key: 'ts', direction: 'desc' },
-          withPayload: true,
-          withVector: true,
-        })
-        const deleted = new Set()
-        const byId = new Map(points.map((point) => [String(point.id), point]))
-        for (const point of points) {
-          const id = String(point.id)
-          if (deleted.has(id)) continue
-          const vector = Array.isArray(point.vector) ? point.vector : point.vector?.default ?? null
-          if (!Array.isArray(vector)) continue
-          let similar = []
-          try {
-            similar = await qdrant.search(storage.collection, {
-              vector,
-              limit: 5,
-              scoreThreshold: options.dedupeThreshold,
-            })
-          } catch (error) {
-            result.errors.push(`dedupe search: ${errorText(error)}`)
-            break
-          }
-          for (const candidate of similar) {
-            const candidateId = String(candidate.id)
-            if (candidateId === id || deleted.has(candidateId)) continue
-            const other = byId.get(candidateId)
-            const otherTs = Number(other?.payload?.ts) || Number(candidate?.payload?.ts) || 0
-            const selfTs = Number(point?.payload?.ts) || 0
-            const olderId = otherTs < selfTs ? candidateId : id
-            const keepId = olderId === candidateId ? id : candidateId
-            if (olderId === id) {
-              // 自己更旧：删自己，跳出（也把 candidate 标记为已处理）
-              deleted.add(id)
-              try {
-                await qdrant.deletePoints(storage.collection, [id])
-                result.duplicates += 1
-              } catch (error) {
-                result.errors.push(`dedupe delete: ${errorText(error)}`)
-              }
-              break
-            }
-            deleted.add(candidateId)
-            try {
-              await qdrant.deletePoints(storage.collection, [candidateId])
-              result.duplicates += 1
-            } catch (error) {
-              result.errors.push(`dedupe delete: ${errorText(error)}`)
-            }
-            void keepId
-          }
-        }
-      }
-      // 4) 索引重建（幂等）
-      await qdrant.ensurePayloadIndexes(storage.collection)
-    } catch (error) {
-      result.ok = false
-      result.errors.push(errorText(error))
-    }
-    result.finishedAt = Date.now()
-    result.durationMs = result.finishedAt - result.startedAt
-    this.stats.lastMaintenanceAt = result.finishedAt
-    this.stats.lastMaintenance = result
-    if (options.debug || result.errors.length > 0) {
-      this.logger.info?.(
-        `[dsh-memory] 维护完成：过期 ${result.expired}，超限 ${result.overflow}，重复 ${result.duplicates}，错误 ${result.errors.length}`,
-      )
-    }
-    return result
-  }
-
-  // ------------------------------------------------------------------
-  // 状态 / 测试
-  // ------------------------------------------------------------------
-
-  /** 设置页状态快照。 */
   async status() {
     const provider = this.activeProvider()
     const recall = this.recallOptions()
@@ -4403,6 +3901,673 @@ class MemoryService {
     if (this.cfg().debug === true) this.logger.info?.('[dsh-memory]', ...args)
   }
 
+}
+// ===== src/lib/entry/capture-controller.js =====
+/**
+ * 自动记录：监听 session/event，在每轮结束时把“用户要点 + 助手回答要点”
+ * 以及用户图片的一句话概览写入长期记忆。
+ *
+ * 只记录 source.kind === 'user' 的真实人类消息；插件自己注入的
+ * long-term-memory 上下文、运行时上下文、工具结果等一律不记录。
+ */
+
+
+/** 从 content blocks 里提取纯文本。 */
+function textFromContent(content) {
+  if (!Array.isArray(content)) return ''
+  const parts = []
+  for (const block of content) {
+    if (!block || typeof block !== 'object') continue
+    if (block.type === 'text' && typeof block.text === 'string') parts.push(block.text)
+  }
+  return cleanText(parts.join('\n'))
+}
+
+class CaptureController {
+  /**
+   * @param {import('./service.js').MemoryService} service
+   */
+  constructor(service) {
+    this.service = service
+    this.ctx = service.ctx
+    this.logger = service.logger
+    /** sessionId -> { turn, users: string[], assistant: string, images: ImageAttachmentRef[], cwd } */
+    this.buffers = new Map()
+  }
+
+  /** 注册事件监听（由插件 effect 持有）。 */
+  start() {
+    this.ctx.effect(
+      () =>
+        this.ctx.on('session/event', (session, event) => {
+          try {
+            this.observe(session, event)
+          } catch (error) {
+            this.logger.warn?.(`[dsh-memory] 记录会话事件失败：${error?.message ?? error}`)
+          }
+        }),
+      'dsh-memory: session capture',
+    )
+    this.ctx.effect(
+      () =>
+        this.ctx.on('session/disposed', (session) => {
+          this.buffers.delete(String(session?.id ?? ''))
+        }),
+      'dsh-memory: capture cleanup',
+    )
+  }
+
+  observe(session, event) {
+    // 睡眠整理期间不记录（避免把 zzzZZ 对话写进长期记忆）
+    if (this.service.sleep?.isSleeping?.()) return
+    const options = this.service.captureOptions()
+    if (!options.autoCapture) return
+    const sessionId = String(session?.id ?? '')
+    if (!sessionId) return
+    const header = session?.header
+    if (!options.includeSubagents && header?.origin === 'subagent') return
+
+    switch (event?.type) {
+      case 'turn/start': {
+        this.buffers.set(sessionId, {
+          turn: Number(event.data?.turn) || 0,
+          users: [],
+          assistant: '',
+          images: [],
+          cwd: String(header?.cwd ?? ''),
+        })
+        break
+      }
+      case 'user/message': {
+        const buffer = this.buffers.get(sessionId)
+        if (!buffer) return
+        const message = event.data
+        if (message?.source?.kind !== 'user') return
+        const text = textFromContent(message?.content)
+        if (text) buffer.users.push(text)
+        if (Array.isArray(message?.content)) {
+          for (const block of message.content) {
+            if (block?.type === 'image' && block.attachment) buffer.images.push(block.attachment)
+          }
+        }
+        break
+      }
+      case 'assistant/message': {
+        const buffer = this.buffers.get(sessionId)
+        if (!buffer) return
+        const text = textFromContent(event.data?.message?.content)
+        if (text) buffer.assistant = text
+        break
+      }
+      case 'turn/end': {
+        const buffer = this.buffers.get(sessionId)
+        this.buffers.delete(sessionId)
+        if (!buffer) return
+        if (buffer.turn !== (Number(event.data?.turn) || 0)) return
+        const reason = event.data?.reason?.kind
+        if (reason !== 'completed') return
+        this.finalize(sessionId, buffer)
+        break
+      }
+      default:
+        break
+    }
+  }
+
+  /** 一轮结束：入队写入任务（不阻塞 agent 回合）。 */
+  finalize(sessionId, buffer) {
+    const service = this.service
+    const options = service.captureOptions()
+    const userText = truncate(cleanText(buffer.users.join('\n\n')), options.captureUserChars)
+    const assistantText = truncate(cleanText(buffer.assistant), options.captureAssistantChars)
+    const summaryLength = (userText + assistantText).length
+    const imageCount = buffer.images.length
+    if (summaryLength >= options.captureMinChars) {
+      service.queue.push(
+        'capture-turn',
+        () =>
+          service.addTurnMemory({
+            userText,
+            assistantText,
+            sessionId,
+            cwd: buffer.cwd,
+            turn: buffer.turn,
+            imageCount,
+          }),
+        { retries: 1 },
+      )
+    }
+    // 图片：每张单独生成概览并写入（同一轮内按 attachmentId 去重）
+    const seen = new Set()
+    for (const ref of buffer.images) {
+      const attachmentId = String(ref?.attachmentId ?? '')
+      if (!attachmentId || seen.has(attachmentId)) continue
+      seen.add(attachmentId)
+      service.queue.push(
+        `capture-image:${attachmentId}`,
+        () =>
+          service.addImageMemory({
+            ref,
+            sessionId,
+            cwd: buffer.cwd,
+            turn: buffer.turn,
+          }),
+        { retries: 0 },
+      )
+    }
+  }
+}
+// ===== src/lib/entry/http/routes.js =====
+/**
+ * 设置页使用的 Host HTTP 接口（与 DSH Web 同源，仅本机可访问）：
+ *
+ *   GET  /__dsh_memory__/status              运行状态
+ *   GET  /__dsh_memory__/memories?q&limit&offset&kind   记忆列表/检索
+ *   GET  /__dsh_memory__/export              导出全部记忆 JSON
+ *   POST /__dsh_memory__/test                测试激活 provider（可带 providerId）
+ *   POST /__dsh_memory__/memories            手动新增记忆
+ *   POST /__dsh_memory__/memories/delete     删除记忆 {ids:[...]}
+ *   POST /__dsh_memory__/recreate            重建集合（需要 confirm:"DELETE"）
+ *   POST /__dsh_memory__/maintenance         立即执行一次维护
+ *   GET  /__dsh_memory__/sleep               睡眠状态 + 整理任务列表摘要
+ *   POST /__dsh_memory__/sleep/run           手动触发一次睡眠整理
+ *   GET  /__dsh_memory__/consolidation       整理任务列表与历史
+ *   GET  /__dsh_memory__/models?providerId=  拉取某个 provider 的模型列表
+ *
+ * POST 请求要求自定义头 x-dsh-memory: 1，避免跨站请求伪造（跨域预检会拦下）。
+ */
+
+
+/** 读取 JSON 请求体（限制大小）。 */
+function readJsonBody(req, limit = 64 * 1024) {
+  return new Promise((resolve, reject) => {
+    let size = 0
+    const chunks = []
+    req.on('data', (chunk) => {
+      size += chunk.length
+      if (size > limit) {
+        reject(new Error('请求体过大'))
+        req.destroy()
+        return
+      }
+      chunks.push(chunk)
+    })
+    req.on('end', () => {
+      if (chunks.length === 0) {
+        resolve(undefined)
+        return
+      }
+      try {
+        resolve(JSON.parse(Buffer.concat(chunks).toString('utf8')))
+      } catch (error) {
+        reject(new Error(`请求体不是合法 JSON：${errorText(error)}`))
+      }
+    })
+    req.on('error', reject)
+  })
+}
+
+/** 统一 JSON 响应。 */
+function respond(res, status, value) {
+  const body = JSON.stringify(value)
+  res.statusCode = status
+  res.setHeader('Content-Type', 'application/json; charset=utf-8')
+  res.setHeader('Cache-Control', 'no-store')
+  res.end(body)
+}
+
+/** 是否是带自定义头的 POST（基础 CSRF 防护）。 */
+function trustedPost(req) {
+  return req.method === 'POST' && req.headers['x-dsh-memory'] === '1'
+}
+
+/** 解析 URL 查询参数。 */
+function parseQuery(req) {
+  try {
+    const url = new URL(String(req.url ?? '/'), 'http://127.0.0.1')
+    return url.searchParams
+  } catch {
+    return new URLSearchParams()
+  }
+}
+
+/**
+ * @param {object} ctx DSH 插件上下文
+ * @param {import('./service.js').MemoryService} service
+ */
+function registerHttpRoutes(ctx, service) {
+  const log = service.logger
+  const statusRoute = {
+    kind: 'exact',
+    path: '/__dsh_memory__/status',
+    handler: async (req, res) => {
+      if (req.method !== 'GET') {
+        respond(res, 405, { ok: false, error: 'method not allowed' })
+        return
+      }
+      try {
+        respond(res, 200, await service.status())
+      } catch (error) {
+        respond(res, 500, { ok: false, error: errorText(error) })
+      }
+    },
+  }
+  const memoriesRoute = {
+    kind: 'exact',
+    path: '/__dsh_memory__/memories',
+    handler: async (req, res) => {
+      try {
+        if (req.method === 'GET') {
+          const query = parseQuery(req)
+          const result = await service.listMemories({
+            query: query.get('q') ?? '',
+            limit: Number(query.get('limit') ?? 20),
+            offset: query.get('offset') ?? null,
+            kind: query.get('kind') ?? '',
+            range: query.get('range') ?? '',
+            level: query.get('level') ?? '',
+            batch: query.get('batch') ?? '',
+          })
+          respond(res, 200, { ok: true, ...result })
+          return
+        }
+        if (!trustedPost(req)) {
+          respond(res, 403, { ok: false, error: 'forbidden' })
+          return
+        }
+        const body = await readJsonBody(req)
+        const text = cleanText(body?.text ?? '')
+        if (!text) {
+          respond(res, 400, { ok: false, error: '缺少要保存的 text' })
+          return
+        }
+        const kind = typeof body?.kind === 'string' && body.kind.trim() ? body.kind.trim() : 'note'
+        const tags = Array.isArray(body?.tags)
+          ? body.tags.filter((tag) => typeof tag === 'string').slice(0, 12)
+          : []
+        const saved = await service.addMemory({ kind, text, meta: { tags, source: 'settings' } })
+        respond(res, 200, { ok: true, item: saved })
+      } catch (error) {
+        respond(res, 500, { ok: false, error: errorText(error) })
+      }
+    },
+  }
+  const memoriesDeleteRoute = {
+    kind: 'exact',
+    path: '/__dsh_memory__/memories/delete',
+    handler: async (req, res) => {
+      if (!trustedPost(req)) {
+        respond(res, 403, { ok: false, error: 'forbidden' })
+        return
+      }
+      try {
+        const body = await readJsonBody(req)
+        const ids = Array.isArray(body?.ids) ? body.ids : body?.id ? [body.id] : []
+        const result = await service.forget(ids)
+        respond(res, 200, result)
+      } catch (error) {
+        respond(res, 400, { ok: false, error: errorText(error) })
+      }
+    },
+  }
+  const exportRoute = {
+    kind: 'exact',
+    path: '/__dsh_memory__/export',
+    handler: async (req, res) => {
+      if (req.method !== 'GET') {
+        respond(res, 405, { ok: false, error: 'method not allowed' })
+        return
+      }
+      try {
+        respond(res, 200, await service.exportMemories())
+      } catch (error) {
+        respond(res, 500, { ok: false, error: errorText(error) })
+      }
+    },
+  }
+  const testRoute = {
+    kind: 'exact',
+    path: '/__dsh_memory__/test',
+    handler: async (req, res) => {
+      if (!trustedPost(req)) {
+        respond(res, 403, { ok: false, error: 'forbidden' })
+        return
+      }
+      try {
+        const body = await readJsonBody(req)
+        respond(res, 200, await service.test(typeof body?.providerId === 'string' ? body.providerId : undefined))
+      } catch (error) {
+        log.warn?.(`[dsh-memory] 连接测试失败：${errorText(error)}`)
+        respond(res, 500, { ok: false, error: errorText(error) })
+      }
+    },
+  }
+  const recreateRoute = {
+    kind: 'exact',
+    path: '/__dsh_memory__/recreate',
+    handler: async (req, res) => {
+      if (!trustedPost(req)) {
+        respond(res, 403, { ok: false, error: 'forbidden' })
+        return
+      }
+      try {
+        const body = await readJsonBody(req)
+        if (body?.confirm !== 'DELETE') {
+          respond(res, 400, { ok: false, error: '需要 confirm: "DELETE" 才能重建集合' })
+          return
+        }
+        const result = await service.recreateCollection()
+        if (!result.ok) {
+          respond(res, 500, { ok: false, error: result.error ?? '重建失败' })
+          return
+        }
+        respond(res, 200, { ok: true, collection: result.info })
+      } catch (error) {
+        log.warn?.(`[dsh-memory] 重建集合失败：${errorText(error)}`)
+        respond(res, 500, { ok: false, error: errorText(error) })
+      }
+    },
+  }
+  const maintenanceRoute = {
+    kind: 'exact',
+    path: '/__dsh_memory__/maintenance',
+    handler: async (req, res) => {
+      if (!trustedPost(req)) {
+        respond(res, 403, { ok: false, error: 'forbidden' })
+        return
+      }
+      try {
+        await readJsonBody(req)
+        respond(res, 200, await service.maintenance({ force: true }))
+      } catch (error) {
+        respond(res, 500, { ok: false, error: errorText(error) })
+      }
+    },
+  }
+  const sleepRoute = {
+    kind: 'exact',
+    path: '/__dsh_memory__/sleep',
+    handler: async (req, res) => {
+      if (req.method !== 'GET') {
+        respond(res, 405, { ok: false, error: 'method not allowed' })
+        return
+      }
+      if (!service.sleep || !service.consolidation) {
+        respond(res, 503, { ok: false, error: '睡眠整理组件未加载' })
+        return
+      }
+      respond(res, 200, {
+        ok: true,
+        sleep: service.sleep.status(),
+        consolidation: service.consolidation.summary(),
+      })
+    },
+  }
+  const sleepRunRoute = {
+    kind: 'exact',
+    path: '/__dsh_memory__/sleep/run',
+    handler: async (req, res) => {
+      if (!trustedPost(req)) {
+        respond(res, 403, { ok: false, error: 'forbidden' })
+        return
+      }
+      if (!service.sleep) {
+        respond(res, 503, { ok: false, error: '睡眠整理组件未加载' })
+        return
+      }
+      try {
+        const body = await readJsonBody(req)
+        if (body?.confirm === 'run') {
+          respond(res, 200, service.sleep.requestManual())
+          return
+        }
+        respond(res, 200, service.sleep.requestManual())
+      } catch (error) {
+        respond(res, 500, { ok: false, error: errorText(error) })
+      }
+    },
+  }
+  const consolidationRoute = {
+    kind: 'exact',
+    path: '/__dsh_memory__/consolidation',
+    handler: async (req, res) => {
+      if (req.method !== 'GET') {
+        respond(res, 405, { ok: false, error: 'method not allowed' })
+        return
+      }
+      if (!service.consolidation) {
+        respond(res, 503, { ok: false, error: '整理引擎未加载' })
+        return
+      }
+      respond(res, 200, { ok: true, ...service.consolidation.summary() })
+    },
+  }
+  const modelsRoute = {
+    kind: 'exact',
+    path: '/__dsh_memory__/models',
+    handler: async (req, res) => {
+      if (req.method !== 'GET') {
+        respond(res, 405, { ok: false, error: 'method not allowed' })
+        return
+      }
+      try {
+        const query = parseQuery(req)
+        respond(res, 200, await service.listProviderModels(query.get('providerId') ?? ''))
+      } catch (error) {
+        respond(res, 500, { ok: false, error: errorText(error) })
+      }
+    },
+  }
+  const dshModelsRoute = {
+    kind: 'exact',
+    path: '/__dsh_memory__/dsh-models',
+    handler: async (req, res) => {
+      if (req.method !== 'GET') {
+        respond(res, 405, { ok: false, error: 'method not allowed' })
+        return
+      }
+      try {
+        respond(res, 200, { ok: true, ...(await service.dshCatalog()) })
+      } catch (error) {
+        respond(res, 500, { ok: false, error: errorText(error) })
+      }
+    },
+  }
+
+  const routes = [
+    statusRoute,
+    memoriesRoute,
+    memoriesDeleteRoute,
+    exportRoute,
+    testRoute,
+    recreateRoute,
+    maintenanceRoute,
+    sleepRoute,
+    sleepRunRoute,
+    consolidationRoute,
+    modelsRoute,
+    dshModelsRoute,
+  ]
+  return routes.map((route) => ctx.effect(() => ctx.webServer.register(route), `dsh-memory: route ${route.path}`))
+}
+// ===== src/lib/entry/maintenance-timer.js =====
+/**
+ * 定期维护定时器（入口层）：启动后 90 秒检查一次，之后每 5 分钟检查是否到期。
+ * @param {object} ctx
+ * @param {import('../app/memory-service.js').MemoryService} service
+ */
+
+
+const MAINTENANCE_TICK_MS = 5 * 60 * 1000
+
+function startMaintenanceTimer(ctx, service) {
+  const logger = service.logger
+  let maintenanceTimer
+  let startupTimer
+  ctx.effect(() => {
+    const tick = () => {
+      try {
+        const options = service.maintenanceOptions()
+        const due =
+          service.stats.lastMaintenanceAt === 0 ||
+          Date.now() - service.stats.lastMaintenanceAt >= options.maintenanceIntervalHours * 3600 * 1000
+        if (!due) return
+        service
+          .maintenance()
+          .then((result) => {
+            if (!result.ok) logger.warn?.(`[dsh-memory] 定期维护出现错误：${result.errors.join('; ')}`)
+          })
+          .catch((error) => logger.warn?.(`[dsh-memory] 定期维护失败：${errorText(error)}`))
+      } catch (error) {
+        logger.warn?.(`[dsh-memory] 维护定时器异常：${errorText(error)}`)
+      }
+    }
+    startupTimer = setTimeout(tick, 90 * 1000)
+    maintenanceTimer = setInterval(tick, MAINTENANCE_TICK_MS)
+    return () => {
+      clearTimeout(startupTimer)
+      clearInterval(maintenanceTimer)
+    }
+  }, 'dsh-memory: maintenance timer')
+}
+// ===== src/lib/entry/prompt.js =====
+/**
+ * 注入系统提示词的长期记忆使用说明（入口层，只做文本与注册）。
+ * @param {object} ctx DSH 插件上下文
+ */
+const PROMPT_SECTION = [
+  '## 长期记忆',
+  '你拥有一个跨会话的持久化长期记忆库（由 dsh-memory 插件提供）。',
+  '- 相关历史记忆可能以 source 为 long-term-memory 的上下文消息自动提供给你（通常以【长期记忆·自动召回】开头）。它们只是参考；若与当前对话冲突，以当前对话为准，不要向用户复述“经检索”之类的话。',
+  '- 当用户透露值得长期记住的信息（偏好、身份、项目背景、重要决定、常用路径或命令、约定等）时，调用 memory_save 保存。每条记忆应当简洁、自包含（不要用“他/它/这个”等指代），一条一个事实；不要保存密码、密钥等敏感凭据。',
+  '- 需要回忆过去的信息时，调用 memory_search 检索。不要凭空编造没有检索到的记忆。',
+  '- 用户要求忘记某条记忆时，先用 memory_search 找到 id，再调用 memory_forget 删除。',
+  '- 记忆条目会带发生时间（按配置时区显示，可能附相对时间）；自动召回上下文里也可能给出“当前时间”。需要判断信息新旧或做时间推算时，使用这些时间，不要假设当前日期。',
+].join('\n')
+
+/** 注册提示词段。 */
+function registerPromptSection(ctx) {
+  ctx.effect(
+    () =>
+      ctx.systemPrompt.section({
+        name: 'dsh-memory:instructions',
+        order: 2475,
+        text: () => PROMPT_SECTION,
+      }),
+    'dsh-memory: prompt section',
+  )
+}
+// ===== src/lib/entry/recall-controller.js =====
+/**
+ * 自动召回：在每轮第一步之前，用最后一条真实用户消息做向量检索，
+ * 把相关记忆作为一条 source.kind = 'long-term-memory' 的上下文消息
+ * 追加进本步的 messages。
+ *
+ * 该消息会进入会话日志（可回放/可 fork），DSH Web 会把它显示成
+ * “上下文注入”行，而不是用户气泡。
+ */
+
+
+
+
+/** 从消息列表里取出最后一条真实人类消息的文本。 */
+function lastUserText(messages) {
+  if (!Array.isArray(messages)) return ''
+  for (let index = messages.length - 1; index >= 0; index -= 1) {
+    const message = messages[index]
+    if (!message || message.role !== 'user') continue
+    if (message.source?.kind !== 'user') continue
+    const parts = []
+    for (const block of message.content ?? []) {
+      if (block?.type === 'text' && typeof block.text === 'string') parts.push(block.text)
+    }
+    const text = parts.join('\n').trim()
+    if (text) return text
+  }
+  return ''
+}
+
+/** 构造注入用的上下文消息。 */
+function createMemoryMessage(text) {
+  return {
+    id: `memory-${randomUUID()}`,
+    role: 'user',
+    content: [{ type: 'text', text }],
+    source: { kind: MEMORY_SOURCE },
+  }
+}
+
+class RecallController {
+  /**
+   * @param {import('./service.js').MemoryService} service
+   */
+  constructor(service) {
+    this.service = service
+    this.ctx = service.ctx
+    this.logger = service.logger
+  }
+
+  start() {
+    this.ctx.effect(
+      () =>
+        this.ctx.on('agent/pre-step', async (payload, next) => {
+          const decision = await next()
+          try {
+            return await this.augment(payload, decision)
+          } catch (error) {
+            this.service.stats.lastRecallError = errorText(error)
+            this.service.debugLog(`自动召回失败：${errorText(error)}`)
+            return decision
+          }
+        }),
+      'dsh-memory: auto recall',
+    )
+  }
+
+  async augment(payload, decision) {
+    // 睡眠整理期间：不召回，改为让模型只回复 zzzZZ，并把用户原话排队到睡醒后继续处理
+    const sleep = this.service.sleep
+    if (sleep?.isSleeping?.()) {
+      if (payload?.step !== 1) return decision
+      if (payload?.signal?.aborted) return decision
+      if (decision?.kind !== 'enter') return decision
+      const intercepted = sleep.interceptPreStep(payload, decision)
+      if (intercepted?.message) {
+        return { ...decision, messages: [...decision.messages, intercepted.message] }
+      }
+      return decision
+    }
+    const options = this.service.recallOptions()
+    if (!options.autoRecall) return decision
+    const agentId = String(payload?.agent?.id ?? '')
+    if (!this.service.captureOptions().includeSubagents && agentId) {
+      const session = this.service.ctx.sessions?.get?.(agentId)
+      if (session?.header?.origin === 'subagent') return decision
+    }
+    if (payload?.step !== 1) return decision
+    if (payload?.signal?.aborted) return decision
+    if (decision?.kind !== 'enter') return decision
+    const query = lastUserText(decision.messages) || lastUserText(payload.messages)
+    this.service.stats.recallChecks += 1
+    this.service.stats.lastRecallQuery = query.slice(0, 120)
+    this.service.stats.lastRecallError = ''
+    if (!query || query.length < 2) return decision
+    const context = this.service.sessionContext(agentId)
+    const timeout = AbortSignal.timeout(options.recallTimeoutMs)
+    const signal = payload?.signal === undefined ? timeout : AbortSignal.any([payload.signal, timeout])
+    const { block, hits } = await this.service.recall(query, {
+      signal,
+      sessionId: context.sessionId,
+      cwd: context.cwd,
+    })
+    if (!block || hits.length === 0) return decision
+    this.service.stats.lastRecallInjectAt = Date.now()
+    this.service.debugLog(`自动召回 ${hits.length} 条记忆（score ${hits[0].score.toFixed(3)}）`)
+    return {
+      ...decision,
+      messages: [...decision.messages, createMemoryMessage(block)],
+    }
+  }
 }
 // ===== src/lib/entry/sleep-controller.js =====
 /**
@@ -4998,16 +5163,10 @@ function registerMemoryTools(service) {
     ctx.effect(() => ctx.tools.register(tool), `dsh-memory: tool ${tool.name}`),
   )
 }
-// ===== src/index.js =====
+// ===== src/lib/entry/bootstrap.js =====
 /**
- * dsh-memory Host 半（v0.2）：装配长期记忆服务。
- *
- * - 配置：src/lib/config.js（多 provider 档案 + 行为/保留参数，全部 volatile，设置页可改）
- * - 业务：src/lib/service.js（provider 解析 / 嵌入 / Qdrant / 记录 / 召回 / 管理 / 维护）
- * - 自动记录：src/lib/capture.js；自动召回：src/lib/recall.js
- * - 工具：src/lib/tools.js；设置页数据接口：src/lib/http.js
- *
- * 浏览器半在 client.js（设置页 GUI）。
+ * 插件装配（R4 组合根）：只负责把服务/控制器/路由/定时器接起来。
+ * index.js 保持为极薄的 Host 入口（name/inject/Config/apply）。
  */
 
 
@@ -5019,100 +5178,40 @@ function registerMemoryTools(service) {
 
 
 
-const name = 'dsh-memory'
-
-/** 需要的 Host 服务；缺任意一个时插件保持未激活，而不是报错。 */
-const inject = ['tools', 'systemPrompt', 'webServer', 'credentials', 'attachments', 'sessions', 'timer', 'agents', 'llm', 'agentDefaultModel']
-
-
-/** 注入系统提示词的长期记忆使用说明。 */
-const PROMPT_SECTION = [
-  '## 长期记忆',
-  '你拥有一个跨会话的持久化长期记忆库（由 dsh-memory 插件提供）。',
-  '- 相关历史记忆可能以 source 为 long-term-memory 的上下文消息自动提供给你（通常以【长期记忆·自动召回】开头）。它们只是参考；若与当前对话冲突，以当前对话为准，不要向用户复述“经检索”之类的话。',
-  '- 当用户透露值得长期记住的信息（偏好、身份、项目背景、重要决定、常用路径或命令、约定等）时，调用 memory_save 保存。每条记忆应当简洁、自包含（不要用“他/它/这个”等指代），一条一个事实；不要保存密码、密钥等敏感凭据。',
-  '- 需要回忆过去的信息时，调用 memory_search 检索。不要凭空编造没有检索到的记忆。',
-  '- 用户要求忘记某条记忆时，先用 memory_search 找到 id，再调用 memory_forget 删除。',
-  '- 记忆条目会带发生时间（按配置时区显示，可能附相对时间）；自动召回上下文里也可能给出“当前时间”。需要判断信息新旧或做时间推算时，使用这些时间，不要假设当前日期。',
-].join('\n')
-
-/** 维护检查定时器间隔（毫秒）：每 5 分钟检查一次是否到维护时间。 */
-const MAINTENANCE_TICK_MS = 5 * 60 * 1000
 
 /**
  * @param {object} ctx DSH 插件上下文
  * @param {object} config schemastery Config 实例
  */
-function apply(ctx, config) {
+function applyPlugin(ctx, config) {
   const service = new MemoryService(ctx, config)
   const logger = service.logger
 
-  // 0) 睡眠整理引擎 + 控制器（v0.4）
+  // 睡眠整理引擎 + 控制器
   const consolidation = new ConsolidationEngine(service)
   const sleep = new SleepController(service, consolidation)
   service.consolidation = consolidation
   service.sleep = sleep
 
-  // 1) 系统提示词说明
-  ctx.effect(
-    () =>
-      ctx.systemPrompt.section({
-        name: 'dsh-memory:instructions',
-        order: 2475,
-        text: () => PROMPT_SECTION,
-      }),
-    'dsh-memory: prompt section',
-  )
-
-  // 2) 模型工具
+  registerPromptSection(ctx)
   registerMemoryTools(service)
-
-  // 3) 设置页数据接口
   registerHttpRoutes(ctx, service)
 
-  // 4) 自动记录 + 自动召回
+  // 自动记录 + 自动召回 + 睡眠控制器
   new CaptureController(service).start()
   new RecallController(service).start()
-
-  // 4.5) 睡眠控制器（定时器 + 用户活动监听）
   consolidation.load().catch((error) => logger.warn?.(`[dsh-memory] 读取整理任务列表失败：${errorText(error)}`))
   sleep.start()
 
-  // 5) 定期维护：启动后延迟执行一次，之后按 maintenanceIntervalHours 触发
-  let maintenanceTimer
-  let startupTimer
-  ctx.effect(() => {
-    const tick = () => {
-      try {
-        const options = service.maintenanceOptions()
-        const due =
-          service.stats.lastMaintenanceAt === 0 ||
-          Date.now() - service.stats.lastMaintenanceAt >= options.maintenanceIntervalHours * 3600 * 1000
-        if (!due) return
-        service
-          .maintenance()
-          .then((result) => {
-            if (!result.ok) logger.warn?.(`[dsh-memory] 定期维护出现错误：${result.errors.join('; ')}`)
-          })
-          .catch((error) => logger.warn?.(`[dsh-memory] 定期维护失败：${errorText(error)}`))
-      } catch (error) {
-        logger.warn?.(`[dsh-memory] 维护定时器异常：${errorText(error)}`)
-      }
-    }
-    startupTimer = setTimeout(tick, 90 * 1000)
-    maintenanceTimer = setInterval(tick, MAINTENANCE_TICK_MS)
-    return () => {
-      clearTimeout(startupTimer)
-      clearInterval(maintenanceTimer)
-    }
-  }, 'dsh-memory: maintenance timer')
+  // 定期维护
+  startMaintenanceTimer(ctx, service)
 
   const provider = service.activeProvider()
   logger.info?.(
     `[dsh-memory] 已加载 v0.6.0：provider=${provider.id}（${provider.embedModel}，${provider.dimensions} 维）→ Qdrant ${service.storage().qdrantUrl} / ${service.storage().collection}`,
   )
 
-  // 6) 启动自检：确保 collection 存在（失败只告警，不阻塞 DSH 启动），并补齐旧记忆标签
+  // 启动自检：确保 collection 存在，并补齐旧记忆标签（失败只告警）
   Promise.resolve()
     .then(() => service.ensureReady())
     .then((info) => {
@@ -5122,6 +5221,38 @@ function apply(ctx, config) {
     .catch((error) => {
       logger.warn?.(`[dsh-memory] 启动自检失败：${errorText(error)}`)
     })
+}
+// ===== src/index.js =====
+/**
+ * dsh-memory Host 入口（组合根）：只声明标识/依赖/配置并交给 entry/bootstrap 装配。
+ * 具体分层与依赖规则见 docs/ARCHITECTURE.md。
+ */
+
+
+
+const name = 'dsh-memory'
+
+/** 需要的 Host 服务；缺任意一个时插件保持未激活，而不是报错。 */
+const inject = [
+  'tools',
+  'systemPrompt',
+  'webServer',
+  'credentials',
+  'attachments',
+  'sessions',
+  'timer',
+  'agents',
+  'llm',
+  'agentDefaultModel',
+]
+
+
+/**
+ * @param {object} ctx DSH 插件上下文
+ * @param {object} config schemastery Config 实例
+ */
+function apply(ctx, config) {
+  applyPlugin(ctx, config)
 }
 
 export { name, inject, Config, apply }
