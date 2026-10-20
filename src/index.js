@@ -8,15 +8,15 @@
  *
  * 浏览器半在 client.js（设置页 GUI）。
  */
-import { Config } from './lib/config.js'
-import { CaptureController } from './lib/capture.js'
-import { ConsolidationEngine } from './lib/consolidation.js'
-import { registerHttpRoutes } from './lib/http.js'
-import { RecallController } from './lib/recall.js'
-import { MemoryService } from './lib/service.js'
-import { SleepController } from './lib/sleep.js'
-import { registerMemoryTools } from './lib/tools.js'
-import { errorText } from './lib/util.js'
+import { Config } from './lib/config/schema.js'
+import { CaptureController } from './lib/entry/capture-controller.js'
+import { ConsolidationEngine } from './lib/app/consolidation-service.js'
+import { registerHttpRoutes } from './lib/entry/http/routes.js'
+import { RecallController } from './lib/entry/recall-controller.js'
+import { MemoryService } from './lib/app/memory-service.js'
+import { SleepController } from './lib/entry/sleep-controller.js'
+import { registerMemoryTools } from './lib/entry/tools.js'
+import { errorText } from './lib/util/index.js'
 
 export const name = 'dsh-memory'
 

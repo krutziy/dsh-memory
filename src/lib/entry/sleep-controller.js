@@ -9,11 +9,8 @@
  * - 睡觉期间自动记录会跳过 zzzZZ 轮次，避免污染记忆。
  */
 import { randomUUID } from 'node:crypto'
-import { dayKey, formatDuration, isAtOrAfterTime, parseHhMm } from './util.js'
-
-/** 睡眠/唤醒期间使用的上下文注入消息 source kind。 */
-export const SLEEP_SOURCE = 'dsh-memory-sleep'
-export const WAKE_SOURCE = 'dsh-memory-wake'
+import { SLEEP_SOURCE, WAKE_SOURCE } from '../../shared/protocol.js'
+import { dayKey, formatDuration, isAtOrAfterTime, parseHhMm } from '../util/index.js'
 
 /** 构造一条 source.kind 为指定值的 user 消息。 */
 function contextMessage(kind, id, text) {

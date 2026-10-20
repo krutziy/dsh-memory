@@ -5,7 +5,7 @@
  * 只记录 source.kind === 'user' 的真实人类消息；插件自己注入的
  * long-term-memory 上下文、运行时上下文、工具结果等一律不记录。
  */
-import { cleanText, truncate } from './util.js'
+import { cleanText, truncate } from '../util/index.js'
 
 /** 从 content blocks 里提取纯文本。 */
 export function textFromContent(content) {

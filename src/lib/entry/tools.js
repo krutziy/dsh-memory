@@ -7,7 +7,7 @@
  * 使用原始 ctx.tools.register（不依赖 DSH 内部工具包），参数 schema 只使用
  * DSH 支持的 JSON Schema 子集：type/oneOf/properties/required/items/enum/const。
  */
-import { cleanText, errorText } from './util.js'
+import { cleanText, errorText } from '../util/index.js'
 
 /** 统一的文本型工具输出渲染。 */
 function renderText(_args, value) {

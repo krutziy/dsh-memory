@@ -30,7 +30,7 @@ import {
   readJsonFile,
   renderMemoryLines,
   writeJsonFileAtomic,
-} from './util.js'
+} from '../util/index.js'
 
 /** 整理状态文件版本。 */
 const STATE_VERSION = 1

@@ -7,8 +7,8 @@
  * “上下文注入”行，而不是用户气泡。
  */
 import { randomUUID } from 'node:crypto'
-import { MEMORY_SOURCE } from './service.js'
-import { errorText } from './util.js'
+import { MEMORY_SOURCE } from '../../shared/protocol.js'
+import { errorText } from '../util/index.js'
 
 /** 从消息列表里取出最后一条真实人类消息的文本。 */
 function lastUserText(messages) {

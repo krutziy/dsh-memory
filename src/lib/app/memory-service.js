@@ -11,9 +11,10 @@
  * - 保留策略与定期维护（过期清理、超限淘汰、相似重复合并、索引重建）；
  * - 状态、测试、后台队列。
  */
-import { DIMENSIONS } from './config.js'
-import { OpenAICompatClient, DEFAULT_CAPTION_PROMPT } from './api-client.js'
-import { QdrantClient } from './qdrant.js'
+import { DIMENSIONS } from '../config/schema.js'
+import { MEMORY_SOURCE } from '../../shared/protocol.js'
+import { OpenAICompatClient, DEFAULT_CAPTION_PROMPT } from '../adapters/openai/client.js'
+import { QdrantClient } from '../adapters/qdrant/client.js'
 import {
   SerialQueue,
   asBool,
@@ -31,11 +32,9 @@ import {
   timeInfo,
   toDataUri,
   truncate,
-} from './util.js'
+} from '../util/index.js'
 
 /** 自动召回注入消息的 source.kind；DSH 会把它渲染成“上下文注入”行而不是用户气泡。 */
-export const MEMORY_SOURCE = 'long-term-memory'
-
 /** 自动召回上下文消息的标题前缀。 */
 export const RECALL_HEADER = '【长期记忆·自动召回】'
 

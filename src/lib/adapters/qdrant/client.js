@@ -3,7 +3,7 @@
  * 与 Qdrant 同机部署时默认 http://127.0.0.1:6333，无需 API Key；
  * 如需鉴权，可从 DSH 凭据库读取 api-key。
  */
-import { errorText } from './util.js'
+import { errorText } from '../../util/index.js'
 
 function joinUrl(base, path) {
   return `${String(base ?? '').replace(/\/+$/, '')}${path}`

@@ -1,4 +1,4 @@
-// ⚠️ 本文件由 build.mjs 从 src/ 生成，请修改 src/ 下的源码后重新构建。
+// ⚠️ 本文件由 build.mjs 从 src/ 生成（拓扑排序），请修改 src/ 下的源码后重新构建。
 // 生成命令：node build.mjs
 
 import { createHash, randomUUID } from 'node:crypto'
@@ -6,7 +6,7 @@ import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from '
 import { createRequire } from 'node:module'
 import { dirname, join } from 'node:path'
 
-// ===== src/lib/schemastery.js =====
+// ===== src/lib/config/schemastery.js =====
 /**
  * 加载 DSH 自带的 @deepseek-ai/schemastery。
  *
@@ -71,7 +71,414 @@ function loadSchemastery() {
 
 /** schemastery 的默认导出（z）。 */
 const z = loadSchemastery()
-// ===== src/lib/util.js =====
+// ===== src/lib/config/schema.js =====
+/**
+ * dsh-memory 插件配置（v0.2）。
+ *
+ * 所有用户可调项都声明为 `.volatile()`，DSH 的 Settings 服务会把它们投影成
+ * 可编辑表单，设置页通过 ctx.configForms 读写，保存后热生效。
+ *
+ * v0.2 起支持多 provider 档案：providers 是整棵被标记 volatile 的数组，
+ * 设置页可以增删改、切换 activeProvider；不再绑定硅基流动。
+ */
+
+
+/** 常用嵌入维度档位（不同模型支持范围不同，这里作为提示）。 */
+const DIMENSIONS = [256, 512, 768, 1024, 1536, 2048, 2560, 3072, 4096]
+
+/** 图片记忆方式。 */
+const IMAGE_MODES = ['caption', 'placeholder', 'off']
+
+/** 记忆范围。 */
+const SCOPE_MODES = ['global', 'workspace', 'session']
+
+/** 单个 provider 档案的字段结构（同时用于客户端预设与校验）。 */
+const PROVIDER_FIELDS = [
+  'id',
+  'name',
+  'protocol',
+  'baseUrl',
+  'embedModel',
+  'dimensions',
+  'apiKeyEnv',
+  'sendDimensions',
+  'visionModel',
+  'visionBaseUrl',
+  'visionApiKeyEnv',
+]
+
+const Config = z.object({
+  // -------------------- 多 provider 档案 --------------------
+  providers: z
+    .array(
+      z.object({
+        id: z.string().required().description('唯一标识（英文/数字/下划线），如 siliconflow'),
+        name: z.string().default('').description('显示名称，如 硅基流动'),
+        protocol: z
+          .string()
+          .default('openai')
+          .description('接口协议；目前支持 OpenAI 兼容的 /embeddings 与 /chat/completions'),
+        baseUrl: z.string().required().description('API Base URL，如 https://api.siliconflow.cn/v1'),
+        embedModel: z.string().required().description('嵌入模型名称'),
+        dimensions: z.number().default(1024).step(1).description('向量维度（需与 Qdrant 集合一致）'),
+        apiKeyEnv: z
+          .string()
+          .default('')
+          .description('该 Base URL 对应的 Key 在 DSH 凭据库中的引用名；留空则用 <ID>_API_KEY'),
+        sendDimensions: z
+          .boolean()
+          .default(true)
+          .description('请求嵌入接口时是否发送 dimensions 参数（部分服务不支持时关掉）'),
+        visionModel: z
+          .string()
+          .default('')
+          .description('图片概览使用的视觉对话模型；留空则图片只记占位'),
+        visionBaseUrl: z.string().default('').description('视觉接口 Base URL；留空与 baseUrl 相同'),
+        visionApiKeyEnv: z.string().default('').description('视觉接口 Key 引用名；留空与 apiKeyEnv 相同'),
+      }),
+    )
+    .default([])
+    .volatile()
+    .description('provider 档案列表（可保存多套云端服务商配置）'),
+  activeProvider: z
+    .string()
+    .default('')
+    .volatile()
+    .description('当前激活的 provider id；留空使用列表中的第一个'),
+
+  // -------------------- 向量库 --------------------
+  qdrantUrl: z
+    .string()
+    .default('http://127.0.0.1:6333')
+    .volatile()
+    .description('Qdrant HTTP 地址；插件与 Qdrant 同机时保持 127.0.0.1'),
+  collection: z.string().default('dsh_memory').volatile().description('Qdrant collection 名称'),
+  qdrantApiKeyEnv: z
+    .string()
+    .default('')
+    .volatile()
+    .description('Qdrant API Key 的凭据引用名；留空表示无鉴权（本机回环推荐）'),
+
+  // -------------------- 自动记录 --------------------
+  autoCapture: z
+    .boolean()
+    .default(true)
+    .volatile()
+    .description('每轮对话结束后，自动把“用户要点 + 助手回答要点”存入长期记忆'),
+  captureUserChars: z
+    .number()
+    .default(400)
+    .step(1)
+    .min(0)
+    .volatile()
+    .description('自动记录时用户内容的最大保留字符数'),
+  captureAssistantChars: z
+    .number()
+    .default(400)
+    .step(1)
+    .min(0)
+    .volatile()
+    .description('自动记录时助手回答的最大保留字符数'),
+  captureMinChars: z
+    .number()
+    .default(12)
+    .step(1)
+    .min(0)
+    .volatile()
+    .description('一轮内容少于该字符数时不记录（过滤“好的/谢谢”等噪音）'),
+  includeSubagents: z
+    .boolean()
+    .default(false)
+    .volatile()
+    .description('是否也记录子代理（subagent）会话的要点'),
+
+  // -------------------- 自动召回 --------------------
+  autoRecall: z
+    .boolean()
+    .default(true)
+    .volatile()
+    .description('每轮开始时自动检索相关长期记忆并注入上下文'),
+  memoryScope: z
+    .union([z.const('global'), z.const('workspace'), z.const('session')])
+    .default('global')
+    .volatile()
+    .description('记忆范围：global=全局共享；workspace=按工作目录隔离；session=按会话隔离'),
+  recallTopK: z
+    .number()
+    .default(3)
+    .step(1)
+    .min(1)
+    .max(20)
+    .volatile()
+    .description('自动召回的条目数（1-20）'),
+  recallMinScore: z
+    .number()
+    .default(0.42)
+    .step(0.01)
+    .min(0)
+    .max(1)
+    .volatile()
+    .description('自动召回的最低相关度（0-1，越高越严格）'),
+  recallMaxChars: z
+    .number()
+    .default(600)
+    .step(1)
+    .min(100)
+    .max(4000)
+    .volatile()
+    .description('自动召回内容注入上下文时的最大字符数'),
+  recallIncludeCurrentSession: z
+    .boolean()
+    .default(false)
+    .volatile()
+    .description('自动召回时是否包含当前会话自身的记忆'),
+  recallTimeoutMs: z
+    .number()
+    .default(3000)
+    .step(100)
+    .min(500)
+    .max(20000)
+    .volatile()
+    .description('自动召回的超时时间（毫秒）；超时则本轮跳过召回'),
+
+  // -------------------- 时间与时区 --------------------
+  timezone: z
+    .string()
+    .default('')
+    .volatile()
+    .description('时间显示时区：留空=跟随服务器本地；可选常见 IANA 时区，或 custom 自定义'),
+  timezoneCustom: z
+    .string()
+    .default('')
+    .volatile()
+    .description('自定义 IANA 时区（当 timezone=custom 时生效），如 America/New_York'),
+  injectCurrentTime: z
+    .boolean()
+    .default(true)
+    .volatile()
+    .description('自动召回时在上下文里附带“当前时间”（按所选时区），便于模型判断记忆的新旧'),
+  relativeTime: z
+    .boolean()
+    .default(true)
+    .volatile()
+    .description('召回/列表中显示相对时间（如“3 天前”）'),
+
+  // -------------------- 图片 --------------------
+  captionSource: z
+    .string()
+    .default('dsh')
+    .volatile()
+    .description('图片概览模型来源：dsh=直接使用 DSH 已配置的模型；custom=使用插件自定义 provider'),
+  captionDshProvider: z
+    .string()
+    .default('')
+    .volatile()
+    .description('DSH 图片概览使用的 provider；留空使用 DSH 默认模型'),
+  captionDshModel: z
+    .string()
+    .default('')
+    .volatile()
+    .description('DSH 图片概览使用的模型；留空使用 DSH 默认模型（需支持图片输入）'),
+  captionProviderId: z
+    .string()
+    .default('')
+    .volatile()
+    .description('图片概览使用的 provider id；留空跟随当前激活 provider'),
+  captionModel: z
+    .string()
+    .default('')
+    .volatile()
+    .description('图片概览使用的视觉模型；留空使用该 provider 的 visionModel 配置'),
+  imageMode: z
+    .union([z.const('caption'), z.const('placeholder'), z.const('off')])
+    .default('caption')
+    .volatile()
+    .description('图片记忆方式：caption=生成一句话概览后只存描述；placeholder=只记“发过图”；off=忽略图片'),
+  captionPrompt: z
+    .string()
+    .default('')
+    .volatile()
+    .description('图片概览的提示词；留空使用内置默认提示词'),
+  captionMaxTokens: z
+    .number()
+    .default(96)
+    .step(1)
+    .min(16)
+    .max(1024)
+    .volatile()
+    .description('图片概览生成的最大 token 数'),
+
+  // -------------------- 工具 --------------------
+  toolsEnabled: z
+    .boolean()
+    .default(true)
+    .volatile()
+    .description('是否允许模型使用 memory_search / memory_save / memory_forget 工具'),
+  toolSearchLimit: z
+    .number()
+    .default(5)
+    .step(1)
+    .min(1)
+    .max(20)
+    .volatile()
+    .description('memory_search 的默认返回条数（1-20）'),
+
+  // -------------------- 定期维护 / 保留策略 --------------------
+  retentionDays: z
+    .number()
+    .default(0)
+    .step(1)
+    .min(0)
+    .volatile()
+    .description('记忆保留天数（0=永久保留）；超期记忆在定期维护时删除'),
+  maxMemories: z
+    .number()
+    .default(0)
+    .step(1)
+    .min(0)
+    .volatile()
+    .description('记忆条数上限（0=不限）；超限时定期维护淘汰最旧的记录'),
+  maintenanceIntervalHours: z
+    .number()
+    .default(6)
+    .step(1)
+    .min(1)
+    .max(168)
+    .volatile()
+    .description('自动维护的间隔小时数'),
+  maintenanceDedupe: z
+    .boolean()
+    .default(true)
+    .volatile()
+    .description('维护时对高度相似的重复记忆做合并（保留较新的一条）'),
+  dedupeThreshold: z
+    .number()
+    .default(0.96)
+    .step(0.01)
+    .min(0.8)
+    .max(1)
+    .volatile()
+    .description('重复记忆合并的相似度阈值（0.8-1，越高越保守）'),
+  dedupeMaxScan: z
+    .number()
+    .default(100)
+    .step(10)
+    .min(10)
+    .max(1000)
+    .volatile()
+    .description('每次维护最多检查多少条最近记忆以寻找重复'),
+
+  // -------------------- 睡眠整理 / 记忆巩固 --------------------
+  consolidationEnabled: z
+    .boolean()
+    .default(false)
+    .volatile()
+    .description('开启“睡眠整理”：按天压缩原始记忆，并按任务列表在 7/30 天后继续压缩（默认关闭）'),
+  sleepAt: z
+    .string()
+    .default('00:00')
+    .volatile()
+    .description('睡眠开始时间 HH:mm（按所选时区；默认 00:00）'),
+  sleepRetryMinutes: z
+    .number()
+    .default(15)
+    .step(1)
+    .min(1)
+    .max(240)
+    .volatile()
+    .description('用户忙碌时每隔多少分钟重试入睡'),
+  idleMinutes: z
+    .number()
+    .default(60)
+    .step(1)
+    .min(1)
+    .max(1440)
+    .volatile()
+    .description('最近多少分钟内没有人类消息、且没有运行中的会话，才算空闲可以睡'),
+  consolidationSource: z
+    .string()
+    .default('dsh')
+    .volatile()
+    .description('整理模型来源：dsh=直接使用 DSH 已配置的模型；custom=使用插件自定义 provider'),
+  consolidationDshProvider: z
+    .string()
+    .default('')
+    .volatile()
+    .description('DSH 模型来源时使用的 provider；留空使用 DSH 默认模型'),
+  consolidationDshModel: z
+    .string()
+    .default('')
+    .volatile()
+    .description('DSH 模型来源时使用的模型；留空使用 DSH 默认模型'),
+  consolidationLimitItems: z
+    .boolean()
+    .default(false)
+    .volatile()
+    .description('是否限制每级整理输出的条数（默认关闭，由模型决定；开启后使用内部安全上限）'),
+  consolidationProviderId: z
+    .string()
+    .default('')
+    .volatile()
+    .description('整理模型使用的 provider id；留空表示使用当前激活 provider'),
+  consolidationModel: z
+    .string()
+    .default('Qwen/Qwen2.5-7B-Instruct')
+    .volatile()
+    .description('整理（摘要/提炼）使用的对话模型；留空或调用失败时回退纯规则整理'),
+  consolidationInputMaxChars: z
+    .number()
+    .default(12000)
+    .step(100)
+    .min(1000)
+    .max(200000)
+    .volatile()
+    .description('单个批次最多送入模型的字符数（超出会分块映射后再合并）'),
+  consolidationPrompt: z
+    .string()
+    .default('')
+    .volatile()
+    .description('整理提示词；留空使用内置提示词'),
+
+  // -------------------- 实验性功能 --------------------
+  experimentalEventMergeEnabled: z
+    .boolean()
+    .default(false)
+    .volatile()
+    .description('实验性：整理时用嵌入向量在库中检索相似/同事件记忆，只把相关簇交给模型合并（默认关闭）'),
+  experimentalEventMergeThreshold: z
+    .number()
+    .default(0.85)
+    .step(0.01)
+    .min(0.5)
+    .max(1)
+    .volatile()
+    .description('事件合并的相似度阈值'),
+  experimentalEventMergeMaxCandidates: z
+    .number()
+    .default(30)
+    .step(1)
+    .min(1)
+    .max(200)
+    .volatile()
+    .description('事件合并每次最多带入多少条相关记忆作为参考'),
+  experimentalEnhancementEnabled: z
+    .boolean()
+    .default(false)
+    .volatile()
+    .description('实验性：额外保留整理后的 1 级记忆若干天，不再继续整理，仅供事件召回/按需搜索使用'),
+  experimentalEnhancementDays: z
+    .number()
+    .default(7)
+    .step(1)
+    .min(1)
+    .max(365)
+    .volatile()
+    .description('增强记忆的保留天数（到期自动删除）'),
+
+  // -------------------- 其他 --------------------
+  debug: z.boolean().default(false).volatile().description('在 DSH 日志中输出插件调试信息'),
+})
+// ===== src/lib/util/index.js =====
 /**
  * 通用小工具：配置解包、截断、哈希、UUID、data URI、超时。
  */
@@ -604,414 +1011,1352 @@ function renderMemoryLines(items, maxChars, formatter) {
   }
   return lines.join('\n')
 }
-// ===== src/lib/config.js =====
+// ===== src/lib/entry/capture-controller.js =====
 /**
- * dsh-memory 插件配置（v0.2）。
+ * 自动记录：监听 session/event，在每轮结束时把“用户要点 + 助手回答要点”
+ * 以及用户图片的一句话概览写入长期记忆。
  *
- * 所有用户可调项都声明为 `.volatile()`，DSH 的 Settings 服务会把它们投影成
- * 可编辑表单，设置页通过 ctx.configForms 读写，保存后热生效。
- *
- * v0.2 起支持多 provider 档案：providers 是整棵被标记 volatile 的数组，
- * 设置页可以增删改、切换 activeProvider；不再绑定硅基流动。
+ * 只记录 source.kind === 'user' 的真实人类消息；插件自己注入的
+ * long-term-memory 上下文、运行时上下文、工具结果等一律不记录。
  */
 
 
-/** 常用嵌入维度档位（不同模型支持范围不同，这里作为提示）。 */
-const DIMENSIONS = [256, 512, 768, 1024, 1536, 2048, 2560, 3072, 4096]
+/** 从 content blocks 里提取纯文本。 */
+function textFromContent(content) {
+  if (!Array.isArray(content)) return ''
+  const parts = []
+  for (const block of content) {
+    if (!block || typeof block !== 'object') continue
+    if (block.type === 'text' && typeof block.text === 'string') parts.push(block.text)
+  }
+  return cleanText(parts.join('\n'))
+}
 
-/** 图片记忆方式。 */
-const IMAGE_MODES = ['caption', 'placeholder', 'off']
+class CaptureController {
+  /**
+   * @param {import('./service.js').MemoryService} service
+   */
+  constructor(service) {
+    this.service = service
+    this.ctx = service.ctx
+    this.logger = service.logger
+    /** sessionId -> { turn, users: string[], assistant: string, images: ImageAttachmentRef[], cwd } */
+    this.buffers = new Map()
+  }
 
-/** 记忆范围。 */
-const SCOPE_MODES = ['global', 'workspace', 'session']
-
-/** 单个 provider 档案的字段结构（同时用于客户端预设与校验）。 */
-const PROVIDER_FIELDS = [
-  'id',
-  'name',
-  'protocol',
-  'baseUrl',
-  'embedModel',
-  'dimensions',
-  'apiKeyEnv',
-  'sendDimensions',
-  'visionModel',
-  'visionBaseUrl',
-  'visionApiKeyEnv',
-]
-
-const Config = z.object({
-  // -------------------- 多 provider 档案 --------------------
-  providers: z
-    .array(
-      z.object({
-        id: z.string().required().description('唯一标识（英文/数字/下划线），如 siliconflow'),
-        name: z.string().default('').description('显示名称，如 硅基流动'),
-        protocol: z
-          .string()
-          .default('openai')
-          .description('接口协议；目前支持 OpenAI 兼容的 /embeddings 与 /chat/completions'),
-        baseUrl: z.string().required().description('API Base URL，如 https://api.siliconflow.cn/v1'),
-        embedModel: z.string().required().description('嵌入模型名称'),
-        dimensions: z.number().default(1024).step(1).description('向量维度（需与 Qdrant 集合一致）'),
-        apiKeyEnv: z
-          .string()
-          .default('')
-          .description('该 Base URL 对应的 Key 在 DSH 凭据库中的引用名；留空则用 <ID>_API_KEY'),
-        sendDimensions: z
-          .boolean()
-          .default(true)
-          .description('请求嵌入接口时是否发送 dimensions 参数（部分服务不支持时关掉）'),
-        visionModel: z
-          .string()
-          .default('')
-          .description('图片概览使用的视觉对话模型；留空则图片只记占位'),
-        visionBaseUrl: z.string().default('').description('视觉接口 Base URL；留空与 baseUrl 相同'),
-        visionApiKeyEnv: z.string().default('').description('视觉接口 Key 引用名；留空与 apiKeyEnv 相同'),
-      }),
+  /** 注册事件监听（由插件 effect 持有）。 */
+  start() {
+    this.ctx.effect(
+      () =>
+        this.ctx.on('session/event', (session, event) => {
+          try {
+            this.observe(session, event)
+          } catch (error) {
+            this.logger.warn?.(`[dsh-memory] 记录会话事件失败：${error?.message ?? error}`)
+          }
+        }),
+      'dsh-memory: session capture',
     )
-    .default([])
-    .volatile()
-    .description('provider 档案列表（可保存多套云端服务商配置）'),
-  activeProvider: z
-    .string()
-    .default('')
-    .volatile()
-    .description('当前激活的 provider id；留空使用列表中的第一个'),
+    this.ctx.effect(
+      () =>
+        this.ctx.on('session/disposed', (session) => {
+          this.buffers.delete(String(session?.id ?? ''))
+        }),
+      'dsh-memory: capture cleanup',
+    )
+  }
 
-  // -------------------- 向量库 --------------------
-  qdrantUrl: z
-    .string()
-    .default('http://127.0.0.1:6333')
-    .volatile()
-    .description('Qdrant HTTP 地址；插件与 Qdrant 同机时保持 127.0.0.1'),
-  collection: z.string().default('dsh_memory').volatile().description('Qdrant collection 名称'),
-  qdrantApiKeyEnv: z
-    .string()
-    .default('')
-    .volatile()
-    .description('Qdrant API Key 的凭据引用名；留空表示无鉴权（本机回环推荐）'),
+  observe(session, event) {
+    // 睡眠整理期间不记录（避免把 zzzZZ 对话写进长期记忆）
+    if (this.service.sleep?.isSleeping?.()) return
+    const options = this.service.captureOptions()
+    if (!options.autoCapture) return
+    const sessionId = String(session?.id ?? '')
+    if (!sessionId) return
+    const header = session?.header
+    if (!options.includeSubagents && header?.origin === 'subagent') return
 
-  // -------------------- 自动记录 --------------------
-  autoCapture: z
-    .boolean()
-    .default(true)
-    .volatile()
-    .description('每轮对话结束后，自动把“用户要点 + 助手回答要点”存入长期记忆'),
-  captureUserChars: z
-    .number()
-    .default(400)
-    .step(1)
-    .min(0)
-    .volatile()
-    .description('自动记录时用户内容的最大保留字符数'),
-  captureAssistantChars: z
-    .number()
-    .default(400)
-    .step(1)
-    .min(0)
-    .volatile()
-    .description('自动记录时助手回答的最大保留字符数'),
-  captureMinChars: z
-    .number()
-    .default(12)
-    .step(1)
-    .min(0)
-    .volatile()
-    .description('一轮内容少于该字符数时不记录（过滤“好的/谢谢”等噪音）'),
-  includeSubagents: z
-    .boolean()
-    .default(false)
-    .volatile()
-    .description('是否也记录子代理（subagent）会话的要点'),
+    switch (event?.type) {
+      case 'turn/start': {
+        this.buffers.set(sessionId, {
+          turn: Number(event.data?.turn) || 0,
+          users: [],
+          assistant: '',
+          images: [],
+          cwd: String(header?.cwd ?? ''),
+        })
+        break
+      }
+      case 'user/message': {
+        const buffer = this.buffers.get(sessionId)
+        if (!buffer) return
+        const message = event.data
+        if (message?.source?.kind !== 'user') return
+        const text = textFromContent(message?.content)
+        if (text) buffer.users.push(text)
+        if (Array.isArray(message?.content)) {
+          for (const block of message.content) {
+            if (block?.type === 'image' && block.attachment) buffer.images.push(block.attachment)
+          }
+        }
+        break
+      }
+      case 'assistant/message': {
+        const buffer = this.buffers.get(sessionId)
+        if (!buffer) return
+        const text = textFromContent(event.data?.message?.content)
+        if (text) buffer.assistant = text
+        break
+      }
+      case 'turn/end': {
+        const buffer = this.buffers.get(sessionId)
+        this.buffers.delete(sessionId)
+        if (!buffer) return
+        if (buffer.turn !== (Number(event.data?.turn) || 0)) return
+        const reason = event.data?.reason?.kind
+        if (reason !== 'completed') return
+        this.finalize(sessionId, buffer)
+        break
+      }
+      default:
+        break
+    }
+  }
 
-  // -------------------- 自动召回 --------------------
-  autoRecall: z
-    .boolean()
-    .default(true)
-    .volatile()
-    .description('每轮开始时自动检索相关长期记忆并注入上下文'),
-  memoryScope: z
-    .union([z.const('global'), z.const('workspace'), z.const('session')])
-    .default('global')
-    .volatile()
-    .description('记忆范围：global=全局共享；workspace=按工作目录隔离；session=按会话隔离'),
-  recallTopK: z
-    .number()
-    .default(3)
-    .step(1)
-    .min(1)
-    .max(20)
-    .volatile()
-    .description('自动召回的条目数（1-20）'),
-  recallMinScore: z
-    .number()
-    .default(0.42)
-    .step(0.01)
-    .min(0)
-    .max(1)
-    .volatile()
-    .description('自动召回的最低相关度（0-1，越高越严格）'),
-  recallMaxChars: z
-    .number()
-    .default(600)
-    .step(1)
-    .min(100)
-    .max(4000)
-    .volatile()
-    .description('自动召回内容注入上下文时的最大字符数'),
-  recallIncludeCurrentSession: z
-    .boolean()
-    .default(false)
-    .volatile()
-    .description('自动召回时是否包含当前会话自身的记忆'),
-  recallTimeoutMs: z
-    .number()
-    .default(3000)
-    .step(100)
-    .min(500)
-    .max(20000)
-    .volatile()
-    .description('自动召回的超时时间（毫秒）；超时则本轮跳过召回'),
+  /** 一轮结束：入队写入任务（不阻塞 agent 回合）。 */
+  finalize(sessionId, buffer) {
+    const service = this.service
+    const options = service.captureOptions()
+    const userText = truncate(cleanText(buffer.users.join('\n\n')), options.captureUserChars)
+    const assistantText = truncate(cleanText(buffer.assistant), options.captureAssistantChars)
+    const summaryLength = (userText + assistantText).length
+    const imageCount = buffer.images.length
+    if (summaryLength >= options.captureMinChars) {
+      service.queue.push(
+        'capture-turn',
+        () =>
+          service.addTurnMemory({
+            userText,
+            assistantText,
+            sessionId,
+            cwd: buffer.cwd,
+            turn: buffer.turn,
+            imageCount,
+          }),
+        { retries: 1 },
+      )
+    }
+    // 图片：每张单独生成概览并写入（同一轮内按 attachmentId 去重）
+    const seen = new Set()
+    for (const ref of buffer.images) {
+      const attachmentId = String(ref?.attachmentId ?? '')
+      if (!attachmentId || seen.has(attachmentId)) continue
+      seen.add(attachmentId)
+      service.queue.push(
+        `capture-image:${attachmentId}`,
+        () =>
+          service.addImageMemory({
+            ref,
+            sessionId,
+            cwd: buffer.cwd,
+            turn: buffer.turn,
+          }),
+        { retries: 0 },
+      )
+    }
+  }
+}
+// ===== src/lib/app/consolidation-service.js =====
+/**
+ * 睡眠整理引擎（v0.4）。
+ *
+ * 把记忆压缩成“批次”，用任务列表调度多级压缩：
+ *   L1：每天把原始记忆（level=0）压缩成一个 5 位编号的批次（保留多少条由模型按重要性决定）
+ *   L2：L1 批次创建 7 天后，再压缩为 L2 批次（L1 原文删除）
+ *   L3：L2 批次创建 30 天后，再压缩为 L3 批次（最终长期摘要）
+ *
+ * 任务列表持久化在 $DSH_HOME/storages/dsh-memory/consolidation.json，
+ * 批次编号是随机 5 位数；只要求“待处理/处理中”的编号唯一，完成后的编号可回收复用。
+ *
+ * 实验功能（默认关闭）：
+ * - 事件合并：整理时用嵌入向量在全库检索相似记忆，只把相关小簇作为参考交给 LLM，
+ *   并生成 kind='event' 的事件摘要（不会被整库塞给 LLM）。
+ * - 增强记忆：额外保留一份 L1 产物 enhancementDays 天，不参与后续整理，
+ *   仅供事件合并/按需搜索使用，到期自动删除。
+ */
 
-  // -------------------- 时间与时区 --------------------
-  timezone: z
-    .string()
-    .default('')
-    .volatile()
-    .description('时间显示时区：留空=跟随服务器本地；可选常见 IANA 时区，或 custom 自定义'),
-  timezoneCustom: z
-    .string()
-    .default('')
-    .volatile()
-    .description('自定义 IANA 时区（当 timezone=custom 时生效），如 America/New_York'),
-  injectCurrentTime: z
-    .boolean()
-    .default(true)
-    .volatile()
-    .description('自动召回时在上下文里附带“当前时间”（按所选时区），便于模型判断记忆的新旧'),
-  relativeTime: z
-    .boolean()
-    .default(true)
-    .volatile()
-    .description('召回/列表中显示相对时间（如“3 天前”）'),
 
-  // -------------------- 图片 --------------------
-  captionSource: z
-    .string()
-    .default('dsh')
-    .volatile()
-    .description('图片概览模型来源：dsh=直接使用 DSH 已配置的模型；custom=使用插件自定义 provider'),
-  captionDshProvider: z
-    .string()
-    .default('')
-    .volatile()
-    .description('DSH 图片概览使用的 provider；留空使用 DSH 默认模型'),
-  captionDshModel: z
-    .string()
-    .default('')
-    .volatile()
-    .description('DSH 图片概览使用的模型；留空使用 DSH 默认模型（需支持图片输入）'),
-  captionProviderId: z
-    .string()
-    .default('')
-    .volatile()
-    .description('图片概览使用的 provider id；留空跟随当前激活 provider'),
-  captionModel: z
-    .string()
-    .default('')
-    .volatile()
-    .description('图片概览使用的视觉模型；留空使用该 provider 的 visionModel 配置'),
-  imageMode: z
-    .union([z.const('caption'), z.const('placeholder'), z.const('off')])
-    .default('caption')
-    .volatile()
-    .description('图片记忆方式：caption=生成一句话概览后只存描述；placeholder=只记“发过图”；off=忽略图片'),
-  captionPrompt: z
-    .string()
-    .default('')
-    .volatile()
-    .description('图片概览的提示词；留空使用内置默认提示词'),
-  captionMaxTokens: z
-    .number()
-    .default(96)
-    .step(1)
-    .min(16)
-    .max(1024)
-    .volatile()
-    .description('图片概览生成的最大 token 数'),
 
-  // -------------------- 工具 --------------------
-  toolsEnabled: z
-    .boolean()
-    .default(true)
-    .volatile()
-    .description('是否允许模型使用 memory_search / memory_save / memory_forget 工具'),
-  toolSearchLimit: z
-    .number()
-    .default(5)
-    .step(1)
-    .min(1)
-    .max(20)
-    .volatile()
-    .description('memory_search 的默认返回条数（1-20）'),
 
-  // -------------------- 定期维护 / 保留策略 --------------------
-  retentionDays: z
-    .number()
-    .default(0)
-    .step(1)
-    .min(0)
-    .volatile()
-    .description('记忆保留天数（0=永久保留）；超期记忆在定期维护时删除'),
-  maxMemories: z
-    .number()
-    .default(0)
-    .step(1)
-    .min(0)
-    .volatile()
-    .description('记忆条数上限（0=不限）；超限时定期维护淘汰最旧的记录'),
-  maintenanceIntervalHours: z
-    .number()
-    .default(6)
-    .step(1)
-    .min(1)
-    .max(168)
-    .volatile()
-    .description('自动维护的间隔小时数'),
-  maintenanceDedupe: z
-    .boolean()
-    .default(true)
-    .volatile()
-    .description('维护时对高度相似的重复记忆做合并（保留较新的一条）'),
-  dedupeThreshold: z
-    .number()
-    .default(0.96)
-    .step(0.01)
-    .min(0.8)
-    .max(1)
-    .volatile()
-    .description('重复记忆合并的相似度阈值（0.8-1，越高越保守）'),
-  dedupeMaxScan: z
-    .number()
-    .default(100)
-    .step(10)
-    .min(10)
-    .max(1000)
-    .volatile()
-    .description('每次维护最多检查多少条最近记忆以寻找重复'),
+/** 整理状态文件版本。 */
+const STATE_VERSION = 1
 
-  // -------------------- 睡眠整理 / 记忆巩固 --------------------
-  consolidationEnabled: z
-    .boolean()
-    .default(false)
-    .volatile()
-    .description('开启“睡眠整理”：按天压缩原始记忆，并按任务列表在 7/30 天后继续压缩（默认关闭）'),
-  sleepAt: z
-    .string()
-    .default('00:00')
-    .volatile()
-    .description('睡眠开始时间 HH:mm（按所选时区；默认 00:00）'),
-  sleepRetryMinutes: z
-    .number()
-    .default(15)
-    .step(1)
-    .min(1)
-    .max(240)
-    .volatile()
-    .description('用户忙碌时每隔多少分钟重试入睡'),
-  idleMinutes: z
-    .number()
-    .default(60)
-    .step(1)
-    .min(1)
-    .max(1440)
-    .volatile()
-    .description('最近多少分钟内没有人类消息、且没有运行中的会话，才算空闲可以睡'),
-  consolidationSource: z
-    .string()
-    .default('dsh')
-    .volatile()
-    .description('整理模型来源：dsh=直接使用 DSH 已配置的模型；custom=使用插件自定义 provider'),
-  consolidationDshProvider: z
-    .string()
-    .default('')
-    .volatile()
-    .description('DSH 模型来源时使用的 provider；留空使用 DSH 默认模型'),
-  consolidationDshModel: z
-    .string()
-    .default('')
-    .volatile()
-    .description('DSH 模型来源时使用的模型；留空使用 DSH 默认模型'),
-  consolidationLimitItems: z
-    .boolean()
-    .default(false)
-    .volatile()
-    .description('是否限制每级整理输出的条数（默认关闭，由模型决定；开启后使用内部安全上限）'),
-  consolidationProviderId: z
-    .string()
-    .default('')
-    .volatile()
-    .description('整理模型使用的 provider id；留空表示使用当前激活 provider'),
-  consolidationModel: z
-    .string()
-    .default('Qwen/Qwen2.5-7B-Instruct')
-    .volatile()
-    .description('整理（摘要/提炼）使用的对话模型；留空或调用失败时回退纯规则整理'),
-  consolidationInputMaxChars: z
-    .number()
-    .default(12000)
-    .step(100)
-    .min(1000)
-    .max(200000)
-    .volatile()
-    .description('单个批次最多送入模型的字符数（超出会分块映射后再合并）'),
-  consolidationPrompt: z
-    .string()
-    .default('')
-    .volatile()
-    .description('整理提示词；留空使用内置提示词'),
+/** 内置整理提示词。 */
+const DEFAULT_PROMPT = [
+  '你是长期记忆整理助手，模拟人类睡眠中的记忆巩固。',
+  '输入：某个时间单元内的若干条记忆（可能来自对话、事实、偏好、图片概览）。',
+  '任务：合并、去重、压缩，提炼出最重要的信息；删除寒暄与重复，不编造不存在的内容。',
+  '输出必须是严格 JSON（不要输出代码围栏之外的解释）：',
+  '{"summary":"一段简短的整体摘要","facts":[{"text":"一条自包含的事实","kind":"fact|preference|project|note","tags":["可选标签"]}],"event":{"summary":"可选：如果这些记忆构成同一事件，写一句事件摘要","tags":["可选"]}}',
+  '要求：',
+  '- facts 条数由你根据信息的重要性和密度自行决定（不要为了凑数而保留琐碎内容，也不要丢失关键事实）；每条自包含，不要用“他/它/这个”等指代。',
+  '- 保留关键事实、偏好、决定、时间、人名、项目名；丢弃噪音。',
+  '- summary 与 facts 用中文（除非原文主要是其他语言）。',
+].join('\n')
 
-  // -------------------- 实验性功能 --------------------
-  experimentalEventMergeEnabled: z
-    .boolean()
-    .default(false)
-    .volatile()
-    .description('实验性：整理时用嵌入向量在库中检索相似/同事件记忆，只把相关簇交给模型合并（默认关闭）'),
-  experimentalEventMergeThreshold: z
-    .number()
-    .default(0.85)
-    .step(0.01)
-    .min(0.5)
-    .max(1)
-    .volatile()
-    .description('事件合并的相似度阈值'),
-  experimentalEventMergeMaxCandidates: z
-    .number()
-    .default(30)
-    .step(1)
-    .min(1)
-    .max(200)
-    .volatile()
-    .description('事件合并每次最多带入多少条相关记忆作为参考'),
-  experimentalEnhancementEnabled: z
-    .boolean()
-    .default(false)
-    .volatile()
-    .description('实验性：额外保留整理后的 1 级记忆若干天，不再继续整理，仅供事件召回/按需搜索使用'),
-  experimentalEnhancementDays: z
-    .number()
-    .default(7)
-    .step(1)
-    .min(1)
-    .max(365)
-    .volatile()
-    .description('增强记忆的保留天数（到期自动删除）'),
+/** 一个批次的简易视图（给状态/历史用）。 */
+function batchView(batch) {
+  return {
+    id: batch.id,
+    level: batch.level,
+    status: batch.status,
+    createdAt: batch.createdAt,
+    dueAt: batch.dueAt,
+    sourceCount: batch.inputCount ?? 0,
+    outputCount: batch.outputCount ?? 0,
+    dayKey: batch.dayKey ?? '',
+    sourceBatchIds: batch.sourceBatchIds ?? [],
+    error: batch.error ?? null,
+  }
+}
 
-  // -------------------- 其他 --------------------
-  debug: z.boolean().default(false).volatile().description('在 DSH 日志中输出插件调试信息'),
-})
-// ===== src/lib/api-client.js =====
+class ConsolidationEngine {
+  /**
+   * @param {import('./service.js').MemoryService} service
+   */
+  constructor(service) {
+    this.service = service
+    this.ctx = service.ctx
+    this.logger = service.logger
+    this.statePath = join(dshHome(), 'storages', 'dsh-memory', 'consolidation.json')
+    this.state = { version: STATE_VERSION, batches: [], history: [], lastRun: null }
+    this.loaded = false
+    this.running = null
+  }
+
+  /** 配置级别定义（level1 为每日原始记忆压缩，level2/3 为后续批次压缩）。 */
+  stages() {
+    // 默认不限制输出条数，由整理模型按内容重要性自行决定；
+    // 只有在设置页显式开启「限制每级整理条数」时才套用内部安全上限。
+    // 7 天 / 30 天的触发间隔是固定的整理节奏，未来要扩展更多级只需在数组里追加。
+    const limitEnabled = this.service.cfg().consolidationLimitItems === true
+    return [
+      { level: 1, maxItems: limitEnabled ? 40 : null, afterDays: 0 },
+      { level: 2, maxItems: limitEnabled ? 20 : null, afterDays: 7 },
+      { level: 3, maxItems: limitEnabled ? 10 : null, afterDays: 30 },
+    ]
+  }
+
+  stage(level) {
+    return this.stages().find((item) => item.level === level) ?? null
+  }
+
+  nextStage(level) {
+    return this.stages().find((item) => item.level === level + 1) ?? null
+  }
+
+  // ------------------------------------------------------------------
+  // 任务列表持久化
+  // ------------------------------------------------------------------
+
+  async load() {
+    if (this.loaded) return this.state
+    const data = readJsonFile(this.statePath, null)
+    if (data && typeof data === 'object' && Array.isArray(data.batches)) {
+      this.state = {
+        version: STATE_VERSION,
+        batches: data.batches,
+        history: Array.isArray(data.history) ? data.history : [],
+        lastRun: data.lastRun ?? null,
+      }
+    }
+    this.loaded = true
+    return this.state
+  }
+
+  async save() {
+    // 只保留最近 600 个批次与 40 条历史，避免状态文件无限膨胀
+    if (this.state.batches.length > 600) {
+      const finished = this.state.batches.filter((b) => b.status !== 'pending' && b.status !== 'processing')
+      const active = this.state.batches.filter((b) => b.status === 'pending' || b.status === 'processing')
+      const keepFinished = finished.slice(-Math.max(0, 600 - active.length))
+      this.state.batches = [...keepFinished, ...active].sort((a, b) => a.createdAt - b.createdAt)
+    }
+    if (this.state.history.length > 40) this.state.history = this.state.history.slice(-40)
+    writeJsonFileAtomic(this.statePath, this.state)
+  }
+
+  /** 待处理/处理中批次占用的编号集合。 */
+  pendingIds() {
+    return new Set(
+      this.state.batches
+        .filter((batch) => batch.status === 'pending' || batch.status === 'processing')
+        .map((batch) => String(batch.id)),
+    )
+  }
+
+  batchById(id) {
+    return this.state.batches.find((batch) => String(batch.id) === String(id)) ?? null
+  }
+
+  /** 状态/历史摘要。 */
+  summary() {
+    const batches = this.state.batches ?? []
+    const pending = batches.filter((batch) => batch.status === 'pending' || batch.status === 'processing')
+    const byLevel = {}
+    for (const batch of pending) byLevel[batch.level] = (byLevel[batch.level] ?? 0) + 1
+    const nextDue = pending
+      .filter((batch) => Number.isFinite(batch.dueAt))
+      .sort((a, b) => a.dueAt - b.dueAt)[0]
+    return {
+      enabled: this.service.cfg().consolidationEnabled === true,
+      pendingTotal: pending.length,
+      pendingByLevel: byLevel,
+      nextDueAt: nextDue?.dueAt ?? null,
+      nextDueTime: nextDue?.dueAt ? this.service.formatTs(nextDue.dueAt) : '',
+      batches: batches.slice(-15).map(batchView),
+      history: (this.state.history ?? []).slice(-6).map((entry) => ({
+        at: entry.at,
+        time: entry.at ? this.service.formatTs(entry.at) : '',
+        manual: entry.manual === true,
+        durationMs: entry.durationMs ?? 0,
+        levels: entry.levels ?? {},
+        errors: entry.errors ?? [],
+      })),
+      lastRun: this.state.lastRun,
+      statePath: this.statePath,
+    }
+  }
+
+  // ------------------------------------------------------------------
+  // 运行整理
+  // ------------------------------------------------------------------
+
+  /** 是否正在整理。 */
+  get busy() {
+    return this.running !== null
+  }
+
+  /**
+   * 执行一轮整理（睡醒前调用）。同一时间只允许一个 run。
+   * @param {{manual?:boolean, reason?:string}} options
+   */
+  async run(options = {}) {
+    await this.load()
+    if (this.running) return this.running
+    this.running = this.#runInner({ manual: options.manual === true, reason: options.reason ?? 'sleep' })
+      .finally(() => {
+        this.running = null
+      })
+    return this.running
+  }
+
+  async #runInner({ manual, reason }) {
+    const startedAt = Date.now()
+    const cfg = this.service.cfg()
+    const tz = this.service.timeOptions().timeZone
+    const today = dayKey(Date.now(), tz)
+    const stages = this.stages()
+    const result = {
+      ok: true,
+      manual,
+      reason,
+      startedAt,
+      finishedAt: 0,
+      durationMs: 0,
+      levels: {},
+      batches: [],
+      deleted: 0,
+      errors: [],
+      maintenance: null,
+    }
+
+    try {
+      await this.service.ensureReady()
+
+      // ---------- L1：把“今天之前”的原始记忆按天压缩 ----------
+      const raw = await this.service.collectMemories({
+        filter: { must: [{ key: 'level', match: { value: 0 } }] },
+        withVector: cfg.experimentalEventMergeEnabled === true,
+        maxItems: 5000,
+        orderBy: { key: 'ts', direction: 'asc' },
+      })
+      const byDay = new Map()
+      for (const item of raw) {
+        const key = dayKey(Number(item.payload?.ts) || 0, tz)
+        if (key >= today) continue
+        if (!byDay.has(key)) byDay.set(key, [])
+        byDay.get(key).push(item)
+      }
+      const dayKeys = [...byDay.keys()].sort()
+      for (const key of dayKeys) {
+        const items = byDay.get(key)
+        const stage1 = stages.find((item) => item.level === 1)
+        const outcome = await this.#compress({
+          level: 1,
+          stage: stage1,
+          sources: items,
+          dayKey: key,
+          sourceBatchIds: [],
+          meta: { dayRange: dayBoundsFromKey(key, tz) },
+        })
+        result.batches.push(outcome.view)
+        if (outcome.error) result.errors.push(outcome.error)
+        this.#mergeLevelStats(result, 1, outcome)
+      }
+
+      // ---------- L2/L3：处理到期批次 ----------
+      for (const stage of stages.filter((item) => item.level >= 2)) {
+        const due = this.state.batches
+          .filter(
+            (batch) =>
+              batch.level === stage.level - 1 &&
+              batch.status === 'pending' &&
+              Number(batch.dueAt) > 0 &&
+              Number(batch.dueAt) <= Date.now(),
+          )
+          .sort((a, b) => a.dueAt - b.dueAt)
+        for (const sourceBatch of due) {
+          const sources = await this.service.collectBatchMemories(sourceBatch.id, {
+            withVector: cfg.experimentalEventMergeEnabled === true,
+            maxItems: 5000,
+          })
+          if (sources.length === 0) {
+            sourceBatch.status = 'done'
+            sourceBatch.updatedAt = Date.now()
+            sourceBatch.error = 'empty-batch'
+            await this.save()
+            continue
+          }
+          const outcome = await this.#compress({
+            level: stage.level,
+            stage,
+            sources,
+            dayKey: sourceBatch.dayKey ?? '',
+            sourceBatchIds: [sourceBatch.id],
+            meta: { dayRange: sourceBatch.dayRange ?? null },
+          })
+          result.batches.push(outcome.view)
+          if (outcome.error) result.errors.push(outcome.error)
+          this.#mergeLevelStats(result, stage.level, outcome)
+          if (!outcome.error) {
+            sourceBatch.status = 'done'
+            sourceBatch.updatedAt = Date.now()
+            sourceBatch.outputBatchId = outcome.view.id
+          } else {
+            sourceBatch.attempts = (sourceBatch.attempts ?? 0) + 1
+            sourceBatch.error = outcome.error
+          }
+          await this.save()
+        }
+      }
+
+      // ---------- 增强记忆到期清理 ----------
+      try {
+        const expired = await this.service.listExpiredEnhanced(Date.now())
+        if (expired.length > 0) {
+          await this.service.deleteMemoryIds(expired)
+          result.deleted += expired.length
+        }
+      } catch (error) {
+        result.errors.push(`enhanced-expiry: ${errorText(error)}`)
+      }
+
+      // ---------- 整理后自动维护（去重/过期/索引） ----------
+      try {
+        result.maintenance = await this.service.maintenance({ force: false })
+      } catch (error) {
+        result.errors.push(`maintenance: ${errorText(error)}`)
+      }
+    } catch (error) {
+      result.ok = false
+      result.errors.push(errorText(error))
+    }
+
+    result.finishedAt = Date.now()
+    result.durationMs = result.finishedAt - startedAt
+    result.ok = result.ok && result.errors.length === 0
+    this.state.lastRun = {
+      at: result.finishedAt,
+      manual,
+      durationMs: result.durationMs,
+      ok: result.ok,
+      levels: result.levels,
+      deleted: result.deleted,
+      errors: result.errors,
+    }
+    this.state.history.push({
+      at: result.startedAt,
+      manual,
+      durationMs: result.durationMs,
+      levels: result.levels,
+      currentLevels: this.summaryLevels(),
+      errors: result.errors,
+    })
+    await this.save()
+    const levelText = Object.entries(result.levels)
+      .map(([level, stat]) => `L${level}:${stat.batches}批/${stat.input}→${stat.output}`)
+      .join(' ')
+    this.service.debugLog(`睡眠整理完成 ${formatDuration(result.durationMs)} ${levelText} 删除原文 ${result.deleted} 条`)
+    return result
+  }
+
+  summaryLevels() {
+    const counts = {}
+    for (const batch of this.state.batches) counts[batch.level] = (counts[batch.level] ?? 0) + 1
+    return counts
+  }
+
+  #mergeLevelStats(result, level, outcome) {
+    if (!result.levels[level]) result.levels[level] = { batches: 0, input: 0, output: 0 }
+    result.levels[level].batches += 1
+    result.levels[level].input += outcome.inputCount ?? 0
+    result.levels[level].output += outcome.outputCount ?? 0
+    result.deleted += outcome.deleted ?? 0
+  }
+
+  /**
+   * 压缩一个批次：调 LLM（或规则回退）生成摘要+事实，写入新记忆，删除原文，登记任务。
+   */
+  async #compress({ level, stage, sources, dayKey: key, sourceBatchIds, meta }) {
+    const cfg = this.service.cfg()
+    const nextStage = this.nextStage(level)
+    const batchId = nextBatchId(this.pendingIds())
+    const cleanSources = (sources ?? []).filter((item) => item.payload?.text)
+    const inputCount = cleanSources.length
+    const emptyView = {
+      id: batchId,
+      level,
+      status: nextStage ? 'pending' : 'final',
+      createdAt: Date.now(),
+      dueAt: nextStage ? Date.now() + nextStage.afterDays * 86400000 : null,
+      sourceCount: inputCount,
+      outputCount: 0,
+      sourceBatchIds,
+      dayKey: key || '',
+      error: 'no-source',
+    }
+    if (inputCount === 0) return { view: emptyView, inputCount: 0, outputCount: 0, deleted: 0, error: null }
+
+    try {
+      // ---------- 实验：事件合并（只取相似记忆作为参考） ----------
+      let related = []
+      if (cfg.experimentalEventMergeEnabled === true) {
+        related = await this.#findRelated(cleanSources)
+      }
+
+      // ---------- LLM / 规则压缩 ----------
+      const rendered = this.#renderSources(cleanSources, level)
+      const chunks = chunkByChars(cleanSources, Math.max(1000, Number(cfg.consolidationInputMaxChars) || 12000))
+      let combined = null
+      let llmCalls = 0
+      let latencyMs = 0
+      try {
+        const partials = []
+        for (const chunk of chunks) {
+          const partial = await this.#callLLM({
+            level,
+            stage,
+            items: chunk,
+            rendered: this.#renderSources(chunk, level),
+            related,
+            isFirst: partials.length === 0,
+          })
+          partials.push(partial)
+          llmCalls += 1
+          latencyMs += partial.latencyMs ?? 0
+        }
+        combined = partials.length === 1 ? partials[0].data : await this.#mergePartials(partials, stage)
+        if (partials.length > 1) {
+          llmCalls += 1
+          latencyMs += combined?.latencyMs ?? 0
+        }
+      } catch (error) {
+        // 回退：纯规则压缩（保证睡眠不中断；内容可能粗糙）
+        this.service.debugLog(`整理 LLM 不可用，回退规则压缩：${errorText(error)}`)
+        combined = this.#ruleCompress(chunks, stage)
+        combined = combined.data
+        combined.fallback = true
+        combined.fallbackReason = errorText(error)
+      }
+
+      const summary = String(combined?.summary ?? '').trim()
+      const facts = Array.isArray(combined?.facts) ? combined.facts : []
+      const event = combined?.event && typeof combined.event === 'object' ? combined.event : null
+
+      // 默认保留条数由模型决定；只有开启「限制每级整理条数」时才截断。
+      const limitEnabled = Number.isFinite(stage.maxItems)
+      const maxItems = limitEnabled ? Math.max(1, stage.maxItems) : null
+      const factLimit = limitEnabled ? Math.max(0, maxItems - (summary ? 1 : 0)) : Infinity
+      const selectedFacts = facts
+        .filter((fact) => fact && typeof fact.text === 'string' && fact.text.trim())
+        .slice(0, factLimit)
+        .map((fact) => ({
+          text: String(fact.text).trim(),
+          kind: ['fact', 'preference', 'project', 'note', 'event'].includes(fact.kind) ? fact.kind : 'fact',
+          tags: Array.isArray(fact.tags) ? fact.tags.map(String).slice(0, 8) : [],
+        }))
+
+      const entries = []
+      if (summary) entries.push({ text: summary, kind: 'summary', tags: ['summary'] })
+      for (const fact of selectedFacts) entries.push(fact)
+      if (entries.length === 0) entries.push({ text: rendered.slice(0, Math.max(80, Math.min(400, rendered.length))), kind: 'note', tags: ['fallback'] })
+      const eventText = event?.summary && String(event.summary).trim()
+        ? String(event.summary).trim()
+        : related.length > 0
+          ? `相关事件：${summary || related[0].text}`.slice(0, 500)
+          : ''
+      if (eventText) {
+        entries.push({
+          text: eventText,
+          kind: 'event',
+          tags: Array.isArray(event?.tags) ? event.tags.map(String).slice(0, 8) : ['event'],
+        })
+      }
+
+      // 压缩比统计：输入条数 → 输出条数（source 删除，目标比例仅作为提示）
+      const now = Date.now()
+      const sourceIds = cleanSources.map((item) => item.id)
+      const baseMeta = {
+        level,
+        batch: batchId,
+        batchCreatedAt: now,
+        sourceCount: inputCount,
+        sourceBatchIds,
+        dayRange: meta?.dayRange ?? null,
+        consolidatedAt: now,
+        relatedCount: related.length,
+      }
+
+      const written = []
+      try {
+        for (const [index, entry] of entries.entries()) {
+          const saved = await this.service.addMemory({
+            kind: entry.kind === 'summary' ? 'summary' : entry.kind,
+            text: entry.text,
+            meta: {
+              ...baseMeta,
+              tags: entry.tags,
+              // 批次内唯一：避免整理产物的内容哈希与原文（或彼此）相同，
+              // 导致“先写入、再删除原文”把新产物一起删掉。
+              idSeed: `sleep-${batchId}-${index}`,
+            },
+          })
+          written.push(saved)
+        }
+        // 实验：增强记忆副本（不进入整理链，仅事件/按需召回使用）
+        if (cfg.experimentalEnhancementEnabled === true && level === 1) {
+          const days = Math.max(1, Number(cfg.experimentalEnhancementDays) || 7)
+          for (const saved of written) {
+            await this.service.addMemory({
+              kind: saved.kind ?? 'summary',
+              text: `（增强记忆）${saved.text}`,
+              meta: {
+                level: 1,
+                enhanced: true,
+                expiresAt: now + days * 86400000,
+                sourceCount: inputCount,
+                sourceBatchIds,
+                consolidatedAt: now,
+                idSeed: `enhanced-${batchId}`,
+              },
+            })
+          }
+        }
+      } catch (error) {
+        return {
+          view: { ...emptyView, error: `write-failed: ${errorText(error)}` },
+          inputCount,
+          outputCount: 0,
+          deleted: 0,
+          error: `write-failed: ${errorText(error)}`,
+        }
+      }
+
+      // 写入成功后删除原文
+      let deleted = 0
+      try {
+        deleted = await this.service.deleteMemoryIds(sourceIds)
+      } catch (error) {
+        return {
+          view: { ...emptyView, error: `delete-failed: ${errorText(error)}` },
+          inputCount,
+          outputCount: written.length,
+          deleted: 0,
+          error: `delete-failed: ${errorText(error)}`,
+        }
+      }
+
+      const batchRow = {
+        id: batchId,
+        level,
+        status: nextStage ? 'pending' : 'final',
+        createdAt: now,
+        updatedAt: now,
+        dueAt: nextStage ? now + nextStage.afterDays * 86400000 : null,
+        dayKey: key || '',
+        dayRange: meta?.dayRange ?? null,
+        sourceBatchIds,
+        sourceIdsCount: sourceIds.length,
+        inputCount,
+        outputCount: written.length,
+        maxItems,
+        llmCalls,
+        latencyMs,
+        fallback: combined?.fallback === true,
+        fallbackReason: combined?.fallbackReason ?? null,
+        error: null,
+      }
+      this.state.batches.push(batchRow)
+      await this.save()
+      return {
+        view: batchView(batchRow),
+        inputCount,
+        outputCount: written.length,
+        deleted,
+        error: null,
+      }
+    } catch (error) {
+      return {
+        view: { ...emptyView, error: errorText(error) },
+        inputCount,
+        outputCount: 0,
+        deleted: 0,
+        error: errorText(error),
+      }
+    }
+  }
+
+  /** 渲染记忆条目给模型。 */
+  #renderSources(items, level) {
+    return items
+      .map((item) => {
+        const payload = item.payload ?? {}
+        const time = this.service.formatTs(Number(payload.ts) || 0)
+        const kind = payload.kind ?? 'note'
+        const batch = payload.batch ? ` #${payload.batch}` : ''
+        return `- [${time}·${kind}${batch}] ${String(payload.text ?? '').trim()}`
+      })
+      .join('\n')
+  }
+
+  /** 在全库检索相似记忆（事件合并参考），绝不加载全库到内存。 */
+  async #findRelated(sources) {
+    const cfg = this.service.cfg()
+    const threshold = Math.min(1, Math.max(0.5, Number(cfg.experimentalEventMergeThreshold) || 0.85))
+    const maxCandidates = Math.max(1, Math.min(200, Number(cfg.experimentalEventMergeMaxCandidates) || 30))
+    const ownIds = new Set(sources.map((item) => item.id))
+    const related = new Map()
+    // 只探测最多 20 条源记忆，控制查询次数
+    for (const source of sources.slice(0, 20)) {
+      const vector = source.vector
+      if (!Array.isArray(vector)) continue
+      try {
+        const hits = await this.service.searchSimilar(vector, {
+          limit: 5,
+          threshold,
+          excludeIds: [...ownIds, ...related.keys()],
+        })
+        for (const hit of hits) {
+          if (!related.has(hit.id)) related.set(hit.id, hit)
+          if (related.size >= maxCandidates) break
+        }
+      } catch {
+        /* 忽略单条检索失败 */
+      }
+      if (related.size >= maxCandidates) break
+    }
+    return [...related.values()].slice(0, maxCandidates)
+  }
+
+  /** 调一次整理 LLM（DSH 模型或自定义 provider，由 service 路由）。 */
+  async #callLLM({ level, stage, items, rendered, related, isFirst }) {
+    const cfg = this.service.cfg()
+    const limitEnabled = Number.isFinite(stage?.maxItems)
+    const maxFacts = limitEnabled ? Math.max(1, stage.maxItems - 1) : null
+    const relatedText = isFirst && related.length > 0
+      ? `\n\n【可能相关的其他事件记忆（仅参考，不要删除/编造，可合并同一事件的信息）】\n${renderMemoryLines(related, 6000, (item) => `- [${this.service.formatTs(item.ts)}·${item.kind}${item.batch ? ' #' + item.batch : ''}] ${item.text.slice(0, 500)}`)}`
+      : ''
+    const customPrompt = String(cfg.consolidationPrompt ?? '').trim()
+    const system = customPrompt || DEFAULT_PROMPT
+    const countRule = limitEnabled
+      ? `请输出 JSON：summary、facts（条数由你按重要性决定，最多 ${maxFacts} 条）、可选 event。`
+      : '请输出 JSON：summary、facts（条数由你按重要性自行决定）、可选 event。'
+    const user = [
+      `这是第 ${level} 级记忆整理。本批共 ${items.length} 条记忆。`,
+      countRule,
+      '精简是默认目标：优先保留关键事实、偏好、决定、时间和人名；重复、寒暄和流水账直接丢弃。',
+      '',
+      '【本批记忆】',
+      rendered,
+      relatedText,
+    ].join('\n')
+    const startedAt = Date.now()
+    const response = await this.service.consolidationChat({
+      system,
+      messages: [{ role: 'user', content: user }],
+      maxTokens: level >= 3 ? 4096 : level === 2 ? 3072 : 2048,
+      temperature: 0.2,
+    })
+    const parsed = extractJson(response.text)
+    if (!parsed || typeof parsed !== 'object') {
+      throw new Error(`整理模型未返回可解析 JSON：${String(response.text).slice(0, 200)}`)
+    }
+    return {
+      data: {
+        summary: typeof parsed.summary === 'string' ? parsed.summary : '',
+        facts: Array.isArray(parsed.facts) ? parsed.facts : [],
+        event: parsed.event && typeof parsed.event === 'object' ? parsed.event : null,
+      },
+      latencyMs: response.latencyMs ?? Date.now() - startedAt,
+      raw: response.text,
+      usage: response.usage ?? null,
+      modelSource: response.source ?? '',
+      model: response.model ?? '',
+    }
+  }
+
+  /** 多块结果合并。 */
+  async #mergePartials(partials, stage) {
+    const summaries = partials.map((partial, index) => `## 分块 ${index + 1}\n${JSON.stringify(partial.data)}`).join('\n\n')
+    const startedAt = Date.now()
+    try {
+      const limitEnabled = Number.isFinite(stage?.maxItems)
+      const limitRule = limitEnabled ? `facts 上限 ${Math.max(1, stage.maxItems - 1)}。` : 'facts 条数由你按重要性决定。'
+      const response = await this.service.consolidationChat({
+        system:
+          '你在合并多个记忆整理分块的结果。请合并去重，输出同样格式的严格 JSON：{"summary":"...","facts":[...],"event":{...}}。',
+        messages: [{ role: 'user', content: `${limitRule}\n\n${summaries}` }],
+        maxTokens: 3072,
+        temperature: 0.2,
+      })
+      const parsed = extractJson(response.text)
+      if (!parsed || typeof parsed !== 'object') throw new Error('merge-no-json')
+      return {
+        data: {
+          summary: typeof parsed.summary === 'string' ? parsed.summary : '',
+          facts: Array.isArray(parsed.facts) ? parsed.facts : [],
+          event: parsed.event && typeof parsed.event === 'object' ? parsed.event : null,
+        },
+        latencyMs: response.latencyMs ?? Date.now() - startedAt,
+      }
+    } catch {
+      // 合并失败：简单拼接（去重）
+      const facts = []
+      const seen = new Set()
+      for (const partial of partials) {
+        for (const fact of partial.data.facts ?? []) {
+          const text = String(fact?.text ?? '').trim()
+          if (!text || seen.has(text)) continue
+          seen.add(text)
+          facts.push(fact)
+        }
+      }
+      return {
+        data: {
+          summary: partials.map((partial) => partial.data.summary).filter(Boolean).join('；'),
+          facts,
+          event: null,
+        },
+        latencyMs: 0,
+      }
+    }
+  }
+
+  /** 纯规则压缩（LLM 不可用时的回退）。 */
+  #ruleCompress(chunks, stage) {
+    const maxItems = Number.isFinite(stage?.maxItems) ? Math.max(1, stage.maxItems) : Infinity
+    const facts = []
+    const seen = new Set()
+    for (const chunk of chunks) {
+      for (const item of chunk) {
+        const text = String(item.payload?.text ?? '').trim()
+        if (!text) continue
+        const normalized = text.slice(0, 80)
+        if (seen.has(normalized)) continue
+        seen.add(normalized)
+        facts.push({
+          text,
+          kind: item.payload?.kind === 'summary' || item.payload?.kind === 'event' ? 'note' : (item.payload?.kind ?? 'note'),
+        })
+        if (facts.length >= Math.max(1, maxItems - 1)) break
+      }
+      if (facts.length >= Math.max(1, maxItems - 1)) break
+    }
+    const summary = facts
+      .slice(0, 3)
+      .map((fact) => fact.text.slice(0, 80))
+      .join('；')
+    return {
+      data: {
+        summary: summary ? `规则整理：${summary}` : '',
+        facts,
+        event: null,
+        fallback: true,
+        fallbackReason: 'no-llm',
+      },
+      latencyMs: 0,
+    }
+  }
+}
+// ===== src/lib/entry/http/routes.js =====
+/**
+ * 设置页使用的 Host HTTP 接口（与 DSH Web 同源，仅本机可访问）：
+ *
+ *   GET  /__dsh_memory__/status              运行状态
+ *   GET  /__dsh_memory__/memories?q&limit&offset&kind   记忆列表/检索
+ *   GET  /__dsh_memory__/export              导出全部记忆 JSON
+ *   POST /__dsh_memory__/test                测试激活 provider（可带 providerId）
+ *   POST /__dsh_memory__/memories            手动新增记忆
+ *   POST /__dsh_memory__/memories/delete     删除记忆 {ids:[...]}
+ *   POST /__dsh_memory__/recreate            重建集合（需要 confirm:"DELETE"）
+ *   POST /__dsh_memory__/maintenance         立即执行一次维护
+ *   GET  /__dsh_memory__/sleep               睡眠状态 + 整理任务列表摘要
+ *   POST /__dsh_memory__/sleep/run           手动触发一次睡眠整理
+ *   GET  /__dsh_memory__/consolidation       整理任务列表与历史
+ *   GET  /__dsh_memory__/models?providerId=  拉取某个 provider 的模型列表
+ *
+ * POST 请求要求自定义头 x-dsh-memory: 1，避免跨站请求伪造（跨域预检会拦下）。
+ */
+
+
+/** 读取 JSON 请求体（限制大小）。 */
+function readJsonBody(req, limit = 64 * 1024) {
+  return new Promise((resolve, reject) => {
+    let size = 0
+    const chunks = []
+    req.on('data', (chunk) => {
+      size += chunk.length
+      if (size > limit) {
+        reject(new Error('请求体过大'))
+        req.destroy()
+        return
+      }
+      chunks.push(chunk)
+    })
+    req.on('end', () => {
+      if (chunks.length === 0) {
+        resolve(undefined)
+        return
+      }
+      try {
+        resolve(JSON.parse(Buffer.concat(chunks).toString('utf8')))
+      } catch (error) {
+        reject(new Error(`请求体不是合法 JSON：${errorText(error)}`))
+      }
+    })
+    req.on('error', reject)
+  })
+}
+
+/** 统一 JSON 响应。 */
+function respond(res, status, value) {
+  const body = JSON.stringify(value)
+  res.statusCode = status
+  res.setHeader('Content-Type', 'application/json; charset=utf-8')
+  res.setHeader('Cache-Control', 'no-store')
+  res.end(body)
+}
+
+/** 是否是带自定义头的 POST（基础 CSRF 防护）。 */
+function trustedPost(req) {
+  return req.method === 'POST' && req.headers['x-dsh-memory'] === '1'
+}
+
+/** 解析 URL 查询参数。 */
+function parseQuery(req) {
+  try {
+    const url = new URL(String(req.url ?? '/'), 'http://127.0.0.1')
+    return url.searchParams
+  } catch {
+    return new URLSearchParams()
+  }
+}
+
+/**
+ * @param {object} ctx DSH 插件上下文
+ * @param {import('./service.js').MemoryService} service
+ */
+function registerHttpRoutes(ctx, service) {
+  const log = service.logger
+  const statusRoute = {
+    kind: 'exact',
+    path: '/__dsh_memory__/status',
+    handler: async (req, res) => {
+      if (req.method !== 'GET') {
+        respond(res, 405, { ok: false, error: 'method not allowed' })
+        return
+      }
+      try {
+        respond(res, 200, await service.status())
+      } catch (error) {
+        respond(res, 500, { ok: false, error: errorText(error) })
+      }
+    },
+  }
+  const memoriesRoute = {
+    kind: 'exact',
+    path: '/__dsh_memory__/memories',
+    handler: async (req, res) => {
+      try {
+        if (req.method === 'GET') {
+          const query = parseQuery(req)
+          const result = await service.listMemories({
+            query: query.get('q') ?? '',
+            limit: Number(query.get('limit') ?? 20),
+            offset: query.get('offset') ?? null,
+            kind: query.get('kind') ?? '',
+            range: query.get('range') ?? '',
+            level: query.get('level') ?? '',
+            batch: query.get('batch') ?? '',
+          })
+          respond(res, 200, { ok: true, ...result })
+          return
+        }
+        if (!trustedPost(req)) {
+          respond(res, 403, { ok: false, error: 'forbidden' })
+          return
+        }
+        const body = await readJsonBody(req)
+        const text = cleanText(body?.text ?? '')
+        if (!text) {
+          respond(res, 400, { ok: false, error: '缺少要保存的 text' })
+          return
+        }
+        const kind = typeof body?.kind === 'string' && body.kind.trim() ? body.kind.trim() : 'note'
+        const tags = Array.isArray(body?.tags)
+          ? body.tags.filter((tag) => typeof tag === 'string').slice(0, 12)
+          : []
+        const saved = await service.addMemory({ kind, text, meta: { tags, source: 'settings' } })
+        respond(res, 200, { ok: true, item: saved })
+      } catch (error) {
+        respond(res, 500, { ok: false, error: errorText(error) })
+      }
+    },
+  }
+  const memoriesDeleteRoute = {
+    kind: 'exact',
+    path: '/__dsh_memory__/memories/delete',
+    handler: async (req, res) => {
+      if (!trustedPost(req)) {
+        respond(res, 403, { ok: false, error: 'forbidden' })
+        return
+      }
+      try {
+        const body = await readJsonBody(req)
+        const ids = Array.isArray(body?.ids) ? body.ids : body?.id ? [body.id] : []
+        const result = await service.forget(ids)
+        respond(res, 200, result)
+      } catch (error) {
+        respond(res, 400, { ok: false, error: errorText(error) })
+      }
+    },
+  }
+  const exportRoute = {
+    kind: 'exact',
+    path: '/__dsh_memory__/export',
+    handler: async (req, res) => {
+      if (req.method !== 'GET') {
+        respond(res, 405, { ok: false, error: 'method not allowed' })
+        return
+      }
+      try {
+        respond(res, 200, await service.exportMemories())
+      } catch (error) {
+        respond(res, 500, { ok: false, error: errorText(error) })
+      }
+    },
+  }
+  const testRoute = {
+    kind: 'exact',
+    path: '/__dsh_memory__/test',
+    handler: async (req, res) => {
+      if (!trustedPost(req)) {
+        respond(res, 403, { ok: false, error: 'forbidden' })
+        return
+      }
+      try {
+        const body = await readJsonBody(req)
+        respond(res, 200, await service.test(typeof body?.providerId === 'string' ? body.providerId : undefined))
+      } catch (error) {
+        log.warn?.(`[dsh-memory] 连接测试失败：${errorText(error)}`)
+        respond(res, 500, { ok: false, error: errorText(error) })
+      }
+    },
+  }
+  const recreateRoute = {
+    kind: 'exact',
+    path: '/__dsh_memory__/recreate',
+    handler: async (req, res) => {
+      if (!trustedPost(req)) {
+        respond(res, 403, { ok: false, error: 'forbidden' })
+        return
+      }
+      try {
+        const body = await readJsonBody(req)
+        if (body?.confirm !== 'DELETE') {
+          respond(res, 400, { ok: false, error: '需要 confirm: "DELETE" 才能重建集合' })
+          return
+        }
+        const result = await service.recreateCollection()
+        if (!result.ok) {
+          respond(res, 500, { ok: false, error: result.error ?? '重建失败' })
+          return
+        }
+        respond(res, 200, { ok: true, collection: result.info })
+      } catch (error) {
+        log.warn?.(`[dsh-memory] 重建集合失败：${errorText(error)}`)
+        respond(res, 500, { ok: false, error: errorText(error) })
+      }
+    },
+  }
+  const maintenanceRoute = {
+    kind: 'exact',
+    path: '/__dsh_memory__/maintenance',
+    handler: async (req, res) => {
+      if (!trustedPost(req)) {
+        respond(res, 403, { ok: false, error: 'forbidden' })
+        return
+      }
+      try {
+        await readJsonBody(req)
+        respond(res, 200, await service.maintenance({ force: true }))
+      } catch (error) {
+        respond(res, 500, { ok: false, error: errorText(error) })
+      }
+    },
+  }
+  const sleepRoute = {
+    kind: 'exact',
+    path: '/__dsh_memory__/sleep',
+    handler: async (req, res) => {
+      if (req.method !== 'GET') {
+        respond(res, 405, { ok: false, error: 'method not allowed' })
+        return
+      }
+      if (!service.sleep || !service.consolidation) {
+        respond(res, 503, { ok: false, error: '睡眠整理组件未加载' })
+        return
+      }
+      respond(res, 200, {
+        ok: true,
+        sleep: service.sleep.status(),
+        consolidation: service.consolidation.summary(),
+      })
+    },
+  }
+  const sleepRunRoute = {
+    kind: 'exact',
+    path: '/__dsh_memory__/sleep/run',
+    handler: async (req, res) => {
+      if (!trustedPost(req)) {
+        respond(res, 403, { ok: false, error: 'forbidden' })
+        return
+      }
+      if (!service.sleep) {
+        respond(res, 503, { ok: false, error: '睡眠整理组件未加载' })
+        return
+      }
+      try {
+        const body = await readJsonBody(req)
+        if (body?.confirm === 'run') {
+          respond(res, 200, service.sleep.requestManual())
+          return
+        }
+        respond(res, 200, service.sleep.requestManual())
+      } catch (error) {
+        respond(res, 500, { ok: false, error: errorText(error) })
+      }
+    },
+  }
+  const consolidationRoute = {
+    kind: 'exact',
+    path: '/__dsh_memory__/consolidation',
+    handler: async (req, res) => {
+      if (req.method !== 'GET') {
+        respond(res, 405, { ok: false, error: 'method not allowed' })
+        return
+      }
+      if (!service.consolidation) {
+        respond(res, 503, { ok: false, error: '整理引擎未加载' })
+        return
+      }
+      respond(res, 200, { ok: true, ...service.consolidation.summary() })
+    },
+  }
+  const modelsRoute = {
+    kind: 'exact',
+    path: '/__dsh_memory__/models',
+    handler: async (req, res) => {
+      if (req.method !== 'GET') {
+        respond(res, 405, { ok: false, error: 'method not allowed' })
+        return
+      }
+      try {
+        const query = parseQuery(req)
+        respond(res, 200, await service.listProviderModels(query.get('providerId') ?? ''))
+      } catch (error) {
+        respond(res, 500, { ok: false, error: errorText(error) })
+      }
+    },
+  }
+  const dshModelsRoute = {
+    kind: 'exact',
+    path: '/__dsh_memory__/dsh-models',
+    handler: async (req, res) => {
+      if (req.method !== 'GET') {
+        respond(res, 405, { ok: false, error: 'method not allowed' })
+        return
+      }
+      try {
+        respond(res, 200, { ok: true, ...(await service.dshCatalog()) })
+      } catch (error) {
+        respond(res, 500, { ok: false, error: errorText(error) })
+      }
+    },
+  }
+
+  const routes = [
+    statusRoute,
+    memoriesRoute,
+    memoriesDeleteRoute,
+    exportRoute,
+    testRoute,
+    recreateRoute,
+    maintenanceRoute,
+    sleepRoute,
+    sleepRunRoute,
+    consolidationRoute,
+    modelsRoute,
+    dshModelsRoute,
+  ]
+  return routes.map((route) => ctx.effect(() => ctx.webServer.register(route), `dsh-memory: route ${route.path}`))
+}
+// ===== src/shared/protocol.js =====
+/**
+ * Host 与 client 共用的协议常量（单一事实源）。
+ * 目前 host 直接 import；client 侧在 R5 模块化构建时复用同一份常量。
+ */
+const PLUGIN_ID = 'dsh-memory'
+const API_PREFIX = '/__dsh_memory__/'
+const POST_HEADER = 'x-dsh-memory'
+const POST_HEADER_VALUE = '1'
+const MEMORY_SOURCE = 'long-term-memory'
+const SLEEP_SOURCE = 'dsh-memory-sleep'
+const WAKE_SOURCE = 'dsh-memory-wake'
+// ===== src/lib/entry/recall-controller.js =====
+/**
+ * 自动召回：在每轮第一步之前，用最后一条真实用户消息做向量检索，
+ * 把相关记忆作为一条 source.kind = 'long-term-memory' 的上下文消息
+ * 追加进本步的 messages。
+ *
+ * 该消息会进入会话日志（可回放/可 fork），DSH Web 会把它显示成
+ * “上下文注入”行，而不是用户气泡。
+ */
+
+
+
+
+/** 从消息列表里取出最后一条真实人类消息的文本。 */
+function lastUserText(messages) {
+  if (!Array.isArray(messages)) return ''
+  for (let index = messages.length - 1; index >= 0; index -= 1) {
+    const message = messages[index]
+    if (!message || message.role !== 'user') continue
+    if (message.source?.kind !== 'user') continue
+    const parts = []
+    for (const block of message.content ?? []) {
+      if (block?.type === 'text' && typeof block.text === 'string') parts.push(block.text)
+    }
+    const text = parts.join('\n').trim()
+    if (text) return text
+  }
+  return ''
+}
+
+/** 构造注入用的上下文消息。 */
+function createMemoryMessage(text) {
+  return {
+    id: `memory-${randomUUID()}`,
+    role: 'user',
+    content: [{ type: 'text', text }],
+    source: { kind: MEMORY_SOURCE },
+  }
+}
+
+class RecallController {
+  /**
+   * @param {import('./service.js').MemoryService} service
+   */
+  constructor(service) {
+    this.service = service
+    this.ctx = service.ctx
+    this.logger = service.logger
+  }
+
+  start() {
+    this.ctx.effect(
+      () =>
+        this.ctx.on('agent/pre-step', async (payload, next) => {
+          const decision = await next()
+          try {
+            return await this.augment(payload, decision)
+          } catch (error) {
+            this.service.stats.lastRecallError = errorText(error)
+            this.service.debugLog(`自动召回失败：${errorText(error)}`)
+            return decision
+          }
+        }),
+      'dsh-memory: auto recall',
+    )
+  }
+
+  async augment(payload, decision) {
+    // 睡眠整理期间：不召回，改为让模型只回复 zzzZZ，并把用户原话排队到睡醒后继续处理
+    const sleep = this.service.sleep
+    if (sleep?.isSleeping?.()) {
+      if (payload?.step !== 1) return decision
+      if (payload?.signal?.aborted) return decision
+      if (decision?.kind !== 'enter') return decision
+      const intercepted = sleep.interceptPreStep(payload, decision)
+      if (intercepted?.message) {
+        return { ...decision, messages: [...decision.messages, intercepted.message] }
+      }
+      return decision
+    }
+    const options = this.service.recallOptions()
+    if (!options.autoRecall) return decision
+    const agentId = String(payload?.agent?.id ?? '')
+    if (!this.service.captureOptions().includeSubagents && agentId) {
+      const session = this.service.ctx.sessions?.get?.(agentId)
+      if (session?.header?.origin === 'subagent') return decision
+    }
+    if (payload?.step !== 1) return decision
+    if (payload?.signal?.aborted) return decision
+    if (decision?.kind !== 'enter') return decision
+    const query = lastUserText(decision.messages) || lastUserText(payload.messages)
+    this.service.stats.recallChecks += 1
+    this.service.stats.lastRecallQuery = query.slice(0, 120)
+    this.service.stats.lastRecallError = ''
+    if (!query || query.length < 2) return decision
+    const context = this.service.sessionContext(agentId)
+    const timeout = AbortSignal.timeout(options.recallTimeoutMs)
+    const signal = payload?.signal === undefined ? timeout : AbortSignal.any([payload.signal, timeout])
+    const { block, hits } = await this.service.recall(query, {
+      signal,
+      sessionId: context.sessionId,
+      cwd: context.cwd,
+    })
+    if (!block || hits.length === 0) return decision
+    this.service.stats.lastRecallInjectAt = Date.now()
+    this.service.debugLog(`自动召回 ${hits.length} 条记忆（score ${hits[0].score.toFixed(3)}）`)
+    return {
+      ...decision,
+      messages: [...decision.messages, createMemoryMessage(block)],
+    }
+  }
+}
+// ===== src/lib/adapters/openai/client.js =====
 /**
  * OpenAI 兼容的云端 API 客户端：
  * - POST {baseUrl}/embeddings        文本嵌入（OpenAI / SiliconFlow / DashScope 兼容模式 / 智谱 / 火山方舟 / Jina … 均兼容）
@@ -1243,7 +2588,7 @@ class OpenAICompatClient {
     }
   }
 }
-// ===== src/lib/qdrant.js =====
+// ===== src/lib/adapters/qdrant/client.js =====
 /**
  * Qdrant REST 客户端（只用 HTTP API，不需要额外依赖）。
  * 与 Qdrant 同机部署时默认 http://127.0.0.1:6333，无需 API Key；
@@ -1469,7 +2814,7 @@ class QdrantClient {
     return this.ensureCollection(collection, size)
   }
 }
-// ===== src/lib/service.js =====
+// ===== src/lib/app/memory-service.js =====
 /**
  * MemoryService：插件核心业务对象（v0.2）。
  *
@@ -1488,9 +2833,8 @@ class QdrantClient {
 
 
 
-/** 自动召回注入消息的 source.kind；DSH 会把它渲染成“上下文注入”行而不是用户气泡。 */
-const MEMORY_SOURCE = 'long-term-memory'
 
+/** 自动召回注入消息的 source.kind；DSH 会把它渲染成“上下文注入”行而不是用户气泡。 */
 /** 自动召回上下文消息的标题前缀。 */
 const RECALL_HEADER = '【长期记忆·自动召回】'
 
@@ -3030,740 +4374,7 @@ class MemoryService {
   }
 
 }
-// ===== src/lib/consolidation.js =====
-/**
- * 睡眠整理引擎（v0.4）。
- *
- * 把记忆压缩成“批次”，用任务列表调度多级压缩：
- *   L1：每天把原始记忆（level=0）压缩成一个 5 位编号的批次（保留多少条由模型按重要性决定）
- *   L2：L1 批次创建 7 天后，再压缩为 L2 批次（L1 原文删除）
- *   L3：L2 批次创建 30 天后，再压缩为 L3 批次（最终长期摘要）
- *
- * 任务列表持久化在 $DSH_HOME/storages/dsh-memory/consolidation.json，
- * 批次编号是随机 5 位数；只要求“待处理/处理中”的编号唯一，完成后的编号可回收复用。
- *
- * 实验功能（默认关闭）：
- * - 事件合并：整理时用嵌入向量在全库检索相似记忆，只把相关小簇作为参考交给 LLM，
- *   并生成 kind='event' 的事件摘要（不会被整库塞给 LLM）。
- * - 增强记忆：额外保留一份 L1 产物 enhancementDays 天，不参与后续整理，
- *   仅供事件合并/按需搜索使用，到期自动删除。
- */
-
-
-
-
-/** 整理状态文件版本。 */
-const STATE_VERSION = 1
-
-/** 内置整理提示词。 */
-const DEFAULT_PROMPT = [
-  '你是长期记忆整理助手，模拟人类睡眠中的记忆巩固。',
-  '输入：某个时间单元内的若干条记忆（可能来自对话、事实、偏好、图片概览）。',
-  '任务：合并、去重、压缩，提炼出最重要的信息；删除寒暄与重复，不编造不存在的内容。',
-  '输出必须是严格 JSON（不要输出代码围栏之外的解释）：',
-  '{"summary":"一段简短的整体摘要","facts":[{"text":"一条自包含的事实","kind":"fact|preference|project|note","tags":["可选标签"]}],"event":{"summary":"可选：如果这些记忆构成同一事件，写一句事件摘要","tags":["可选"]}}',
-  '要求：',
-  '- facts 条数由你根据信息的重要性和密度自行决定（不要为了凑数而保留琐碎内容，也不要丢失关键事实）；每条自包含，不要用“他/它/这个”等指代。',
-  '- 保留关键事实、偏好、决定、时间、人名、项目名；丢弃噪音。',
-  '- summary 与 facts 用中文（除非原文主要是其他语言）。',
-].join('\n')
-
-/** 一个批次的简易视图（给状态/历史用）。 */
-function batchView(batch) {
-  return {
-    id: batch.id,
-    level: batch.level,
-    status: batch.status,
-    createdAt: batch.createdAt,
-    dueAt: batch.dueAt,
-    sourceCount: batch.inputCount ?? 0,
-    outputCount: batch.outputCount ?? 0,
-    dayKey: batch.dayKey ?? '',
-    sourceBatchIds: batch.sourceBatchIds ?? [],
-    error: batch.error ?? null,
-  }
-}
-
-class ConsolidationEngine {
-  /**
-   * @param {import('./service.js').MemoryService} service
-   */
-  constructor(service) {
-    this.service = service
-    this.ctx = service.ctx
-    this.logger = service.logger
-    this.statePath = join(dshHome(), 'storages', 'dsh-memory', 'consolidation.json')
-    this.state = { version: STATE_VERSION, batches: [], history: [], lastRun: null }
-    this.loaded = false
-    this.running = null
-  }
-
-  /** 配置级别定义（level1 为每日原始记忆压缩，level2/3 为后续批次压缩）。 */
-  stages() {
-    // 默认不限制输出条数，由整理模型按内容重要性自行决定；
-    // 只有在设置页显式开启「限制每级整理条数」时才套用内部安全上限。
-    // 7 天 / 30 天的触发间隔是固定的整理节奏，未来要扩展更多级只需在数组里追加。
-    const limitEnabled = this.service.cfg().consolidationLimitItems === true
-    return [
-      { level: 1, maxItems: limitEnabled ? 40 : null, afterDays: 0 },
-      { level: 2, maxItems: limitEnabled ? 20 : null, afterDays: 7 },
-      { level: 3, maxItems: limitEnabled ? 10 : null, afterDays: 30 },
-    ]
-  }
-
-  stage(level) {
-    return this.stages().find((item) => item.level === level) ?? null
-  }
-
-  nextStage(level) {
-    return this.stages().find((item) => item.level === level + 1) ?? null
-  }
-
-  // ------------------------------------------------------------------
-  // 任务列表持久化
-  // ------------------------------------------------------------------
-
-  async load() {
-    if (this.loaded) return this.state
-    const data = readJsonFile(this.statePath, null)
-    if (data && typeof data === 'object' && Array.isArray(data.batches)) {
-      this.state = {
-        version: STATE_VERSION,
-        batches: data.batches,
-        history: Array.isArray(data.history) ? data.history : [],
-        lastRun: data.lastRun ?? null,
-      }
-    }
-    this.loaded = true
-    return this.state
-  }
-
-  async save() {
-    // 只保留最近 600 个批次与 40 条历史，避免状态文件无限膨胀
-    if (this.state.batches.length > 600) {
-      const finished = this.state.batches.filter((b) => b.status !== 'pending' && b.status !== 'processing')
-      const active = this.state.batches.filter((b) => b.status === 'pending' || b.status === 'processing')
-      const keepFinished = finished.slice(-Math.max(0, 600 - active.length))
-      this.state.batches = [...keepFinished, ...active].sort((a, b) => a.createdAt - b.createdAt)
-    }
-    if (this.state.history.length > 40) this.state.history = this.state.history.slice(-40)
-    writeJsonFileAtomic(this.statePath, this.state)
-  }
-
-  /** 待处理/处理中批次占用的编号集合。 */
-  pendingIds() {
-    return new Set(
-      this.state.batches
-        .filter((batch) => batch.status === 'pending' || batch.status === 'processing')
-        .map((batch) => String(batch.id)),
-    )
-  }
-
-  batchById(id) {
-    return this.state.batches.find((batch) => String(batch.id) === String(id)) ?? null
-  }
-
-  /** 状态/历史摘要。 */
-  summary() {
-    const batches = this.state.batches ?? []
-    const pending = batches.filter((batch) => batch.status === 'pending' || batch.status === 'processing')
-    const byLevel = {}
-    for (const batch of pending) byLevel[batch.level] = (byLevel[batch.level] ?? 0) + 1
-    const nextDue = pending
-      .filter((batch) => Number.isFinite(batch.dueAt))
-      .sort((a, b) => a.dueAt - b.dueAt)[0]
-    return {
-      enabled: this.service.cfg().consolidationEnabled === true,
-      pendingTotal: pending.length,
-      pendingByLevel: byLevel,
-      nextDueAt: nextDue?.dueAt ?? null,
-      nextDueTime: nextDue?.dueAt ? this.service.formatTs(nextDue.dueAt) : '',
-      batches: batches.slice(-15).map(batchView),
-      history: (this.state.history ?? []).slice(-6).map((entry) => ({
-        at: entry.at,
-        time: entry.at ? this.service.formatTs(entry.at) : '',
-        manual: entry.manual === true,
-        durationMs: entry.durationMs ?? 0,
-        levels: entry.levels ?? {},
-        errors: entry.errors ?? [],
-      })),
-      lastRun: this.state.lastRun,
-      statePath: this.statePath,
-    }
-  }
-
-  // ------------------------------------------------------------------
-  // 运行整理
-  // ------------------------------------------------------------------
-
-  /** 是否正在整理。 */
-  get busy() {
-    return this.running !== null
-  }
-
-  /**
-   * 执行一轮整理（睡醒前调用）。同一时间只允许一个 run。
-   * @param {{manual?:boolean, reason?:string}} options
-   */
-  async run(options = {}) {
-    await this.load()
-    if (this.running) return this.running
-    this.running = this.#runInner({ manual: options.manual === true, reason: options.reason ?? 'sleep' })
-      .finally(() => {
-        this.running = null
-      })
-    return this.running
-  }
-
-  async #runInner({ manual, reason }) {
-    const startedAt = Date.now()
-    const cfg = this.service.cfg()
-    const tz = this.service.timeOptions().timeZone
-    const today = dayKey(Date.now(), tz)
-    const stages = this.stages()
-    const result = {
-      ok: true,
-      manual,
-      reason,
-      startedAt,
-      finishedAt: 0,
-      durationMs: 0,
-      levels: {},
-      batches: [],
-      deleted: 0,
-      errors: [],
-      maintenance: null,
-    }
-
-    try {
-      await this.service.ensureReady()
-
-      // ---------- L1：把“今天之前”的原始记忆按天压缩 ----------
-      const raw = await this.service.collectMemories({
-        filter: { must: [{ key: 'level', match: { value: 0 } }] },
-        withVector: cfg.experimentalEventMergeEnabled === true,
-        maxItems: 5000,
-        orderBy: { key: 'ts', direction: 'asc' },
-      })
-      const byDay = new Map()
-      for (const item of raw) {
-        const key = dayKey(Number(item.payload?.ts) || 0, tz)
-        if (key >= today) continue
-        if (!byDay.has(key)) byDay.set(key, [])
-        byDay.get(key).push(item)
-      }
-      const dayKeys = [...byDay.keys()].sort()
-      for (const key of dayKeys) {
-        const items = byDay.get(key)
-        const stage1 = stages.find((item) => item.level === 1)
-        const outcome = await this.#compress({
-          level: 1,
-          stage: stage1,
-          sources: items,
-          dayKey: key,
-          sourceBatchIds: [],
-          meta: { dayRange: dayBoundsFromKey(key, tz) },
-        })
-        result.batches.push(outcome.view)
-        if (outcome.error) result.errors.push(outcome.error)
-        this.#mergeLevelStats(result, 1, outcome)
-      }
-
-      // ---------- L2/L3：处理到期批次 ----------
-      for (const stage of stages.filter((item) => item.level >= 2)) {
-        const due = this.state.batches
-          .filter(
-            (batch) =>
-              batch.level === stage.level - 1 &&
-              batch.status === 'pending' &&
-              Number(batch.dueAt) > 0 &&
-              Number(batch.dueAt) <= Date.now(),
-          )
-          .sort((a, b) => a.dueAt - b.dueAt)
-        for (const sourceBatch of due) {
-          const sources = await this.service.collectBatchMemories(sourceBatch.id, {
-            withVector: cfg.experimentalEventMergeEnabled === true,
-            maxItems: 5000,
-          })
-          if (sources.length === 0) {
-            sourceBatch.status = 'done'
-            sourceBatch.updatedAt = Date.now()
-            sourceBatch.error = 'empty-batch'
-            await this.save()
-            continue
-          }
-          const outcome = await this.#compress({
-            level: stage.level,
-            stage,
-            sources,
-            dayKey: sourceBatch.dayKey ?? '',
-            sourceBatchIds: [sourceBatch.id],
-            meta: { dayRange: sourceBatch.dayRange ?? null },
-          })
-          result.batches.push(outcome.view)
-          if (outcome.error) result.errors.push(outcome.error)
-          this.#mergeLevelStats(result, stage.level, outcome)
-          if (!outcome.error) {
-            sourceBatch.status = 'done'
-            sourceBatch.updatedAt = Date.now()
-            sourceBatch.outputBatchId = outcome.view.id
-          } else {
-            sourceBatch.attempts = (sourceBatch.attempts ?? 0) + 1
-            sourceBatch.error = outcome.error
-          }
-          await this.save()
-        }
-      }
-
-      // ---------- 增强记忆到期清理 ----------
-      try {
-        const expired = await this.service.listExpiredEnhanced(Date.now())
-        if (expired.length > 0) {
-          await this.service.deleteMemoryIds(expired)
-          result.deleted += expired.length
-        }
-      } catch (error) {
-        result.errors.push(`enhanced-expiry: ${errorText(error)}`)
-      }
-
-      // ---------- 整理后自动维护（去重/过期/索引） ----------
-      try {
-        result.maintenance = await this.service.maintenance({ force: false })
-      } catch (error) {
-        result.errors.push(`maintenance: ${errorText(error)}`)
-      }
-    } catch (error) {
-      result.ok = false
-      result.errors.push(errorText(error))
-    }
-
-    result.finishedAt = Date.now()
-    result.durationMs = result.finishedAt - startedAt
-    result.ok = result.ok && result.errors.length === 0
-    this.state.lastRun = {
-      at: result.finishedAt,
-      manual,
-      durationMs: result.durationMs,
-      ok: result.ok,
-      levels: result.levels,
-      deleted: result.deleted,
-      errors: result.errors,
-    }
-    this.state.history.push({
-      at: result.startedAt,
-      manual,
-      durationMs: result.durationMs,
-      levels: result.levels,
-      currentLevels: this.summaryLevels(),
-      errors: result.errors,
-    })
-    await this.save()
-    const levelText = Object.entries(result.levels)
-      .map(([level, stat]) => `L${level}:${stat.batches}批/${stat.input}→${stat.output}`)
-      .join(' ')
-    this.service.debugLog(`睡眠整理完成 ${formatDuration(result.durationMs)} ${levelText} 删除原文 ${result.deleted} 条`)
-    return result
-  }
-
-  summaryLevels() {
-    const counts = {}
-    for (const batch of this.state.batches) counts[batch.level] = (counts[batch.level] ?? 0) + 1
-    return counts
-  }
-
-  #mergeLevelStats(result, level, outcome) {
-    if (!result.levels[level]) result.levels[level] = { batches: 0, input: 0, output: 0 }
-    result.levels[level].batches += 1
-    result.levels[level].input += outcome.inputCount ?? 0
-    result.levels[level].output += outcome.outputCount ?? 0
-    result.deleted += outcome.deleted ?? 0
-  }
-
-  /**
-   * 压缩一个批次：调 LLM（或规则回退）生成摘要+事实，写入新记忆，删除原文，登记任务。
-   */
-  async #compress({ level, stage, sources, dayKey: key, sourceBatchIds, meta }) {
-    const cfg = this.service.cfg()
-    const nextStage = this.nextStage(level)
-    const batchId = nextBatchId(this.pendingIds())
-    const cleanSources = (sources ?? []).filter((item) => item.payload?.text)
-    const inputCount = cleanSources.length
-    const emptyView = {
-      id: batchId,
-      level,
-      status: nextStage ? 'pending' : 'final',
-      createdAt: Date.now(),
-      dueAt: nextStage ? Date.now() + nextStage.afterDays * 86400000 : null,
-      sourceCount: inputCount,
-      outputCount: 0,
-      sourceBatchIds,
-      dayKey: key || '',
-      error: 'no-source',
-    }
-    if (inputCount === 0) return { view: emptyView, inputCount: 0, outputCount: 0, deleted: 0, error: null }
-
-    try {
-      // ---------- 实验：事件合并（只取相似记忆作为参考） ----------
-      let related = []
-      if (cfg.experimentalEventMergeEnabled === true) {
-        related = await this.#findRelated(cleanSources)
-      }
-
-      // ---------- LLM / 规则压缩 ----------
-      const rendered = this.#renderSources(cleanSources, level)
-      const chunks = chunkByChars(cleanSources, Math.max(1000, Number(cfg.consolidationInputMaxChars) || 12000))
-      let combined = null
-      let llmCalls = 0
-      let latencyMs = 0
-      try {
-        const partials = []
-        for (const chunk of chunks) {
-          const partial = await this.#callLLM({
-            level,
-            stage,
-            items: chunk,
-            rendered: this.#renderSources(chunk, level),
-            related,
-            isFirst: partials.length === 0,
-          })
-          partials.push(partial)
-          llmCalls += 1
-          latencyMs += partial.latencyMs ?? 0
-        }
-        combined = partials.length === 1 ? partials[0].data : await this.#mergePartials(partials, stage)
-        if (partials.length > 1) {
-          llmCalls += 1
-          latencyMs += combined?.latencyMs ?? 0
-        }
-      } catch (error) {
-        // 回退：纯规则压缩（保证睡眠不中断；内容可能粗糙）
-        this.service.debugLog(`整理 LLM 不可用，回退规则压缩：${errorText(error)}`)
-        combined = this.#ruleCompress(chunks, stage)
-        combined = combined.data
-        combined.fallback = true
-        combined.fallbackReason = errorText(error)
-      }
-
-      const summary = String(combined?.summary ?? '').trim()
-      const facts = Array.isArray(combined?.facts) ? combined.facts : []
-      const event = combined?.event && typeof combined.event === 'object' ? combined.event : null
-
-      // 默认保留条数由模型决定；只有开启「限制每级整理条数」时才截断。
-      const limitEnabled = Number.isFinite(stage.maxItems)
-      const maxItems = limitEnabled ? Math.max(1, stage.maxItems) : null
-      const factLimit = limitEnabled ? Math.max(0, maxItems - (summary ? 1 : 0)) : Infinity
-      const selectedFacts = facts
-        .filter((fact) => fact && typeof fact.text === 'string' && fact.text.trim())
-        .slice(0, factLimit)
-        .map((fact) => ({
-          text: String(fact.text).trim(),
-          kind: ['fact', 'preference', 'project', 'note', 'event'].includes(fact.kind) ? fact.kind : 'fact',
-          tags: Array.isArray(fact.tags) ? fact.tags.map(String).slice(0, 8) : [],
-        }))
-
-      const entries = []
-      if (summary) entries.push({ text: summary, kind: 'summary', tags: ['summary'] })
-      for (const fact of selectedFacts) entries.push(fact)
-      if (entries.length === 0) entries.push({ text: rendered.slice(0, Math.max(80, Math.min(400, rendered.length))), kind: 'note', tags: ['fallback'] })
-      const eventText = event?.summary && String(event.summary).trim()
-        ? String(event.summary).trim()
-        : related.length > 0
-          ? `相关事件：${summary || related[0].text}`.slice(0, 500)
-          : ''
-      if (eventText) {
-        entries.push({
-          text: eventText,
-          kind: 'event',
-          tags: Array.isArray(event?.tags) ? event.tags.map(String).slice(0, 8) : ['event'],
-        })
-      }
-
-      // 压缩比统计：输入条数 → 输出条数（source 删除，目标比例仅作为提示）
-      const now = Date.now()
-      const sourceIds = cleanSources.map((item) => item.id)
-      const baseMeta = {
-        level,
-        batch: batchId,
-        batchCreatedAt: now,
-        sourceCount: inputCount,
-        sourceBatchIds,
-        dayRange: meta?.dayRange ?? null,
-        consolidatedAt: now,
-        relatedCount: related.length,
-      }
-
-      const written = []
-      try {
-        for (const [index, entry] of entries.entries()) {
-          const saved = await this.service.addMemory({
-            kind: entry.kind === 'summary' ? 'summary' : entry.kind,
-            text: entry.text,
-            meta: {
-              ...baseMeta,
-              tags: entry.tags,
-              // 批次内唯一：避免整理产物的内容哈希与原文（或彼此）相同，
-              // 导致“先写入、再删除原文”把新产物一起删掉。
-              idSeed: `sleep-${batchId}-${index}`,
-            },
-          })
-          written.push(saved)
-        }
-        // 实验：增强记忆副本（不进入整理链，仅事件/按需召回使用）
-        if (cfg.experimentalEnhancementEnabled === true && level === 1) {
-          const days = Math.max(1, Number(cfg.experimentalEnhancementDays) || 7)
-          for (const saved of written) {
-            await this.service.addMemory({
-              kind: saved.kind ?? 'summary',
-              text: `（增强记忆）${saved.text}`,
-              meta: {
-                level: 1,
-                enhanced: true,
-                expiresAt: now + days * 86400000,
-                sourceCount: inputCount,
-                sourceBatchIds,
-                consolidatedAt: now,
-                idSeed: `enhanced-${batchId}`,
-              },
-            })
-          }
-        }
-      } catch (error) {
-        return {
-          view: { ...emptyView, error: `write-failed: ${errorText(error)}` },
-          inputCount,
-          outputCount: 0,
-          deleted: 0,
-          error: `write-failed: ${errorText(error)}`,
-        }
-      }
-
-      // 写入成功后删除原文
-      let deleted = 0
-      try {
-        deleted = await this.service.deleteMemoryIds(sourceIds)
-      } catch (error) {
-        return {
-          view: { ...emptyView, error: `delete-failed: ${errorText(error)}` },
-          inputCount,
-          outputCount: written.length,
-          deleted: 0,
-          error: `delete-failed: ${errorText(error)}`,
-        }
-      }
-
-      const batchRow = {
-        id: batchId,
-        level,
-        status: nextStage ? 'pending' : 'final',
-        createdAt: now,
-        updatedAt: now,
-        dueAt: nextStage ? now + nextStage.afterDays * 86400000 : null,
-        dayKey: key || '',
-        dayRange: meta?.dayRange ?? null,
-        sourceBatchIds,
-        sourceIdsCount: sourceIds.length,
-        inputCount,
-        outputCount: written.length,
-        maxItems,
-        llmCalls,
-        latencyMs,
-        fallback: combined?.fallback === true,
-        fallbackReason: combined?.fallbackReason ?? null,
-        error: null,
-      }
-      this.state.batches.push(batchRow)
-      await this.save()
-      return {
-        view: batchView(batchRow),
-        inputCount,
-        outputCount: written.length,
-        deleted,
-        error: null,
-      }
-    } catch (error) {
-      return {
-        view: { ...emptyView, error: errorText(error) },
-        inputCount,
-        outputCount: 0,
-        deleted: 0,
-        error: errorText(error),
-      }
-    }
-  }
-
-  /** 渲染记忆条目给模型。 */
-  #renderSources(items, level) {
-    return items
-      .map((item) => {
-        const payload = item.payload ?? {}
-        const time = this.service.formatTs(Number(payload.ts) || 0)
-        const kind = payload.kind ?? 'note'
-        const batch = payload.batch ? ` #${payload.batch}` : ''
-        return `- [${time}·${kind}${batch}] ${String(payload.text ?? '').trim()}`
-      })
-      .join('\n')
-  }
-
-  /** 在全库检索相似记忆（事件合并参考），绝不加载全库到内存。 */
-  async #findRelated(sources) {
-    const cfg = this.service.cfg()
-    const threshold = Math.min(1, Math.max(0.5, Number(cfg.experimentalEventMergeThreshold) || 0.85))
-    const maxCandidates = Math.max(1, Math.min(200, Number(cfg.experimentalEventMergeMaxCandidates) || 30))
-    const ownIds = new Set(sources.map((item) => item.id))
-    const related = new Map()
-    // 只探测最多 20 条源记忆，控制查询次数
-    for (const source of sources.slice(0, 20)) {
-      const vector = source.vector
-      if (!Array.isArray(vector)) continue
-      try {
-        const hits = await this.service.searchSimilar(vector, {
-          limit: 5,
-          threshold,
-          excludeIds: [...ownIds, ...related.keys()],
-        })
-        for (const hit of hits) {
-          if (!related.has(hit.id)) related.set(hit.id, hit)
-          if (related.size >= maxCandidates) break
-        }
-      } catch {
-        /* 忽略单条检索失败 */
-      }
-      if (related.size >= maxCandidates) break
-    }
-    return [...related.values()].slice(0, maxCandidates)
-  }
-
-  /** 调一次整理 LLM（DSH 模型或自定义 provider，由 service 路由）。 */
-  async #callLLM({ level, stage, items, rendered, related, isFirst }) {
-    const cfg = this.service.cfg()
-    const limitEnabled = Number.isFinite(stage?.maxItems)
-    const maxFacts = limitEnabled ? Math.max(1, stage.maxItems - 1) : null
-    const relatedText = isFirst && related.length > 0
-      ? `\n\n【可能相关的其他事件记忆（仅参考，不要删除/编造，可合并同一事件的信息）】\n${renderMemoryLines(related, 6000, (item) => `- [${this.service.formatTs(item.ts)}·${item.kind}${item.batch ? ' #' + item.batch : ''}] ${item.text.slice(0, 500)}`)}`
-      : ''
-    const customPrompt = String(cfg.consolidationPrompt ?? '').trim()
-    const system = customPrompt || DEFAULT_PROMPT
-    const countRule = limitEnabled
-      ? `请输出 JSON：summary、facts（条数由你按重要性决定，最多 ${maxFacts} 条）、可选 event。`
-      : '请输出 JSON：summary、facts（条数由你按重要性自行决定）、可选 event。'
-    const user = [
-      `这是第 ${level} 级记忆整理。本批共 ${items.length} 条记忆。`,
-      countRule,
-      '精简是默认目标：优先保留关键事实、偏好、决定、时间和人名；重复、寒暄和流水账直接丢弃。',
-      '',
-      '【本批记忆】',
-      rendered,
-      relatedText,
-    ].join('\n')
-    const startedAt = Date.now()
-    const response = await this.service.consolidationChat({
-      system,
-      messages: [{ role: 'user', content: user }],
-      maxTokens: level >= 3 ? 4096 : level === 2 ? 3072 : 2048,
-      temperature: 0.2,
-    })
-    const parsed = extractJson(response.text)
-    if (!parsed || typeof parsed !== 'object') {
-      throw new Error(`整理模型未返回可解析 JSON：${String(response.text).slice(0, 200)}`)
-    }
-    return {
-      data: {
-        summary: typeof parsed.summary === 'string' ? parsed.summary : '',
-        facts: Array.isArray(parsed.facts) ? parsed.facts : [],
-        event: parsed.event && typeof parsed.event === 'object' ? parsed.event : null,
-      },
-      latencyMs: response.latencyMs ?? Date.now() - startedAt,
-      raw: response.text,
-      usage: response.usage ?? null,
-      modelSource: response.source ?? '',
-      model: response.model ?? '',
-    }
-  }
-
-  /** 多块结果合并。 */
-  async #mergePartials(partials, stage) {
-    const summaries = partials.map((partial, index) => `## 分块 ${index + 1}\n${JSON.stringify(partial.data)}`).join('\n\n')
-    const startedAt = Date.now()
-    try {
-      const limitEnabled = Number.isFinite(stage?.maxItems)
-      const limitRule = limitEnabled ? `facts 上限 ${Math.max(1, stage.maxItems - 1)}。` : 'facts 条数由你按重要性决定。'
-      const response = await this.service.consolidationChat({
-        system:
-          '你在合并多个记忆整理分块的结果。请合并去重，输出同样格式的严格 JSON：{"summary":"...","facts":[...],"event":{...}}。',
-        messages: [{ role: 'user', content: `${limitRule}\n\n${summaries}` }],
-        maxTokens: 3072,
-        temperature: 0.2,
-      })
-      const parsed = extractJson(response.text)
-      if (!parsed || typeof parsed !== 'object') throw new Error('merge-no-json')
-      return {
-        data: {
-          summary: typeof parsed.summary === 'string' ? parsed.summary : '',
-          facts: Array.isArray(parsed.facts) ? parsed.facts : [],
-          event: parsed.event && typeof parsed.event === 'object' ? parsed.event : null,
-        },
-        latencyMs: response.latencyMs ?? Date.now() - startedAt,
-      }
-    } catch {
-      // 合并失败：简单拼接（去重）
-      const facts = []
-      const seen = new Set()
-      for (const partial of partials) {
-        for (const fact of partial.data.facts ?? []) {
-          const text = String(fact?.text ?? '').trim()
-          if (!text || seen.has(text)) continue
-          seen.add(text)
-          facts.push(fact)
-        }
-      }
-      return {
-        data: {
-          summary: partials.map((partial) => partial.data.summary).filter(Boolean).join('；'),
-          facts,
-          event: null,
-        },
-        latencyMs: 0,
-      }
-    }
-  }
-
-  /** 纯规则压缩（LLM 不可用时的回退）。 */
-  #ruleCompress(chunks, stage) {
-    const maxItems = Number.isFinite(stage?.maxItems) ? Math.max(1, stage.maxItems) : Infinity
-    const facts = []
-    const seen = new Set()
-    for (const chunk of chunks) {
-      for (const item of chunk) {
-        const text = String(item.payload?.text ?? '').trim()
-        if (!text) continue
-        const normalized = text.slice(0, 80)
-        if (seen.has(normalized)) continue
-        seen.add(normalized)
-        facts.push({
-          text,
-          kind: item.payload?.kind === 'summary' || item.payload?.kind === 'event' ? 'note' : (item.payload?.kind ?? 'note'),
-        })
-        if (facts.length >= Math.max(1, maxItems - 1)) break
-      }
-      if (facts.length >= Math.max(1, maxItems - 1)) break
-    }
-    const summary = facts
-      .slice(0, 3)
-      .map((fact) => fact.text.slice(0, 80))
-      .join('；')
-    return {
-      data: {
-        summary: summary ? `规则整理：${summary}` : '',
-        facts,
-        event: null,
-        fallback: true,
-        fallbackReason: 'no-llm',
-      },
-      latencyMs: 0,
-    }
-  }
-}
-// ===== src/lib/sleep.js =====
+// ===== src/lib/entry/sleep-controller.js =====
 /**
  * 睡眠控制器（v0.4）。
  *
@@ -3777,9 +4388,6 @@ class ConsolidationEngine {
 
 
 
-/** 睡眠/唤醒期间使用的上下文注入消息 source kind。 */
-const SLEEP_SOURCE = 'dsh-memory-sleep'
-const WAKE_SOURCE = 'dsh-memory-wake'
 
 /** 构造一条 source.kind 为指定值的 user 消息。 */
 function contextMessage(kind, id, text) {
@@ -4125,274 +4733,7 @@ class SleepController {
     }
   }
 }
-// ===== src/lib/capture.js =====
-/**
- * 自动记录：监听 session/event，在每轮结束时把“用户要点 + 助手回答要点”
- * 以及用户图片的一句话概览写入长期记忆。
- *
- * 只记录 source.kind === 'user' 的真实人类消息；插件自己注入的
- * long-term-memory 上下文、运行时上下文、工具结果等一律不记录。
- */
-
-
-/** 从 content blocks 里提取纯文本。 */
-function textFromContent(content) {
-  if (!Array.isArray(content)) return ''
-  const parts = []
-  for (const block of content) {
-    if (!block || typeof block !== 'object') continue
-    if (block.type === 'text' && typeof block.text === 'string') parts.push(block.text)
-  }
-  return cleanText(parts.join('\n'))
-}
-
-class CaptureController {
-  /**
-   * @param {import('./service.js').MemoryService} service
-   */
-  constructor(service) {
-    this.service = service
-    this.ctx = service.ctx
-    this.logger = service.logger
-    /** sessionId -> { turn, users: string[], assistant: string, images: ImageAttachmentRef[], cwd } */
-    this.buffers = new Map()
-  }
-
-  /** 注册事件监听（由插件 effect 持有）。 */
-  start() {
-    this.ctx.effect(
-      () =>
-        this.ctx.on('session/event', (session, event) => {
-          try {
-            this.observe(session, event)
-          } catch (error) {
-            this.logger.warn?.(`[dsh-memory] 记录会话事件失败：${error?.message ?? error}`)
-          }
-        }),
-      'dsh-memory: session capture',
-    )
-    this.ctx.effect(
-      () =>
-        this.ctx.on('session/disposed', (session) => {
-          this.buffers.delete(String(session?.id ?? ''))
-        }),
-      'dsh-memory: capture cleanup',
-    )
-  }
-
-  observe(session, event) {
-    // 睡眠整理期间不记录（避免把 zzzZZ 对话写进长期记忆）
-    if (this.service.sleep?.isSleeping?.()) return
-    const options = this.service.captureOptions()
-    if (!options.autoCapture) return
-    const sessionId = String(session?.id ?? '')
-    if (!sessionId) return
-    const header = session?.header
-    if (!options.includeSubagents && header?.origin === 'subagent') return
-
-    switch (event?.type) {
-      case 'turn/start': {
-        this.buffers.set(sessionId, {
-          turn: Number(event.data?.turn) || 0,
-          users: [],
-          assistant: '',
-          images: [],
-          cwd: String(header?.cwd ?? ''),
-        })
-        break
-      }
-      case 'user/message': {
-        const buffer = this.buffers.get(sessionId)
-        if (!buffer) return
-        const message = event.data
-        if (message?.source?.kind !== 'user') return
-        const text = textFromContent(message?.content)
-        if (text) buffer.users.push(text)
-        if (Array.isArray(message?.content)) {
-          for (const block of message.content) {
-            if (block?.type === 'image' && block.attachment) buffer.images.push(block.attachment)
-          }
-        }
-        break
-      }
-      case 'assistant/message': {
-        const buffer = this.buffers.get(sessionId)
-        if (!buffer) return
-        const text = textFromContent(event.data?.message?.content)
-        if (text) buffer.assistant = text
-        break
-      }
-      case 'turn/end': {
-        const buffer = this.buffers.get(sessionId)
-        this.buffers.delete(sessionId)
-        if (!buffer) return
-        if (buffer.turn !== (Number(event.data?.turn) || 0)) return
-        const reason = event.data?.reason?.kind
-        if (reason !== 'completed') return
-        this.finalize(sessionId, buffer)
-        break
-      }
-      default:
-        break
-    }
-  }
-
-  /** 一轮结束：入队写入任务（不阻塞 agent 回合）。 */
-  finalize(sessionId, buffer) {
-    const service = this.service
-    const options = service.captureOptions()
-    const userText = truncate(cleanText(buffer.users.join('\n\n')), options.captureUserChars)
-    const assistantText = truncate(cleanText(buffer.assistant), options.captureAssistantChars)
-    const summaryLength = (userText + assistantText).length
-    const imageCount = buffer.images.length
-    if (summaryLength >= options.captureMinChars) {
-      service.queue.push(
-        'capture-turn',
-        () =>
-          service.addTurnMemory({
-            userText,
-            assistantText,
-            sessionId,
-            cwd: buffer.cwd,
-            turn: buffer.turn,
-            imageCount,
-          }),
-        { retries: 1 },
-      )
-    }
-    // 图片：每张单独生成概览并写入（同一轮内按 attachmentId 去重）
-    const seen = new Set()
-    for (const ref of buffer.images) {
-      const attachmentId = String(ref?.attachmentId ?? '')
-      if (!attachmentId || seen.has(attachmentId)) continue
-      seen.add(attachmentId)
-      service.queue.push(
-        `capture-image:${attachmentId}`,
-        () =>
-          service.addImageMemory({
-            ref,
-            sessionId,
-            cwd: buffer.cwd,
-            turn: buffer.turn,
-          }),
-        { retries: 0 },
-      )
-    }
-  }
-}
-// ===== src/lib/recall.js =====
-/**
- * 自动召回：在每轮第一步之前，用最后一条真实用户消息做向量检索，
- * 把相关记忆作为一条 source.kind = 'long-term-memory' 的上下文消息
- * 追加进本步的 messages。
- *
- * 该消息会进入会话日志（可回放/可 fork），DSH Web 会把它显示成
- * “上下文注入”行，而不是用户气泡。
- */
-
-
-
-
-/** 从消息列表里取出最后一条真实人类消息的文本。 */
-function lastUserText(messages) {
-  if (!Array.isArray(messages)) return ''
-  for (let index = messages.length - 1; index >= 0; index -= 1) {
-    const message = messages[index]
-    if (!message || message.role !== 'user') continue
-    if (message.source?.kind !== 'user') continue
-    const parts = []
-    for (const block of message.content ?? []) {
-      if (block?.type === 'text' && typeof block.text === 'string') parts.push(block.text)
-    }
-    const text = parts.join('\n').trim()
-    if (text) return text
-  }
-  return ''
-}
-
-/** 构造注入用的上下文消息。 */
-function createMemoryMessage(text) {
-  return {
-    id: `memory-${randomUUID()}`,
-    role: 'user',
-    content: [{ type: 'text', text }],
-    source: { kind: MEMORY_SOURCE },
-  }
-}
-
-class RecallController {
-  /**
-   * @param {import('./service.js').MemoryService} service
-   */
-  constructor(service) {
-    this.service = service
-    this.ctx = service.ctx
-    this.logger = service.logger
-  }
-
-  start() {
-    this.ctx.effect(
-      () =>
-        this.ctx.on('agent/pre-step', async (payload, next) => {
-          const decision = await next()
-          try {
-            return await this.augment(payload, decision)
-          } catch (error) {
-            this.service.stats.lastRecallError = errorText(error)
-            this.service.debugLog(`自动召回失败：${errorText(error)}`)
-            return decision
-          }
-        }),
-      'dsh-memory: auto recall',
-    )
-  }
-
-  async augment(payload, decision) {
-    // 睡眠整理期间：不召回，改为让模型只回复 zzzZZ，并把用户原话排队到睡醒后继续处理
-    const sleep = this.service.sleep
-    if (sleep?.isSleeping?.()) {
-      if (payload?.step !== 1) return decision
-      if (payload?.signal?.aborted) return decision
-      if (decision?.kind !== 'enter') return decision
-      const intercepted = sleep.interceptPreStep(payload, decision)
-      if (intercepted?.message) {
-        return { ...decision, messages: [...decision.messages, intercepted.message] }
-      }
-      return decision
-    }
-    const options = this.service.recallOptions()
-    if (!options.autoRecall) return decision
-    const agentId = String(payload?.agent?.id ?? '')
-    if (!this.service.captureOptions().includeSubagents && agentId) {
-      const session = this.service.ctx.sessions?.get?.(agentId)
-      if (session?.header?.origin === 'subagent') return decision
-    }
-    if (payload?.step !== 1) return decision
-    if (payload?.signal?.aborted) return decision
-    if (decision?.kind !== 'enter') return decision
-    const query = lastUserText(decision.messages) || lastUserText(payload.messages)
-    this.service.stats.recallChecks += 1
-    this.service.stats.lastRecallQuery = query.slice(0, 120)
-    this.service.stats.lastRecallError = ''
-    if (!query || query.length < 2) return decision
-    const context = this.service.sessionContext(agentId)
-    const timeout = AbortSignal.timeout(options.recallTimeoutMs)
-    const signal = payload?.signal === undefined ? timeout : AbortSignal.any([payload.signal, timeout])
-    const { block, hits } = await this.service.recall(query, {
-      signal,
-      sessionId: context.sessionId,
-      cwd: context.cwd,
-    })
-    if (!block || hits.length === 0) return decision
-    this.service.stats.lastRecallInjectAt = Date.now()
-    this.service.debugLog(`自动召回 ${hits.length} 条记忆（score ${hits[0].score.toFixed(3)}）`)
-    return {
-      ...decision,
-      messages: [...decision.messages, createMemoryMessage(block)],
-    }
-  }
-}
-// ===== src/lib/tools.js =====
+// ===== src/lib/entry/tools.js =====
 /**
  * 提供给模型的长期记忆工具：
  * - memory_search：检索长期记忆
@@ -4626,339 +4967,6 @@ function registerMemoryTools(service) {
   return tools.map((tool) =>
     ctx.effect(() => ctx.tools.register(tool), `dsh-memory: tool ${tool.name}`),
   )
-}
-// ===== src/lib/http.js =====
-/**
- * 设置页使用的 Host HTTP 接口（与 DSH Web 同源，仅本机可访问）：
- *
- *   GET  /__dsh_memory__/status              运行状态
- *   GET  /__dsh_memory__/memories?q&limit&offset&kind   记忆列表/检索
- *   GET  /__dsh_memory__/export              导出全部记忆 JSON
- *   POST /__dsh_memory__/test                测试激活 provider（可带 providerId）
- *   POST /__dsh_memory__/memories            手动新增记忆
- *   POST /__dsh_memory__/memories/delete     删除记忆 {ids:[...]}
- *   POST /__dsh_memory__/recreate            重建集合（需要 confirm:"DELETE"）
- *   POST /__dsh_memory__/maintenance         立即执行一次维护
- *   GET  /__dsh_memory__/sleep               睡眠状态 + 整理任务列表摘要
- *   POST /__dsh_memory__/sleep/run           手动触发一次睡眠整理
- *   GET  /__dsh_memory__/consolidation       整理任务列表与历史
- *   GET  /__dsh_memory__/models?providerId=  拉取某个 provider 的模型列表
- *
- * POST 请求要求自定义头 x-dsh-memory: 1，避免跨站请求伪造（跨域预检会拦下）。
- */
-
-
-/** 读取 JSON 请求体（限制大小）。 */
-function readJsonBody(req, limit = 64 * 1024) {
-  return new Promise((resolve, reject) => {
-    let size = 0
-    const chunks = []
-    req.on('data', (chunk) => {
-      size += chunk.length
-      if (size > limit) {
-        reject(new Error('请求体过大'))
-        req.destroy()
-        return
-      }
-      chunks.push(chunk)
-    })
-    req.on('end', () => {
-      if (chunks.length === 0) {
-        resolve(undefined)
-        return
-      }
-      try {
-        resolve(JSON.parse(Buffer.concat(chunks).toString('utf8')))
-      } catch (error) {
-        reject(new Error(`请求体不是合法 JSON：${errorText(error)}`))
-      }
-    })
-    req.on('error', reject)
-  })
-}
-
-/** 统一 JSON 响应。 */
-function respond(res, status, value) {
-  const body = JSON.stringify(value)
-  res.statusCode = status
-  res.setHeader('Content-Type', 'application/json; charset=utf-8')
-  res.setHeader('Cache-Control', 'no-store')
-  res.end(body)
-}
-
-/** 是否是带自定义头的 POST（基础 CSRF 防护）。 */
-function trustedPost(req) {
-  return req.method === 'POST' && req.headers['x-dsh-memory'] === '1'
-}
-
-/** 解析 URL 查询参数。 */
-function parseQuery(req) {
-  try {
-    const url = new URL(String(req.url ?? '/'), 'http://127.0.0.1')
-    return url.searchParams
-  } catch {
-    return new URLSearchParams()
-  }
-}
-
-/**
- * @param {object} ctx DSH 插件上下文
- * @param {import('./service.js').MemoryService} service
- */
-function registerHttpRoutes(ctx, service) {
-  const log = service.logger
-  const statusRoute = {
-    kind: 'exact',
-    path: '/__dsh_memory__/status',
-    handler: async (req, res) => {
-      if (req.method !== 'GET') {
-        respond(res, 405, { ok: false, error: 'method not allowed' })
-        return
-      }
-      try {
-        respond(res, 200, await service.status())
-      } catch (error) {
-        respond(res, 500, { ok: false, error: errorText(error) })
-      }
-    },
-  }
-  const memoriesRoute = {
-    kind: 'exact',
-    path: '/__dsh_memory__/memories',
-    handler: async (req, res) => {
-      try {
-        if (req.method === 'GET') {
-          const query = parseQuery(req)
-          const result = await service.listMemories({
-            query: query.get('q') ?? '',
-            limit: Number(query.get('limit') ?? 20),
-            offset: query.get('offset') ?? null,
-            kind: query.get('kind') ?? '',
-            range: query.get('range') ?? '',
-            level: query.get('level') ?? '',
-            batch: query.get('batch') ?? '',
-          })
-          respond(res, 200, { ok: true, ...result })
-          return
-        }
-        if (!trustedPost(req)) {
-          respond(res, 403, { ok: false, error: 'forbidden' })
-          return
-        }
-        const body = await readJsonBody(req)
-        const text = cleanText(body?.text ?? '')
-        if (!text) {
-          respond(res, 400, { ok: false, error: '缺少要保存的 text' })
-          return
-        }
-        const kind = typeof body?.kind === 'string' && body.kind.trim() ? body.kind.trim() : 'note'
-        const tags = Array.isArray(body?.tags)
-          ? body.tags.filter((tag) => typeof tag === 'string').slice(0, 12)
-          : []
-        const saved = await service.addMemory({ kind, text, meta: { tags, source: 'settings' } })
-        respond(res, 200, { ok: true, item: saved })
-      } catch (error) {
-        respond(res, 500, { ok: false, error: errorText(error) })
-      }
-    },
-  }
-  const memoriesDeleteRoute = {
-    kind: 'exact',
-    path: '/__dsh_memory__/memories/delete',
-    handler: async (req, res) => {
-      if (!trustedPost(req)) {
-        respond(res, 403, { ok: false, error: 'forbidden' })
-        return
-      }
-      try {
-        const body = await readJsonBody(req)
-        const ids = Array.isArray(body?.ids) ? body.ids : body?.id ? [body.id] : []
-        const result = await service.forget(ids)
-        respond(res, 200, result)
-      } catch (error) {
-        respond(res, 400, { ok: false, error: errorText(error) })
-      }
-    },
-  }
-  const exportRoute = {
-    kind: 'exact',
-    path: '/__dsh_memory__/export',
-    handler: async (req, res) => {
-      if (req.method !== 'GET') {
-        respond(res, 405, { ok: false, error: 'method not allowed' })
-        return
-      }
-      try {
-        respond(res, 200, await service.exportMemories())
-      } catch (error) {
-        respond(res, 500, { ok: false, error: errorText(error) })
-      }
-    },
-  }
-  const testRoute = {
-    kind: 'exact',
-    path: '/__dsh_memory__/test',
-    handler: async (req, res) => {
-      if (!trustedPost(req)) {
-        respond(res, 403, { ok: false, error: 'forbidden' })
-        return
-      }
-      try {
-        const body = await readJsonBody(req)
-        respond(res, 200, await service.test(typeof body?.providerId === 'string' ? body.providerId : undefined))
-      } catch (error) {
-        log.warn?.(`[dsh-memory] 连接测试失败：${errorText(error)}`)
-        respond(res, 500, { ok: false, error: errorText(error) })
-      }
-    },
-  }
-  const recreateRoute = {
-    kind: 'exact',
-    path: '/__dsh_memory__/recreate',
-    handler: async (req, res) => {
-      if (!trustedPost(req)) {
-        respond(res, 403, { ok: false, error: 'forbidden' })
-        return
-      }
-      try {
-        const body = await readJsonBody(req)
-        if (body?.confirm !== 'DELETE') {
-          respond(res, 400, { ok: false, error: '需要 confirm: "DELETE" 才能重建集合' })
-          return
-        }
-        const result = await service.recreateCollection()
-        if (!result.ok) {
-          respond(res, 500, { ok: false, error: result.error ?? '重建失败' })
-          return
-        }
-        respond(res, 200, { ok: true, collection: result.info })
-      } catch (error) {
-        log.warn?.(`[dsh-memory] 重建集合失败：${errorText(error)}`)
-        respond(res, 500, { ok: false, error: errorText(error) })
-      }
-    },
-  }
-  const maintenanceRoute = {
-    kind: 'exact',
-    path: '/__dsh_memory__/maintenance',
-    handler: async (req, res) => {
-      if (!trustedPost(req)) {
-        respond(res, 403, { ok: false, error: 'forbidden' })
-        return
-      }
-      try {
-        await readJsonBody(req)
-        respond(res, 200, await service.maintenance({ force: true }))
-      } catch (error) {
-        respond(res, 500, { ok: false, error: errorText(error) })
-      }
-    },
-  }
-  const sleepRoute = {
-    kind: 'exact',
-    path: '/__dsh_memory__/sleep',
-    handler: async (req, res) => {
-      if (req.method !== 'GET') {
-        respond(res, 405, { ok: false, error: 'method not allowed' })
-        return
-      }
-      if (!service.sleep || !service.consolidation) {
-        respond(res, 503, { ok: false, error: '睡眠整理组件未加载' })
-        return
-      }
-      respond(res, 200, {
-        ok: true,
-        sleep: service.sleep.status(),
-        consolidation: service.consolidation.summary(),
-      })
-    },
-  }
-  const sleepRunRoute = {
-    kind: 'exact',
-    path: '/__dsh_memory__/sleep/run',
-    handler: async (req, res) => {
-      if (!trustedPost(req)) {
-        respond(res, 403, { ok: false, error: 'forbidden' })
-        return
-      }
-      if (!service.sleep) {
-        respond(res, 503, { ok: false, error: '睡眠整理组件未加载' })
-        return
-      }
-      try {
-        const body = await readJsonBody(req)
-        if (body?.confirm === 'run') {
-          respond(res, 200, service.sleep.requestManual())
-          return
-        }
-        respond(res, 200, service.sleep.requestManual())
-      } catch (error) {
-        respond(res, 500, { ok: false, error: errorText(error) })
-      }
-    },
-  }
-  const consolidationRoute = {
-    kind: 'exact',
-    path: '/__dsh_memory__/consolidation',
-    handler: async (req, res) => {
-      if (req.method !== 'GET') {
-        respond(res, 405, { ok: false, error: 'method not allowed' })
-        return
-      }
-      if (!service.consolidation) {
-        respond(res, 503, { ok: false, error: '整理引擎未加载' })
-        return
-      }
-      respond(res, 200, { ok: true, ...service.consolidation.summary() })
-    },
-  }
-  const modelsRoute = {
-    kind: 'exact',
-    path: '/__dsh_memory__/models',
-    handler: async (req, res) => {
-      if (req.method !== 'GET') {
-        respond(res, 405, { ok: false, error: 'method not allowed' })
-        return
-      }
-      try {
-        const query = parseQuery(req)
-        respond(res, 200, await service.listProviderModels(query.get('providerId') ?? ''))
-      } catch (error) {
-        respond(res, 500, { ok: false, error: errorText(error) })
-      }
-    },
-  }
-  const dshModelsRoute = {
-    kind: 'exact',
-    path: '/__dsh_memory__/dsh-models',
-    handler: async (req, res) => {
-      if (req.method !== 'GET') {
-        respond(res, 405, { ok: false, error: 'method not allowed' })
-        return
-      }
-      try {
-        respond(res, 200, { ok: true, ...(await service.dshCatalog()) })
-      } catch (error) {
-        respond(res, 500, { ok: false, error: errorText(error) })
-      }
-    },
-  }
-
-  const routes = [
-    statusRoute,
-    memoriesRoute,
-    memoriesDeleteRoute,
-    exportRoute,
-    testRoute,
-    recreateRoute,
-    maintenanceRoute,
-    sleepRoute,
-    sleepRunRoute,
-    consolidationRoute,
-    modelsRoute,
-    dshModelsRoute,
-  ]
-  return routes.map((route) => ctx.effect(() => ctx.webServer.register(route), `dsh-memory: route ${route.path}`))
 }
 // ===== src/index.js =====
 /**

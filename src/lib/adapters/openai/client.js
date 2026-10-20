@@ -5,7 +5,7 @@
  *
  * 不绑定任何特定厂商：Base URL、模型、维度、Key 均由 provider 档案提供。
  */
-import { errorText } from './util.js'
+import { errorText } from '../../util/index.js'
 
 /** 组合外部取消信号与超时。 */
 function combineSignal(signal, timeoutMs) {

@@ -16,7 +16,7 @@
  *
  * POST 请求要求自定义头 x-dsh-memory: 1，避免跨站请求伪造（跨域预检会拦下）。
  */
-import { cleanText, errorText } from './util.js'
+import { cleanText, errorText } from '../../util/index.js'
 
 /** 读取 JSON 请求体（限制大小）。 */
 function readJsonBody(req, limit = 64 * 1024) {
