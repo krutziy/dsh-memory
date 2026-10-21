@@ -198,11 +198,6 @@ const Config = z.object({
     .default(true)
     .volatile()
     .description('每轮开始时自动检索相关长期记忆并注入上下文'),
-  memoryScope: z
-    .union([z.const('global'), z.const('workspace'), z.const('session')])
-    .default('global')
-    .volatile()
-    .description('记忆范围：global=全局共享；workspace=按工作目录隔离；session=按会话隔离'),
   recallTopK: z
     .number()
     .default(3)
@@ -227,11 +222,14 @@ const Config = z.object({
     .max(4000)
     .volatile()
     .description('自动召回内容注入上下文时的最大字符数'),
-  recallIncludeCurrentSession: z
-    .boolean()
-    .default(false)
+  recallMinAgeMinutes: z
+    .number()
+    .default(10)
+    .step(1)
+    .min(0)
+    .max(1440)
     .volatile()
-    .description('自动召回时是否包含当前会话自身的记忆'),
+    .description('自动召回时排除最近 N 分钟内自动记录的对话片段（0=不排除），避免重复注入'),
   recallTimeoutMs: z
     .number()
     .default(3000)
@@ -610,111 +608,6 @@ const Config = z.object({
   // -------------------- 其他 --------------------
   debug: z.boolean().default(false).volatile().description('在 DSH 日志中输出插件调试信息'),
 })
-// ===== src/lib/domain/ids.js =====
-/**
- * 纯 ID 领域逻辑：内容哈希记忆 id、5 位批次号。
- */
-
-
-/** 计算 sha256 十六进制摘要。 */
-function sha256(text) {
-  return createHash('sha256').update(String(text), 'utf8').digest('hex')
-}
-
-/** 由种子生成稳定的 UUID（Qdrant point id 需要 UUID 或整数）。 */
-function memoryPointId(seed) {
-  const h = sha256(seed)
-  return `${h.slice(0, 8)}-${h.slice(8, 12)}-4${h.slice(13, 16)}-a${h.slice(17, 20)}-${h.slice(20, 32)}`
-}
-
-/** 生成一个尚未在 pending 集合里的随机 5 位批次编号。 */
-function nextBatchId(pendingIds) {
-  const taken = pendingIds instanceof Set ? pendingIds : new Set(pendingIds ?? [])
-  for (let attempt = 0; attempt < 500; attempt += 1) {
-    const id = String(10000 + Math.floor(Math.random() * 90000))
-    if (!taken.has(id)) return id
-  }
-  // 极端情况下顺序找空位
-  for (let id = 10000; id <= 99999; id += 1) {
-    const text = String(id)
-    if (!taken.has(text)) return text
-  }
-  return String(Date.now()).slice(-5)
-}
-// ===== src/lib/domain/memory-values.js =====
-/**
- * 记忆的“编码强度”与“可信度”规则（domain，纯函数）。
- * importance：编码时的重要性（显式保存 > 偏好/事实 > 闲聊）
- * confidence：这条信念的可信度（用户明确 > 抽取事实 > 普通对话）
- */
-const IMPORTANCE_BY_KIND = {
-  preference: 0.8,
-  fact: 0.75,
-  project: 0.75,
-  note: 0.6,
-  event: 0.8,
-  summary: 0.65,
-  image: 0.5,
-  turn: 0.4,
-}
-
-const CONFIDENCE_BY_KIND = {
-  preference: 0.8,
-  fact: 0.8,
-  project: 0.75,
-  note: 0.7,
-  event: 0.7,
-  summary: 0.7,
-  image: 0.7,
-  turn: 0.6,
-}
-
-/** 默认重要性（0~1）。 */
-function defaultImportance(kind) {
-  return IMPORTANCE_BY_KIND[String(kind ?? '')] ?? 0.5
-}
-
-/** 默认置信度（0~1）。 */
-function defaultConfidence(kind) {
-  return CONFIDENCE_BY_KIND[String(kind ?? '')] ?? 0.6
-}
-
-/** 把任意值规范到 0~1，非法时回退。 */
-function normalizeUnit(value, fallback) {
-  const n = Number(value)
-  if (!Number.isFinite(n)) return fallback
-  return Math.min(1, Math.max(0, n))
-}
-
-/** 规范 importance（缺省按 kind 推断）。 */
-function normalizeImportance(value, kind) {
-  return normalizeUnit(value, defaultImportance(kind))
-}
-
-/** 规范 confidence（缺省按 kind 推断）。 */
-function normalizeConfidence(value, kind) {
-  return normalizeUnit(value, defaultConfidence(kind))
-}
-
-/** 显式保存的编码强度。 */
-const MANUAL_SAVE = { importance: 1, confidence: 0.9 }
-// ===== src/lib/domain/levels.js =====
-/**
- * 巩固层级定义（domain 常量）：L1 按天、L2 7 天、L3 30 天。
- * 保留条数上限仅在配置开启时使用；模型默认自行决定条数。
- */
-const CONSOLIDATION_LEVELS = [
-  { level: 1, afterDays: 0, maxItemsWhenLimited: 40 },
-  { level: 2, afterDays: 7, maxItemsWhenLimited: 20 },
-  { level: 3, afterDays: 30, maxItemsWhenLimited: 10 },
-]
-
-/** 某级别在开启上限时的输出上限；未开启返回 null。 */
-function levelMaxItems(level, limitEnabled) {
-  if (!limitEnabled) return null
-  const stage = CONSOLIDATION_LEVELS.find((item) => item.level === level)
-  return stage ? stage.maxItemsWhenLimited : null
-}
 // ===== src/lib/domain/time.js =====
 /**
  * 纯时间/时区领域逻辑：不依赖 IO、DSH、Qdrant；所有 "now" 都可显式传入。
@@ -947,6 +840,149 @@ function formatDuration(ms) {
   if (minutes < 60) return `${minutes}m ${seconds}s`
   const hours = Math.floor(minutes / 60)
   return `${hours}h ${minutes % 60}m`
+}
+// ===== src/lib/domain/fragments.js =====
+/**
+ * 记忆片段 / 整理队列的纯领域逻辑（不依赖 IO、DSH、Qdrant）：
+ * 层级、批次状态、周/月时间窗、5 位批次编号分配。
+ *
+ * 设计见 docs/QUEUE.md：事件 = 会话 × 日期；L1 事件片段 → L2 周片段 → L3 长期片段。
+ */
+
+
+/** 片段层级（0 原始 → 1 事件 → 2 周 → 3 长期）。 */
+const FRAGMENT_LEVELS = [
+  { level: 0, key: 'raw', afterDays: 0 },
+  { level: 1, key: 'event', afterDays: 7 },
+  { level: 2, key: 'week', afterDays: 30 },
+  { level: 3, key: 'longterm', afterDays: 0 },
+]
+
+/** 批次状态。 */
+const BATCH_STATUS = {
+  COLLECTING: 'collecting',
+  SEALED: 'sealed',
+  RUNNING: 'running',
+  WAITING: 'waiting',
+  FAILED: 'failed',
+  MERGED: 'merged',
+  FINAL: 'final',
+}
+
+/** 仍然占用编号、出现在“待整理队列”里的状态。 */
+const ACTIVE_BATCH_STATUSES = new Set([
+  BATCH_STATUS.COLLECTING,
+  BATCH_STATUS.SEALED,
+  BATCH_STATUS.RUNNING,
+  BATCH_STATUS.WAITING,
+  BATCH_STATUS.FAILED,
+])
+
+/** 终态：不再压缩，编号已回收。 */
+const TERMINAL_BATCH_STATUSES = new Set([BATCH_STATUS.MERGED, BATCH_STATUS.FINAL])
+
+/** 是否活跃批次（占用编号）。 */
+function isActiveBatch(batch) {
+  return Boolean(batch) && ACTIVE_BATCH_STATUSES.has(batch.status)
+}
+
+/** 数字补零。 */
+function pad(value, width = 2) {
+  return String(value).padStart(width, '0')
+}
+
+/** 解析 YYYY-MM-DD 为 UTC 日期对象（用于纯日期运算）。 */
+function dateFromDayKey(dayKey) {
+  const [year, month, day] = String(dayKey).split('-').map(Number)
+  return new Date(Date.UTC(year, month - 1, day))
+}
+
+/** dayKey 所在周的周一（ISO 周，周一为一周开始）。 */
+function weekKeyOf(dayKey) {
+  const date = dateFromDayKey(dayKey)
+  const weekday = (date.getUTCDay() + 6) % 7
+  date.setUTCDate(date.getUTCDate() - weekday)
+  return `${date.getUTCFullYear()}-${pad(date.getUTCMonth() + 1)}-${pad(date.getUTCDate())}`
+}
+
+/** 周所属月份（该周周一的月份，YYYY-MM）。 */
+function monthKeyOfWeek(weekKey) {
+  return String(weekKey).slice(0, 7)
+}
+
+/** 周起点（周一 00:00，用户时区）。 */
+function weekStartMs(weekKey, timeZone) {
+  return dayBoundsFromKey(weekKey, timeZone).from
+}
+
+/** 周终点（周日 23:59:59.999，用户时区）。 */
+function weekEndMs(weekKey, timeZone) {
+  return dayBoundsFromKey(shiftDayKey(weekKey, 6), timeZone).to
+}
+
+/** 月起点（一号 00:00，用户时区）。 */
+function monthStartMs(monthKey, timeZone) {
+  return dayBoundsFromKey(`${monthKey}-01`, timeZone).from
+}
+
+/** 月终点（月末 23:59:59.999，用户时区）。 */
+function monthEndMs(monthKey, timeZone) {
+  const [year, month] = String(monthKey).split('-').map(Number)
+  const next = new Date(Date.UTC(year, month, 1))
+  const nextKey = `${next.getUTCFullYear()}-${pad(next.getUTCMonth() + 1)}-01`
+  return dayBoundsFromKey(nextKey, timeZone).from - 1
+}
+
+/** 事件批次稳定键：`2026-10-21#01`；`#misc` 表示手动/无会话片段。 */
+function eventBatchKey(dayKey, seq) {
+  if (seq === 'misc') return `${dayKey}#misc`
+  return `${dayKey}#${pad(seq)}`
+}
+
+/** 5 位编号范围（沿用旧编号空间，便于迁移）。 */
+const BATCH_NO_MIN = 10000
+const BATCH_NO_MAX = 99999
+
+/**
+ * 顺序分配一个未占用的 5 位编号（用完回绕，长期运行不会耗尽）。
+ * @param {Set<string>|string[]} activeNos 当前占用中的编号
+ * @param {number} lastNo 上次分配的数值
+ * @returns {{no:string,lastNo:number}} 没有空位时 no 为空字符串
+ */
+function allocateBatchNo(activeNos, lastNo) {
+  const taken = activeNos instanceof Set ? activeNos : new Set(activeNos ?? [])
+  let cursor = Number(lastNo) || 0
+  if (!Number.isFinite(cursor) || cursor < BATCH_NO_MIN - 1 || cursor > BATCH_NO_MAX) cursor = BATCH_NO_MIN - 1
+  const total = BATCH_NO_MAX - BATCH_NO_MIN + 1
+  for (let index = 0; index < total; index += 1) {
+    cursor = cursor >= BATCH_NO_MAX ? BATCH_NO_MIN : cursor + 1
+    const no = String(cursor)
+    if (!taken.has(no)) return { no, lastNo: cursor }
+  }
+  return { no: '', lastNo: cursor }
+}
+
+/** 编号显示（补足 5 位；非法值返回空串）。 */
+function formatBatchNo(no) {
+  const text = String(no ?? '').trim()
+  return /^\d{1,5}$/.test(text) ? text.padStart(5, '0') : ''
+}
+// ===== src/lib/domain/levels.js =====
+/**
+ * 巩固层级定义（domain 常量）：L1 按天、L2 7 天、L3 30 天。
+ * 保留条数上限仅在配置开启时使用；模型默认自行决定条数。
+ */
+const CONSOLIDATION_LEVELS = [
+  { level: 1, afterDays: 0, maxItemsWhenLimited: 40 },
+  { level: 2, afterDays: 7, maxItemsWhenLimited: 20 },
+  { level: 3, afterDays: 30, maxItemsWhenLimited: 10 },
+]
+
+/** 某级别在开启上限时的输出上限；未开启返回 null。 */
+function levelMaxItems(level, limitEnabled) {
+  if (!limitEnabled) return null
+  const stage = CONSOLIDATION_LEVELS.find((item) => item.level === level)
+  return stage ? stage.maxItemsWhenLimited : null
 }
 // ===== src/lib/util/index.js =====
 /**
@@ -1227,15 +1263,14 @@ function renderMemoryLines(items, maxChars, formatter) {
 }
 // ===== src/lib/app/consolidation-service.js =====
 /**
- * 睡眠整理引擎（v0.4）。
+ * 睡眠整理引擎（v0.8「记忆片段」）：
  *
- * 把记忆压缩成“批次”，用任务列表调度多级压缩：
- *   L1：每天把原始记忆（level=0）压缩成一个 5 位编号的批次（保留多少条由模型按重要性决定）
- *   L2：L1 批次创建 7 天后，再压缩为 L2 批次（L1 原文删除）
- *   L3：L2 批次创建 30 天后，再压缩为 L3 批次（最终长期摘要）
+ * 队列（app/queue-service.js）负责记录批次状态与编号；本引擎负责在睡眠窗口里执行压缩：
+ *   L1：事件批次（会话 × 日期）→ 事件片段；
+ *   L2：到期（周末后 level2AfterDays 天）的多个事件批次按周合并 → 周片段（N:1）；
+ *   L3：到期（月末后 level3AfterDays 天）的多个周批次按月合并 → 长期片段（N:1，final，不再带编号）。
  *
- * 任务列表持久化在 $DSH_HOME/storages/dsh-memory/consolidation.json，
- * 批次编号是随机 5 位数；只要求“待处理/处理中”的编号唯一，完成后的编号可回收复用。
+ * 编号只存在于批次等待/执行期间；终态（merged/final）后回收，记忆 payload 的 batch 清空。
  *
  * 实验功能（默认关闭）：
  * - 事件合并：整理时用嵌入向量在全库检索相似记忆，只把相关小簇作为参考交给 LLM，
@@ -1247,12 +1282,6 @@ function renderMemoryLines(items, maxChars, formatter) {
 
 
 
-
-
-
-
-/** 整理状态文件版本。 */
-const STATE_VERSION = 1
 
 /** 内置整理提示词。 */
 const DEFAULT_PROMPT = [
@@ -1267,41 +1296,40 @@ const DEFAULT_PROMPT = [
   '- summary 与 facts 用中文（除非原文主要是其他语言）。',
 ].join('\n')
 
-/** 一个批次的简易视图（给状态/历史用）。 */
-function batchView(batch) {
+/** 不同层级的整理提示（追加在用户消息里）。 */
+const LEVEL_HINTS = {
+  1: '本批是**同一次会话在同一天**内留下的片段，请合并成一个事件片段：保留这次经历的来龙去脉、决定和结论，细节可以压缩。',
+  2: '本批是**同一周内多个事件**的片段，请合并成更少、更抽象的周片段：优先保留重要事实、偏好、决定、人物和项目；重复与琐碎细节丢弃。',
+  3: '本批是**同一月内多个周片段**，请合并成长期记忆要点：只保留长期有用的事实、偏好、身份与重要经历，细节可以大量丢弃。',
+}
+
+/** 一个批次的对外视图（运行结果用）。 */
+function outcomeView(batch, error, inputCount, outputCount) {
   return {
-    id: batch.id,
-    level: batch.level,
-    status: batch.status,
-    createdAt: batch.createdAt,
-    dueAt: batch.dueAt,
-    sourceCount: batch.inputCount ?? 0,
-    outputCount: batch.outputCount ?? 0,
-    dayKey: batch.dayKey ?? '',
-    sourceBatchIds: batch.sourceBatchIds ?? [],
-    error: batch.error ?? null,
+    key: batch?.key ?? '',
+    no: batch?.no ?? '',
+    level: batch?.level ?? 0,
+    status: batch?.status ?? '',
+    dayKey: batch?.dayKey ?? '',
+    weekKey: batch?.weekKey ?? '',
+    monthKey: batch?.monthKey ?? '',
+    sourceCount: inputCount ?? batch?.inputCount ?? 0,
+    outputCount: outputCount ?? batch?.outputCount ?? 0,
+    error: error ? errorText(error) : null,
   }
 }
 
 class ConsolidationEngine {
-  /**
-   * @param {import('./service.js').MemoryService} service
-   */
+  /** @param {import('./memory-service.js').MemoryService} service */
   constructor(service) {
     this.service = service
-    this.ctx = service.ctx
+    this.queue = service.taskBoard
     this.logger = service.logger
-    this.statePath = join(dshHome(), 'storages', 'dsh-memory', 'consolidation.json')
-    this.state = { version: STATE_VERSION, batches: [], history: [], lastRun: null }
-    this.loaded = false
     this.running = null
   }
 
-  /** 配置级别定义（level1 为每日原始记忆压缩，level2/3 为后续批次压缩）。 */
+  /** 配置级别定义（只在开启「限制每级整理条数」时套用输出上限）。 */
   stages() {
-    // 默认不限制输出条数，由整理模型按内容重要性自行决定；
-    // 只有在设置页显式开启「限制每级整理条数」时才套用内部安全上限。
-    // 7 天 / 30 天的触发间隔是固定的整理节奏，未来要扩展更多级只需在数组里追加。
     const limitEnabled = this.service.cfg().consolidationLimitItems === true
     return CONSOLIDATION_LEVELS.map((stage) => ({
       level: stage.level,
@@ -1310,94 +1338,26 @@ class ConsolidationEngine {
     }))
   }
 
-  stage(level) {
-    return this.stages().find((item) => item.level === level) ?? null
-  }
-
-  nextStage(level) {
-    return this.stages().find((item) => item.level === level + 1) ?? null
-  }
-
-  // ------------------------------------------------------------------
-  // 任务列表持久化
-  // ------------------------------------------------------------------
-
+  /** 兼容旧调用：保证队列已加载。 */
   async load() {
-    if (this.loaded) return this.state
-    const data = readJsonFile(this.statePath, null)
-    if (data && typeof data === 'object' && Array.isArray(data.batches)) {
-      this.state = {
-        version: STATE_VERSION,
-        batches: data.batches,
-        history: Array.isArray(data.history) ? data.history : [],
-        lastRun: data.lastRun ?? null,
-      }
-    }
-    this.loaded = true
-    return this.state
+    return this.queue.load()
   }
-
-  async save() {
-    // 只保留最近 600 个批次与 40 条历史，避免状态文件无限膨胀
-    if (this.state.batches.length > 600) {
-      const finished = this.state.batches.filter((b) => b.status !== 'pending' && b.status !== 'processing')
-      const active = this.state.batches.filter((b) => b.status === 'pending' || b.status === 'processing')
-      const keepFinished = finished.slice(-Math.max(0, 600 - active.length))
-      this.state.batches = [...keepFinished, ...active].sort((a, b) => a.createdAt - b.createdAt)
-    }
-    if (this.state.history.length > 40) this.state.history = this.state.history.slice(-40)
-    writeJsonFileAtomic(this.statePath, this.state)
-  }
-
-  /** 待处理/处理中批次占用的编号集合。 */
-  pendingIds() {
-    return new Set(
-      this.state.batches
-        .filter((batch) => batch.status === 'pending' || batch.status === 'processing')
-        .map((batch) => String(batch.id)),
-    )
-  }
-
-  batchById(id) {
-    return this.state.batches.find((batch) => String(batch.id) === String(id)) ?? null
-  }
-
-  /** 状态/历史摘要。 */
-  summary() {
-    const batches = this.state.batches ?? []
-    const pending = batches.filter((batch) => batch.status === 'pending' || batch.status === 'processing')
-    const byLevel = {}
-    for (const batch of pending) byLevel[batch.level] = (byLevel[batch.level] ?? 0) + 1
-    const nextDue = pending
-      .filter((batch) => Number.isFinite(batch.dueAt))
-      .sort((a, b) => a.dueAt - b.dueAt)[0]
-    return {
-      enabled: this.service.cfg().consolidationEnabled === true,
-      pendingTotal: pending.length,
-      pendingByLevel: byLevel,
-      nextDueAt: nextDue?.dueAt ?? null,
-      nextDueTime: nextDue?.dueAt ? this.service.formatTs(nextDue.dueAt) : '',
-      batches: batches.slice(-15).map(batchView),
-      history: (this.state.history ?? []).slice(-6).map((entry) => ({
-        at: entry.at,
-        time: entry.at ? this.service.formatTs(entry.at) : '',
-        manual: entry.manual === true,
-        durationMs: entry.durationMs ?? 0,
-        levels: entry.levels ?? {},
-        errors: entry.errors ?? [],
-      })),
-      lastRun: this.state.lastRun,
-      statePath: this.statePath,
-    }
-  }
-
-  // ------------------------------------------------------------------
-  // 运行整理
-  // ------------------------------------------------------------------
 
   /** 是否正在整理。 */
   get busy() {
     return this.running !== null
+  }
+
+  /** 队列摘要（旧接口名保留，设置页继续用它）。 */
+  summary() {
+    return this.queue.summary()
+  }
+
+  /** 当前各层级活跃批次数量（旧接口名保留）。 */
+  summaryLevels() {
+    const counts = {}
+    for (const batch of this.queue.activeBatches()) counts[batch.level] = (counts[batch.level] ?? 0) + 1
+    return counts
   }
 
   /**
@@ -1405,12 +1365,11 @@ class ConsolidationEngine {
    * @param {{manual?:boolean, reason?:string}} options
    */
   async run(options = {}) {
-    await this.load()
+    await this.queue.load()
     if (this.running) return this.running
-    this.running = this.#runInner({ manual: options.manual === true, reason: options.reason ?? 'sleep' })
-      .finally(() => {
-        this.running = null
-      })
+    this.running = this.#runInner({ manual: options.manual === true, reason: options.reason ?? 'sleep' }).finally(() => {
+      this.running = null
+    })
     return this.running
   }
 
@@ -1419,7 +1378,6 @@ class ConsolidationEngine {
     const cfg = this.service.cfg()
     const tz = this.service.timeOptions().timeZone
     const today = dayKey(Date.now(), tz)
-    const stages = this.stages()
     const result = {
       ok: true,
       manual,
@@ -1433,88 +1391,58 @@ class ConsolidationEngine {
       errors: [],
       maintenance: null,
     }
-
     try {
       await this.service.ensureReady()
 
-      // ---------- L1：把“今天之前”的原始记忆按天压缩 ----------
-      const raw = await this.service.collectMemories({
-        filter: { must: [{ key: 'level', match: { value: 0 } }] },
-        withVector: cfg.experimentalEventMergeEnabled === true,
-        maxItems: 5000,
-        orderBy: { key: 'ts', direction: 'asc' },
-      })
-      const byDay = new Map()
-      for (const item of raw) {
-        const key = dayKey(Number(item.payload?.ts) || 0, tz)
-        if (key >= today) continue
-        if (!byDay.has(key)) byDay.set(key, [])
-        byDay.get(key).push(item)
-      }
-      const dayKeys = [...byDay.keys()].sort()
-      for (const key of dayKeys) {
-        const items = byDay.get(key)
-        const stage1 = stages.find((item) => item.level === 1)
-        const outcome = await this.#compress({
-          level: 1,
-          stage: stage1,
-          sources: items,
-          dayKey: key,
-          sourceBatchIds: [],
-          meta: { dayRange: dayBoundsFromKey(key, tz) },
+      // ---------- 0. 把“没有批次”的原始片段按天归入杂项批次 ----------
+      try {
+        const loose = await this.service.collectMemories({
+          filter: { must: [{ key: 'level', match: { value: 0 } }, { key: 'batch', match: { value: '' } }] },
+          withVector: false,
+          maxItems: 5000,
+          orderBy: { key: 'ts', direction: 'asc' },
         })
-        result.batches.push(outcome.view)
-        if (outcome.error) result.errors.push(outcome.error)
-        this.#mergeLevelStats(result, 1, outcome)
-      }
-
-      // ---------- L2/L3：处理到期批次 ----------
-      for (const stage of stages.filter((item) => item.level >= 2)) {
-        const due = this.state.batches
-          .filter(
-            (batch) =>
-              batch.level === stage.level - 1 &&
-              batch.status === 'pending' &&
-              Number(batch.dueAt) > 0 &&
-              Number(batch.dueAt) <= Date.now(),
-          )
-          .sort((a, b) => a.dueAt - b.dueAt)
-        for (const sourceBatch of due) {
-          const sources = await this.service.collectBatchMemories(sourceBatch.id, {
-            withVector: cfg.experimentalEventMergeEnabled === true,
-            maxItems: 5000,
-          })
-          if (sources.length === 0) {
-            sourceBatch.status = 'done'
-            sourceBatch.updatedAt = Date.now()
-            sourceBatch.error = 'empty-batch'
-            await this.save()
-            continue
-          }
-          const outcome = await this.#compress({
-            level: stage.level,
-            stage,
-            sources,
-            dayKey: sourceBatch.dayKey ?? '',
-            sourceBatchIds: [sourceBatch.id],
-            meta: { dayRange: sourceBatch.dayRange ?? null },
-          })
-          result.batches.push(outcome.view)
-          if (outcome.error) result.errors.push(outcome.error)
-          this.#mergeLevelStats(result, stage.level, outcome)
-          if (!outcome.error) {
-            sourceBatch.status = 'done'
-            sourceBatch.updatedAt = Date.now()
-            sourceBatch.outputBatchId = outcome.view.id
-          } else {
-            sourceBatch.attempts = (sourceBatch.attempts ?? 0) + 1
-            sourceBatch.error = outcome.error
-          }
-          await this.save()
+        const days = new Set()
+        for (const item of loose) {
+          const key = dayKey(Number(item.payload?.ts) || 0, tz)
+          if (key < today) days.add(key)
         }
+        for (const key of days) await this.queue.ensureMiscBatch(key)
+        if (days.size > 0) {
+          await this.queue.save()
+          this.service.debugLog(`[dsh-memory] 为 ${days.size} 天的无批次原始片段建立杂项批次`)
+        }
+      } catch (error) {
+        result.errors.push(`misc-batch: ${errorText(error)}`)
       }
 
-      // ---------- 增强记忆到期清理 ----------
+      // ---------- 1. 封批：今天之前的收集中的事件批次 ----------
+      const sealed = this.queue.sealCollecting(today)
+      if (sealed > 0) await this.queue.save()
+
+      // ---------- 2. L1：事件批次 → 事件片段 ----------
+      const l1Candidates = this.queue.state.batches
+        .filter(
+          (batch) =>
+            Number(batch.level) === 1 &&
+            (batch.status === BATCH_STATUS.SEALED || batch.status === BATCH_STATUS.FAILED),
+        )
+        .sort((a, b) => (a.createdAt ?? 0) - (b.createdAt ?? 0))
+      for (const batch of l1Candidates) {
+        const outcome = await this.#processL1(batch)
+        result.batches.push(outcome.view)
+        this.#mergeStats(result, 1, outcome)
+        if (outcome.error) result.errors.push(outcome.error)
+        await this.queue.save()
+      }
+
+      // ---------- 3. L2：到期事件批次按周 N:1 合并 ----------
+      await this.#runMergeLevel({ level: 2, tz, cfg, result })
+
+      // ---------- 4. L3：到期周批次按月 N:1 合并（final） ----------
+      await this.#runMergeLevel({ level: 3, tz, cfg, result })
+
+      // ---------- 5. 增强记忆到期清理 ----------
       try {
         const expired = await this.service.listExpiredEnhanced(Date.now())
         if (expired.length > 0) {
@@ -1525,7 +1453,7 @@ class ConsolidationEngine {
         result.errors.push(`enhanced-expiry: ${errorText(error)}`)
       }
 
-      // ---------- 整理后自动维护（去重/过期/索引） ----------
+      // ---------- 6. 整理后自动维护（去重/过期/索引） ----------
       try {
         result.maintenance = await this.service.maintenance({ force: false })
       } catch (error) {
@@ -1539,266 +1467,227 @@ class ConsolidationEngine {
     result.finishedAt = Date.now()
     result.durationMs = result.finishedAt - startedAt
     result.ok = result.ok && result.errors.length === 0
-    this.state.lastRun = {
-      at: result.finishedAt,
-      manual,
-      durationMs: result.durationMs,
-      ok: result.ok,
-      levels: result.levels,
-      deleted: result.deleted,
-      errors: result.errors,
+    try {
+      await this.queue.recordRun(result)
+    } catch (error) {
+      this.logger.warn?.(`[dsh-memory] 保存整理历史失败：${errorText(error)}`)
     }
-    this.state.history.push({
-      at: result.startedAt,
-      manual,
-      durationMs: result.durationMs,
-      levels: result.levels,
-      currentLevels: this.summaryLevels(),
-      errors: result.errors,
-    })
-    await this.save()
     const levelText = Object.entries(result.levels)
       .map(([level, stat]) => `L${level}:${stat.batches}批/${stat.input}→${stat.output}`)
       .join(' ')
-    this.service.debugLog(`睡眠整理完成 ${formatDuration(result.durationMs)} ${levelText} 删除原文 ${result.deleted} 条`)
+    this.service.debugLog(`睡眠整理完成 ${formatDuration(result.durationMs)} ${levelText} 删除旧片段 ${result.deleted} 条`)
     return result
   }
 
-  summaryLevels() {
-    const counts = {}
-    for (const batch of this.state.batches) counts[batch.level] = (counts[batch.level] ?? 0) + 1
-    return counts
-  }
-
-  #mergeLevelStats(result, level, outcome) {
-    if (!result.levels[level]) result.levels[level] = { batches: 0, input: 0, output: 0 }
-    result.levels[level].batches += 1
-    result.levels[level].input += outcome.inputCount ?? 0
-    result.levels[level].output += outcome.outputCount ?? 0
-    result.deleted += outcome.deleted ?? 0
-  }
-
-  /**
-   * 压缩一个批次：调 LLM（或规则回退）生成摘要+事实，写入新记忆，删除原文，登记任务。
-   */
-  async #compress({ level, stage, sources, dayKey: key, sourceBatchIds, meta }) {
-    const cfg = this.service.cfg()
-    const nextStage = this.nextStage(level)
-    const batchId = nextBatchId(this.pendingIds())
-    const cleanSources = (sources ?? []).filter((item) => item.payload?.text)
-    const inputCount = cleanSources.length
-    const emptyView = {
-      id: batchId,
-      level,
-      status: nextStage ? 'pending' : 'final',
-      createdAt: Date.now(),
-      dueAt: nextStage ? Date.now() + nextStage.afterDays * 86400000 : null,
-      sourceCount: inputCount,
-      outputCount: 0,
-      sourceBatchIds,
-      dayKey: key || '',
-      error: 'no-source',
+  /** 执行某一层的 N:1 合并（L2 按周、L3 按月）。 */
+  async #runMergeLevel({ level, tz, cfg, result }) {
+    const groups = this.queue.dueGroups(level - 1, Date.now())
+    if (groups.size === 0) return
+    // 合并产物的“下一层等待天数”：L2 等到月末后 level3AfterDays 再合并成长期；
+    // L3 是最终层，不再等待。
+    const afterDays = level === 2 ? Math.max(1, Number(cfg.level3AfterDays) || 30) : 0
+    for (const [groupKey, sourceBatches] of groups) {
+      const outcome = await this.#mergeGroup({ level, groupKey, sourceBatches, afterDays, tz })
+      result.batches.push(outcome.view)
+      this.#mergeStats(result, level, outcome)
+      if (outcome.error) result.errors.push(outcome.error)
+      await this.queue.save()
     }
-    if (inputCount === 0) return { view: emptyView, inputCount: 0, outputCount: 0, deleted: 0, error: null }
+  }
 
+  /** 处理一个 L1 事件批次。 */
+  async #processL1(batch) {
     try {
-      // ---------- 实验：事件合并（只取相似记忆作为参考） ----------
-      let related = []
-      if (cfg.experimentalEventMergeEnabled === true) {
-        related = await this.#findRelated(cleanSources)
+      this.queue.markRunning(batch)
+      const tz = this.service.timeOptions().timeZone
+      const cfg = this.service.cfg()
+      const sources = await this.#collectL1Sources(batch, tz)
+      const inputCount = sources.length
+      if (inputCount === 0) {
+        this.queue.markMerged(batch)
+        batch.inputCount = 0
+        batch.outputCount = 0
+        return { view: outcomeView(batch, null, 0, 0), inputCount: 0, outputCount: 0, deleted: 0 }
       }
-
-      // ---------- LLM / 规则压缩 ----------
-      const rendered = this.#renderSources(cleanSources, level)
-      const chunks = chunkByChars(cleanSources, Math.max(1000, Number(cfg.consolidationInputMaxChars) || 12000))
-      let combined = null
-      let llmCalls = 0
-      let latencyMs = 0
-      try {
-        const partials = []
-        for (const chunk of chunks) {
-          const partial = await this.#callLLM({
-            level,
-            stage,
-            items: chunk,
-            rendered: this.#renderSources(chunk, level),
-            related,
-            isFirst: partials.length === 0,
-          })
-          partials.push(partial)
-          llmCalls += 1
-          latencyMs += partial.latencyMs ?? 0
-        }
-        combined = partials.length === 1 ? partials[0].data : await this.#mergePartials(partials, stage)
-        if (partials.length > 1) {
-          llmCalls += 1
-          latencyMs += combined?.latencyMs ?? 0
-        }
-      } catch (error) {
-        // 回退：纯规则压缩（保证睡眠不中断；内容可能粗糙）
-        this.service.debugLog(`整理 LLM 不可用，回退规则压缩：${errorText(error)}`)
-        combined = this.#ruleCompress(chunks, stage)
-        combined = combined.data
-        combined.fallback = true
-        combined.fallbackReason = errorText(error)
-      }
-
-      const summary = String(combined?.summary ?? '').trim()
-      const facts = Array.isArray(combined?.facts) ? combined.facts : []
-      const event = combined?.event && typeof combined.event === 'object' ? combined.event : null
-
-      // 默认保留条数由模型决定；只有开启「限制每级整理条数」时才截断。
-      const limitEnabled = Number.isFinite(stage.maxItems)
-      const maxItems = limitEnabled ? Math.max(1, stage.maxItems) : null
-      const factLimit = limitEnabled ? Math.max(0, maxItems - (summary ? 1 : 0)) : Infinity
-      const selectedFacts = facts
-        .filter((fact) => fact && typeof fact.text === 'string' && fact.text.trim())
-        .slice(0, factLimit)
-        .map((fact) => ({
-          text: String(fact.text).trim(),
-          kind: ['fact', 'preference', 'project', 'note', 'event'].includes(fact.kind) ? fact.kind : 'fact',
-          tags: Array.isArray(fact.tags) ? fact.tags.map(String).slice(0, 8) : [],
-        }))
-
-      const entries = []
-      if (summary) entries.push({ text: summary, kind: 'summary', tags: ['summary'] })
-      for (const fact of selectedFacts) entries.push(fact)
-      if (entries.length === 0) entries.push({ text: rendered.slice(0, Math.max(80, Math.min(400, rendered.length))), kind: 'note', tags: ['fallback'] })
-      const eventText = event?.summary && String(event.summary).trim()
-        ? String(event.summary).trim()
-        : related.length > 0
-          ? `相关事件：${summary || related[0].text}`.slice(0, 500)
-          : ''
-      if (eventText) {
-        entries.push({
-          text: eventText,
-          kind: 'event',
-          tags: Array.isArray(event?.tags) ? event.tags.map(String).slice(0, 8) : ['event'],
-        })
-      }
-
-      // 压缩比统计：输入条数 → 输出条数（source 删除，目标比例仅作为提示）
-      const now = Date.now()
-      const sourceIds = cleanSources.map((item) => item.id)
-      const avgValue = (pick) => {
-        const values = cleanSources
-          .map((item) => Number(pick(item.payload ?? {})))
-          .filter((value) => Number.isFinite(value))
-        if (values.length === 0) return null
-        return values.reduce((sum, value) => sum + value, 0) / values.length
-      }
-      const importanceAvg = avgValue((payload) => normalizeImportance(payload.importance, payload.kind))
-      const confidenceAvg = avgValue((payload) => normalizeConfidence(payload.confidence, payload.kind))
-      const sourceTimes = cleanSources
-        .map((item) => Number(item.payload?.anchorTs) || Number(item.payload?.ts) || 0)
-        .filter((value) => value > 0)
-      const anchorTs = Number(meta?.dayRange?.from) || (sourceTimes.length > 0 ? Math.min(...sourceTimes) : now)
-      const baseMeta = {
-        level,
-        batch: batchId,
-        batchCreatedAt: now,
-        sourceCount: inputCount,
-        sourceBatchIds,
-        dayRange: meta?.dayRange ?? null,
-        consolidatedAt: now,
-        relatedCount: related.length,
+      const dayRange = batch.dayKey ? dayBoundsFromKey(batch.dayKey, tz) : null
+      const anchorTs =
+        dayRange?.from ?? (Number(sources[0]?.payload?.anchorTs) || Number(sources[0]?.payload?.ts) || Date.now())
+      const compressed = await this.#compressGroup({
+        level: 1,
+        sources,
+        related: cfg.experimentalEventMergeEnabled === true,
+      })
+      const written = await this.#writeOutputs({
+        entries: compressed.entries,
+        level: 1,
+        batchNo: batch.no,
+        batchKey: batch.key,
         anchorTs,
-        importance: importanceAvg === null ? undefined : Number(importanceAvg.toFixed(3)),
-        confidence: confidenceAvg === null ? undefined : Number(confidenceAvg.toFixed(3)),
-      }
-
-      const written = []
-      try {
-        for (const [index, entry] of entries.entries()) {
-          const saved = await this.service.addMemory({
-            kind: entry.kind === 'summary' ? 'summary' : entry.kind,
-            text: entry.text,
-            meta: {
-              ...baseMeta,
-              tags: entry.tags,
-              // 批次内唯一：避免整理产物的内容哈希与原文（或彼此）相同，
-              // 导致“先写入、再删除原文”把新产物一起删掉。
-              idSeed: `sleep-${batchId}-${index}`,
-            },
-          })
-          written.push(saved)
-        }
-        // 实验：增强记忆副本（不进入整理链，仅事件/按需召回使用）
-        if (cfg.experimentalEnhancementEnabled === true && level === 1) {
-          const days = Math.max(1, Number(cfg.experimentalEnhancementDays) || 7)
-          for (const saved of written) {
+        range: dayRange,
+        inputCount,
+        relatedCount: compressed.relatedCount,
+      })
+      const sourceIds = sources.map((item) => item.id)
+      const deleted = await this.service.deleteMemoryIds(sourceIds)
+      // 实验：增强记忆副本（不进入整理链，不占编号，仅事件/按需召回使用）
+      if (cfg.experimentalEnhancementEnabled === true) {
+        const days = Math.max(1, Number(cfg.experimentalEnhancementDays) || 7)
+        for (const saved of written) {
+          try {
             await this.service.addMemory({
               kind: saved.kind ?? 'summary',
               text: `（增强记忆）${saved.text}`,
               meta: {
                 level: 1,
+                batch: '',
                 enhanced: true,
-                expiresAt: now + days * 86400000,
+                expiresAt: Date.now() + days * 86400000,
                 sourceCount: inputCount,
-                sourceBatchIds,
-                consolidatedAt: now,
-                idSeed: `enhanced-${batchId}`,
+                consolidatedAt: Date.now(),
+                idSeed: `enhanced-${batch.key}`,
               },
             })
+          } catch {
+            /* 增强记忆失败不影响主链路 */
           }
         }
-      } catch (error) {
-        return {
-          view: { ...emptyView, error: `write-failed: ${errorText(error)}` },
-          inputCount,
-          outputCount: 0,
-          deleted: 0,
-          error: `write-failed: ${errorText(error)}`,
-        }
       }
-
-      // 写入成功后删除原文
-      let deleted = 0
-      try {
-        deleted = await this.service.deleteMemoryIds(sourceIds)
-      } catch (error) {
-        return {
-          view: { ...emptyView, error: `delete-failed: ${errorText(error)}` },
-          inputCount,
-          outputCount: written.length,
-          deleted: 0,
-          error: `delete-failed: ${errorText(error)}`,
-        }
-      }
-
-      const batchRow = {
-        id: batchId,
-        level,
-        status: nextStage ? 'pending' : 'final',
-        createdAt: now,
-        updatedAt: now,
-        dueAt: nextStage ? now + nextStage.afterDays * 86400000 : null,
-        dayKey: key || '',
-        dayRange: meta?.dayRange ?? null,
-        sourceBatchIds,
-        sourceIdsCount: sourceIds.length,
-        inputCount,
-        outputCount: written.length,
-        maxItems,
-        llmCalls,
-        latencyMs,
-        fallback: combined?.fallback === true,
-        fallbackReason: combined?.fallbackReason ?? null,
-        error: null,
-      }
-      this.state.batches.push(batchRow)
-      await this.save()
+      batch.inputCount = inputCount
+      batch.outputCount = written.length
+      batch.deleted = deleted
+      batch.llmCalls = compressed.llmCalls
+      batch.latencyMs = compressed.latencyMs
+      batch.fallback = compressed.fallback
+      batch.fallbackReason = compressed.fallbackReason ?? null
+      batch.lastError = null
+      // 下一层（L2）在该周结束后 afterDays 天到期
+      const delay = Math.max(1, Number(cfg.level2AfterDays) || 7)
+      const dueAt = batch.weekKey ? weekEndMs(batch.weekKey, tz) + delay * 86400000 : Date.now() + delay * 86400000
+      this.queue.markWaiting(batch, dueAt)
       return {
-        view: batchView(batchRow),
+        view: outcomeView(batch, null, inputCount, written.length),
         inputCount,
         outputCount: written.length,
         deleted,
-        error: null,
       }
     } catch (error) {
+      this.queue.markFailed(batch, error)
       return {
-        view: { ...emptyView, error: errorText(error) },
-        inputCount,
+        view: outcomeView(batch, error),
+        inputCount: batch.inputCount ?? 0,
+        outputCount: batch.outputCount ?? 0,
+        deleted: 0,
+        error: errorText(error),
+      }
+    }
+  }
+
+  /** 收集 L1 批次的来源原始片段。 */
+  async #collectL1Sources(batch, tz) {
+    if (batch.dayKey && String(batch.key).endsWith('#misc')) {
+      const bounds = dayBoundsFromKey(batch.dayKey, tz)
+      return this.service.collectMemories({
+        filter: {
+          must: [
+            { key: 'level', match: { value: 0 } },
+            { key: 'batch', match: { value: '' } },
+            { key: 'ts', range: { gte: bounds.from, lte: bounds.to } },
+          ],
+        },
+        withVector: true,
+        maxItems: 5000,
+        orderBy: { key: 'ts', direction: 'asc' },
+      })
+    }
+    const filter = {
+      must: [
+        { key: 'level', match: { value: 0 } },
+        { key: 'batch', match: { value: String(batch.no ?? '') } },
+      ],
+    }
+    return this.service.collectMemories({ filter, withVector: true, maxItems: 5000, orderBy: { key: 'ts', direction: 'asc' } })
+  }
+
+  /** 合并一层批次（L2/L3 的 N:1）。 */
+  async #mergeGroup({ level, groupKey, sourceBatches, afterDays, tz }) {
+    const waitingSources = sourceBatches.filter((batch) => batch.status === BATCH_STATUS.WAITING)
+    const sourceNos = waitingSources.map((batch) => String(batch.no ?? '')).filter(Boolean)
+    const weekKey = level === 2 ? groupKey : (waitingSources[0]?.weekKey ?? '')
+    const monthKey = level === 2 ? monthKeyOfWeek(groupKey) : groupKey
+    // 先收集来源；为空则直接关闭来源批次，不创建新批次
+    let sources = []
+    try {
+      if (sourceNos.length > 0) {
+        sources = await this.service.collectMemories({
+          filter: { must: [{ key: 'level', match: { value: level - 1 } }, { key: 'batch', match: { any: sourceNos } }] },
+          withVector: true,
+          maxItems: 10000,
+          orderBy: { key: 'ts', direction: 'asc' },
+        })
+      }
+    } catch (error) {
+      // 收集失败：只记录错误，来源批次保持等待，下次重试
+      return { view: outcomeView(null, error), inputCount: 0, outputCount: 0, deleted: 0, error: errorText(error) }
+    }
+    if (sources.length === 0) {
+      for (const batch of waitingSources) this.queue.markMerged(batch)
+      return { view: outcomeView(null, null), inputCount: 0, outputCount: 0, deleted: 0 }
+    }
+    const mergeBatch = this.queue.createMergeBatch({
+      level,
+      weekKey,
+      monthKey,
+      sourceKeys: waitingSources.map((batch) => batch.key),
+    })
+    try {
+      const anchorTs = level === 2 ? weekStartMs(weekKey, tz) : monthStartMs(monthKey, tz)
+      const compressed = await this.#compressGroup({
+        level,
+        sources,
+        related: this.service.cfg().experimentalEventMergeEnabled === true,
+      })
+      const written = await this.#writeOutputs({
+        entries: compressed.entries,
+        level,
+        batchNo: level >= 3 ? '' : mergeBatch.no,
+        batchKey: mergeBatch.key,
+        anchorTs,
+        range:
+          level === 2
+            ? { from: anchorTs, to: weekEndMs(weekKey, tz) }
+            : { from: anchorTs, to: monthEndMs(monthKey, tz) },
+        inputCount: sources.length,
+        relatedCount: compressed.relatedCount,
+      })
+      const sourceIds = sources.map((item) => item.id)
+      const deleted = await this.service.deleteMemoryIds(sourceIds)
+      for (const batch of waitingSources) this.queue.markMerged(batch)
+      mergeBatch.inputCount = sources.length
+      mergeBatch.outputCount = written.length
+      mergeBatch.deleted = deleted
+      mergeBatch.llmCalls = compressed.llmCalls
+      mergeBatch.latencyMs = compressed.latencyMs
+      mergeBatch.fallback = compressed.fallback
+      mergeBatch.fallbackReason = compressed.fallbackReason ?? null
+      if (level >= 3) {
+        this.queue.markFinal(mergeBatch)
+      } else {
+        const dueAt = monthEndMs(monthKey, tz) + afterDays * 86400000
+        this.queue.markWaiting(mergeBatch, dueAt)
+      }
+      return {
+        view: outcomeView(mergeBatch, null, sources.length, written.length),
+        inputCount: sources.length,
+        outputCount: written.length,
+        deleted,
+      }
+    } catch (error) {
+      this.queue.markFailed(mergeBatch, error)
+      // 合并批次失败后会创建新的批次重试，旧批次不再占用编号
+      this.queue.releaseNo(mergeBatch)
+      return {
+        view: outcomeView(mergeBatch, error),
+        inputCount: 0,
         outputCount: 0,
         deleted: 0,
         error: errorText(error),
@@ -1806,15 +1695,117 @@ class ConsolidationEngine {
     }
   }
 
+  /** 调模型（或规则回退）把一组来源片段压缩成输出条目。 */
+  async #compressGroup({ level, sources, related = false }) {
+    const cfg = this.service.cfg()
+    const stage = this.stages().find((item) => item.level === level) ?? { level, maxItems: null }
+    const cleanSources = (sources ?? []).filter((item) => item.payload?.text)
+    const chunks = chunkByChars(cleanSources, Math.max(1000, Number(cfg.consolidationInputMaxChars) || 12000))
+    const relatedItems = related ? await this.#findRelated(cleanSources) : []
+    let combined = null
+    let llmCalls = 0
+    let latencyMs = 0
+    try {
+      const partials = []
+      for (const chunk of chunks) {
+        const partial = await this.#callLLM({
+          level,
+          stage,
+          items: chunk,
+          rendered: this.#renderSources(chunk),
+          related: relatedItems,
+          isFirst: partials.length === 0,
+        })
+        partials.push(partial)
+        llmCalls += 1
+        latencyMs += partial.latencyMs ?? 0
+      }
+      combined = partials.length === 1 ? partials[0].data : await this.#mergePartials(partials, stage)
+      if (partials.length > 1) llmCalls += 1
+    } catch (error) {
+      this.service.debugLog(`整理 LLM 不可用，回退规则压缩：${errorText(error)}`)
+      const fallback = this.#ruleCompress(chunks, stage)
+      combined = { ...fallback.data, fallback: true, fallbackReason: errorText(error) }
+    }
+    const summary = String(combined?.summary ?? '').trim()
+    const facts = Array.isArray(combined?.facts) ? combined.facts : []
+    const event = combined?.event && typeof combined.event === 'object' ? combined.event : null
+    const limitEnabled = Number.isFinite(stage.maxItems)
+    const maxItems = limitEnabled ? Math.max(1, stage.maxItems) : null
+    const factLimit = limitEnabled ? Math.max(0, maxItems - (summary ? 1 : 0)) : Infinity
+    const selectedFacts = facts
+      .filter((fact) => fact && typeof fact.text === 'string' && fact.text.trim())
+      .slice(0, factLimit)
+      .map((fact) => ({
+        text: String(fact.text).trim(),
+        kind: ['fact', 'preference', 'project', 'note', 'event'].includes(fact.kind) ? fact.kind : 'fact',
+        tags: Array.isArray(fact.tags) ? fact.tags.map(String).slice(0, 8) : [],
+      }))
+    const rendered = this.#renderSources(cleanSources)
+    const entries = []
+    if (summary) entries.push({ text: summary, kind: 'summary', tags: ['summary'] })
+    for (const fact of selectedFacts) entries.push(fact)
+    if (entries.length === 0) {
+      entries.push({ text: rendered.slice(0, Math.max(80, Math.min(400, rendered.length))), kind: 'note', tags: ['fallback'] })
+    }
+    const eventText =
+      event?.summary && String(event.summary).trim()
+        ? String(event.summary).trim()
+        : relatedItems.length > 0
+          ? `相关事件：${summary || relatedItems[0].text}`.slice(0, 500)
+          : ''
+    if (eventText) {
+      entries.push({
+        text: eventText,
+        kind: 'event',
+        tags: Array.isArray(event?.tags) ? event.tags.map(String).slice(0, 8) : ['event'],
+      })
+    }
+    return {
+      entries,
+      relatedCount: relatedItems.length,
+      llmCalls,
+      latencyMs,
+      fallback: combined?.fallback === true,
+      fallbackReason: combined?.fallbackReason ?? null,
+    }
+  }
+
+  /** 把压缩结果写成记忆（分配 level/anchorTs/来源统计，批次内唯一 idSeed）。 */
+  async #writeOutputs({ entries, level, batchNo, batchKey, anchorTs, range, inputCount, relatedCount }) {
+    const now = Date.now()
+    const written = []
+    for (const [index, entry] of entries.entries()) {
+      const saved = await this.service.addMemory({
+        kind: entry.kind === 'summary' ? 'summary' : entry.kind,
+        text: entry.text,
+        meta: {
+          level,
+          batch: String(batchNo ?? ''),
+          sourceCount: inputCount,
+          dayRange: range ?? null,
+          consolidatedAt: now,
+          relatedCount,
+          anchorTs,
+          tags: entry.tags,
+          // 批次内唯一：避免整理产物的内容哈希与原文（或彼此）相同，
+          // 导致“先写入、再删除原文”把新产物一起删掉。
+          idSeed: `sleep-${batchKey}-${index}`,
+        },
+      })
+      written.push(saved)
+    }
+    return written
+  }
+
   /** 渲染记忆条目给模型。 */
-  #renderSources(items, level) {
+  #renderSources(items) {
     return items
       .map((item) => {
         const payload = item.payload ?? {}
         const time = this.service.formatTs(Number(payload.ts) || 0)
         const kind = payload.kind ?? 'note'
-        const batch = payload.batch ? ` #${payload.batch}` : ''
-        return `- [${time}·${kind}${batch}] ${String(payload.text ?? '').trim()}`
+        return `- [${time}·${kind}] ${String(payload.text ?? '').trim()}`
       })
       .join('\n')
   }
@@ -1826,7 +1817,6 @@ class ConsolidationEngine {
     const maxCandidates = Math.max(1, Math.min(200, Number(cfg.experimentalEventMergeMaxCandidates) || 30))
     const ownIds = new Set(sources.map((item) => item.id))
     const related = new Map()
-    // 只探测最多 20 条源记忆，控制查询次数
     for (const source of sources.slice(0, 20)) {
       const vector = source.vector
       if (!Array.isArray(vector)) continue
@@ -1853,16 +1843,19 @@ class ConsolidationEngine {
     const cfg = this.service.cfg()
     const limitEnabled = Number.isFinite(stage?.maxItems)
     const maxFacts = limitEnabled ? Math.max(1, stage.maxItems - 1) : null
-    const relatedText = isFirst && related.length > 0
-      ? `\n\n【可能相关的其他事件记忆（仅参考，不要删除/编造，可合并同一事件的信息）】\n${renderMemoryLines(related, 6000, (item) => `- [${this.service.formatTs(item.ts)}·${item.kind}${item.batch ? ' #' + item.batch : ''}] ${item.text.slice(0, 500)}`)}`
-      : ''
+    const relatedText =
+      isFirst && related.length > 0
+        ? `\n\n【可能相关的其他事件记忆（仅参考，不要删除/编造，可合并同一事件的信息）】\n${renderMemoryLines(related, 6000, (item) => `- [${this.service.formatTs(item.ts)}·${item.kind}] ${item.text.slice(0, 500)}`)}`
+        : ''
     const customPrompt = String(cfg.consolidationPrompt ?? '').trim()
     const system = customPrompt || DEFAULT_PROMPT
     const countRule = limitEnabled
       ? `请输出 JSON：summary、facts（条数由你按重要性决定，最多 ${maxFacts} 条）、可选 event。`
       : '请输出 JSON：summary、facts（条数由你按重要性自行决定）、可选 event。'
+    const levelHint = LEVEL_HINTS[level] ?? ''
     const user = [
       `这是第 ${level} 级记忆整理。本批共 ${items.length} 条记忆。`,
+      levelHint,
       countRule,
       '精简是默认目标：优先保留关键事实、偏好、决定、时间和人名；重复、寒暄和流水账直接丢弃。',
       '',
@@ -1976,6 +1969,15 @@ class ConsolidationEngine {
       },
       latencyMs: 0,
     }
+  }
+
+  /** 汇总一次运行的分层统计。 */
+  #mergeStats(result, level, outcome) {
+    if (!result.levels[level]) result.levels[level] = { batches: 0, input: 0, output: 0 }
+    result.levels[level].batches += 1
+    result.levels[level].input += outcome.inputCount ?? 0
+    result.levels[level].output += outcome.outputCount ?? 0
+    result.deleted += outcome.deleted ?? 0
   }
 }
 // ===== src/shared/protocol.js =====
@@ -2222,6 +2224,63 @@ class OpenAICompatClient {
     }
   }
 }
+// ===== src/lib/domain/memory-values.js =====
+/**
+ * 记忆的“编码强度”与“可信度”规则（domain，纯函数）。
+ * importance：编码时的重要性（显式保存 > 偏好/事实 > 闲聊）
+ * confidence：这条信念的可信度（用户明确 > 抽取事实 > 普通对话）
+ */
+const IMPORTANCE_BY_KIND = {
+  preference: 0.8,
+  fact: 0.75,
+  project: 0.75,
+  note: 0.6,
+  event: 0.8,
+  summary: 0.65,
+  image: 0.5,
+  turn: 0.4,
+}
+
+const CONFIDENCE_BY_KIND = {
+  preference: 0.8,
+  fact: 0.8,
+  project: 0.75,
+  note: 0.7,
+  event: 0.7,
+  summary: 0.7,
+  image: 0.7,
+  turn: 0.6,
+}
+
+/** 默认重要性（0~1）。 */
+function defaultImportance(kind) {
+  return IMPORTANCE_BY_KIND[String(kind ?? '')] ?? 0.5
+}
+
+/** 默认置信度（0~1）。 */
+function defaultConfidence(kind) {
+  return CONFIDENCE_BY_KIND[String(kind ?? '')] ?? 0.6
+}
+
+/** 把任意值规范到 0~1，非法时回退。 */
+function normalizeUnit(value, fallback) {
+  const n = Number(value)
+  if (!Number.isFinite(n)) return fallback
+  return Math.min(1, Math.max(0, n))
+}
+
+/** 规范 importance（缺省按 kind 推断）。 */
+function normalizeImportance(value, kind) {
+  return normalizeUnit(value, defaultImportance(kind))
+}
+
+/** 规范 confidence（缺省按 kind 推断）。 */
+function normalizeConfidence(value, kind) {
+  return normalizeUnit(value, defaultConfidence(kind))
+}
+
+/** 显式保存的编码强度。 */
+const MANUAL_SAVE = { importance: 1, confidence: 0.9 }
 // ===== src/lib/app/maintenance-service.js =====
 /**
  * MaintenanceService：记忆集合的读取/维护/迁移（v0.7 R3）。
@@ -2425,6 +2484,54 @@ class MaintenanceService {
       return legacy.length
     } catch (error) {
       this.logger.warn?.(`[dsh-memory] 旧记忆迁移失败：${errorText(error)}`)
+      return 0
+    }
+  }
+
+  /**
+   * v0.8 迁移：把 payload.batch 里“不再对应活跃批次”的旧编号清空。
+   * 编号只在待整理期间存在；终态批次的记忆不应再带编号。
+   */
+  async migrateQueueBatchFields(activeNos) {
+    try {
+      const active = activeNos instanceof Set ? activeNos : new Set(activeNos ?? [])
+      await this.ensureReady()
+      const qdrant = await this.qdrant()
+      const storage = this.storage()
+      const stale = []
+      const legacyFields = []
+      let offset
+      for (let page = 0; page < 100; page += 1) {
+        const { points, nextOffset } = await qdrant.scroll(storage.collection, {
+          limit: 256,
+          offset,
+          withPayload: true,
+          withVector: false,
+        })
+        for (const point of points) {
+          const payload = point.payload ?? {}
+          const batch = String(payload.batch ?? '')
+          if (batch && !active.has(batch)) stale.push(String(point.id))
+          if (payload.sessionId !== undefined || payload.cwd !== undefined) legacyFields.push(String(point.id))
+        }
+        if (!nextOffset || points.length === 0) break
+        offset = nextOffset
+      }
+      if (stale.length > 0) {
+        for (let index = 0; index < stale.length; index += 200) {
+          await qdrant.setPayload(storage.collection, { batch: '' }, stale.slice(index, index + 200))
+        }
+        this.logger.info?.(`[dsh-memory] 已清理 ${stale.length} 条旧记忆的过期批次编号`)
+      }
+      if (legacyFields.length > 0 && typeof qdrant.deletePayloadKeys === 'function') {
+        for (let index = 0; index < legacyFields.length; index += 200) {
+          await qdrant.deletePayloadKeys(storage.collection, ['sessionId', 'cwd'], legacyFields.slice(index, index + 200))
+        }
+        this.logger.info?.(`[dsh-memory] 已从 ${legacyFields.length} 条旧记忆移除 sessionId/cwd`)
+      }
+      return stale.length + legacyFields.length
+    } catch (error) {
+      this.logger.warn?.(`[dsh-memory] 批次编号迁移失败：${errorText(error)}`)
       return 0
     }
   }
@@ -3091,7 +3198,7 @@ class QdrantClient {
       })
       const info = { name: collection, points: 0, size, distance: 'Cosine', payloadIndexes: [] }
       await this.ensurePayloadIndexes(collection)
-      return { ok: true, created: true, info: { ...info, payloadIndexes: ['kind', 'sessionId', 'cwd', 'ts'] } }
+      return { ok: true, created: true, info: { ...info, payloadIndexes: ['kind', 'level', 'batch', 'ts'] } }
     }
     if (existing.size !== null && existing.size !== size) {
       return {
@@ -3109,8 +3216,8 @@ class QdrantClient {
   async ensurePayloadIndexes(collection) {
     const indexes = [
       { field_name: 'kind', field_schema: 'keyword' },
-      { field_name: 'sessionId', field_schema: 'keyword' },
-      { field_name: 'cwd', field_schema: 'keyword' },
+      { field_name: 'level', field_schema: 'integer' },
+      { field_name: 'batch', field_schema: 'keyword' },
       { field_name: 'ts', field_schema: 'integer' },
     ]
     for (const index of indexes) {
@@ -3122,6 +3229,20 @@ class QdrantClient {
         this.logger?.warn?.(`[dsh-memory] 创建 Qdrant 索引 ${index.field_name} 失败：${errorText(error)}`)
       }
     }
+  }
+
+  /** 删除若干 point 上的指定 payload 字段（去会话痕迹用）。 */
+  async deletePayloadKeys(collection, keys, ids) {
+    const list = (ids ?? []).map(String).filter(Boolean)
+    const fields = (keys ?? []).map(String).filter(Boolean)
+    if (list.length === 0 || fields.length === 0) return 0
+    await this.request(
+      'POST',
+      `/collections/${encodeURIComponent(collection)}/points/payload/delete`,
+      { keys: fields, points: list, wait: true },
+      { timeoutMs: 30000 },
+    )
+    return list.length
   }
 
   /** 写入/覆盖 points。 */
@@ -3221,6 +3342,22 @@ class QdrantClient {
     }
     return this.ensureCollection(collection, size)
   }
+}
+// ===== src/lib/domain/ids.js =====
+/**
+ * 纯 ID 领域逻辑：内容哈希记忆 point id。
+ */
+
+
+/** 计算 sha256 十六进制摘要。 */
+function sha256(text) {
+  return createHash('sha256').update(String(text), 'utf8').digest('hex')
+}
+
+/** 由种子生成稳定的 UUID（Qdrant point id 需要 UUID 或整数）。 */
+function memoryPointId(seed) {
+  const h = sha256(seed)
+  return `${h.slice(0, 8)}-${h.slice(8, 12)}-4${h.slice(13, 16)}-a${h.slice(17, 20)}-${h.slice(20, 32)}`
 }
 // ===== src/lib/domain/recall-policy.js =====
 /**
@@ -3433,9 +3570,10 @@ class MemoryService {
       checkedAt: 0,
       info: null,
     }
-    /** 由 index.js 注入的睡眠控制器与整理引擎（避免循环依赖）。 */
+    /** 由 index.js 注入的睡眠控制器、整理引擎与整理队列（避免循环依赖）。 */
     this.sleep = null
     this.consolidation = null
+    this.taskBoard = null
   }
 
   // ------------------------------------------------------------------
@@ -3475,6 +3613,7 @@ class MemoryService {
   searchSimilar(vector, options) { return this.maintenanceService.searchSimilar(vector, options) }
   migrateLegacyMemories() { return this.maintenanceService.migrateLegacyMemories() }
   migrateDynamicFields() { return this.maintenanceService.migrateDynamicFields() }
+  migrateQueueBatchFields(activeNos) { return this.maintenanceService.migrateQueueBatchFields(activeNos) }
   maintenance(options) { return this.maintenanceService.maintenance(options) }
 
   // ------------------------------------------------------------------
@@ -3508,17 +3647,31 @@ class MemoryService {
     }
   }
 
+  /** 采集时确保当天该会话的事件批次存在，返回编号（待整理期间的凭证）。 */
+  async eventBatchNo(sessionId, ts = Date.now()) {
+    if (!this.taskBoard || !sessionId) return ''
+    try {
+      const batch = await this.taskBoard.ensureEventBatch({
+        dayKey: dayKey(ts, this.timeOptions().timeZone),
+        sessionId: String(sessionId),
+      })
+      return batch?.no ?? ''
+    } catch (error) {
+      this.debugLog(`分配事件批次失败：${errorText(error)}`)
+      return ''
+    }
+  }
+
   /** 自动召回配置。 */
   recallOptions() {
     const cfg = this.cfg()
-    const scope = cfg.memoryScope === 'workspace' || cfg.memoryScope === 'session' ? cfg.memoryScope : 'global'
     return {
       autoRecall: cfg.autoRecall !== false,
-      memoryScope: scope,
       recallTopK: clampInt(cfg.recallTopK, 3, 1, 20),
       recallMinScore: clampNumber(cfg.recallMinScore, 0.42, 0, 1),
       recallMaxChars: clampInt(cfg.recallMaxChars, 600, 100, 4000),
-      recallIncludeCurrentSession: cfg.recallIncludeCurrentSession === true,
+      // 自动召回排除最近 N 分钟内自动记录的对话片段，避免把刚说过的话再注入一遍
+      recallMinAgeMinutes: Math.max(0, clampInt(cfg.recallMinAgeMinutes, 10, 0, 1440)),
       recallTimeoutMs: clampInt(cfg.recallTimeoutMs, 3000, 500, 20000),
       // 动态相关度（v0.7）
       ageGateEnabled: cfg.recallAgeGateEnabled !== false,
@@ -3598,42 +3751,24 @@ class MemoryService {
     return timeInfo(ts, options.timeZone, options.relativeTime)
   }
 
-  /** 当前 agent 的会话上下文（用于作用域过滤）。 */
-  sessionContext(agentId) {
-    const id = String(agentId ?? '')
-    let cwd = ''
-    try {
-      const session = this.ctx.sessions?.get?.(id)
-      cwd = String(session?.header?.cwd ?? '')
-    } catch {
-      /* ignore */
-    }
-    return { sessionId: id, cwd }
-  }
-
   /**
-   * 构造 Qdrant 过滤条件。
+   * 构造 Qdrant 过滤条件（v0.8：只按类型过滤；记忆不再是“某个会话的容器”）。
    * @param {object} options
-   * @param {'global'|'workspace'|'session'} [options.mode]
-   * @param {string} [options.sessionId] 当前会话
-   * @param {string} [options.cwd] 当前工作目录
-   * @param {boolean} [options.includeCurrentSession] 是否包含当前会话
    * @param {string} [options.kind] 只查某类记忆
+   * @param {number} [options.recentTurnCutoff] 排除该时间点之后自动记录的对话片段
    */
-  buildFilter({ mode = 'global', sessionId = '', cwd = '', includeCurrentSession = false, kind = '' } = {}) {
+  buildFilter({ kind = '', recentTurnCutoff = 0 } = {}) {
     const must = []
     const mustNot = []
-    if (mode === 'session') {
-      if (sessionId) must.push({ key: 'sessionId', match: { value: sessionId } })
-    } else if (mode === 'workspace') {
-      if (cwd) must.push({ key: 'cwd', match: { value: cwd } })
-      if (!includeCurrentSession && sessionId) {
-        mustNot.push({ key: 'sessionId', match: { value: sessionId } })
-      }
-    } else if (!includeCurrentSession && sessionId) {
-      mustNot.push({ key: 'sessionId', match: { value: sessionId } })
-    }
     if (kind) must.push({ key: 'kind', match: { value: kind } })
+    if (Number(recentTurnCutoff) > 0) {
+      mustNot.push({
+        must: [
+          { key: 'kind', match: { value: 'turn' } },
+          { key: 'ts', range: { gt: Number(recentTurnCutoff) } },
+        ],
+      })
+    }
     const filter = {}
     if (must.length > 0) filter.must = must
     if (mustNot.length > 0) filter.must_not = mustNot
@@ -3709,7 +3844,8 @@ class MemoryService {
     await this.ensureReady()
     const qdrant = await this.qdrant()
     const storage = this.storage()
-    const { idSeed, ...payloadMeta } = meta ?? {}
+    // v0.8：记忆不属于某个会话；sessionId/cwd 只用于采集阶段，不写入长期记忆
+    const { idSeed, sessionId: _sessionId, cwd: _cwd, ...payloadMeta } = meta ?? {}
     const id = memoryPointId(idSeed ? `${kind}|${idSeed}|${body}` : `${kind}|${body}`)
     const baseTs = Number(meta?.ts) > 0 ? Number(meta.ts) : Date.now()
     const payload = sanitizeMeta({
@@ -3769,7 +3905,7 @@ class MemoryService {
   }
 
   /** 记录一轮对话要点。 */
-  async addTurnMemory({ userText, assistantText, sessionId, cwd, turn, imageCount = 0 }) {
+  async addTurnMemory({ userText, assistantText, sessionId, turn, imageCount = 0 }) {
     const options = this.captureOptions()
     const user = truncate(cleanText(userText), options.captureUserChars)
     const assistant = truncate(cleanText(assistantText), options.captureAssistantChars)
@@ -3778,20 +3914,20 @@ class MemoryService {
     if (user) parts.push(`用户：${user}`)
     if (assistant) parts.push(`助手：${assistant}`)
     if (imageCount > 0) parts.push(`（本轮附有 ${imageCount} 张图片）`)
+    const batch = await this.eventBatchNo(sessionId)
     return this.addMemory({
       kind: 'turn',
       text: parts.join('\n'),
       meta: {
-        sessionId: String(sessionId ?? ''),
-        cwd: String(cwd ?? ''),
         turn: Number(turn) || 0,
         hasImages: imageCount > 0,
+        batch,
       },
     })
   }
 
   /** 记录一张图片：只存一句话概览，永不存原图。 */
-  async addImageMemory({ ref, sessionId, cwd, turn }) {
+  async addImageMemory({ ref, sessionId, turn }) {
     const image = this.imageOptions()
     if (image.imageMode === 'off') return { ok: false, skipped: 'image-mode-off' }
     const cfg = this.cfg()
@@ -3852,15 +3988,15 @@ class MemoryService {
     } else {
       text = '用户发送了一张图片（未解析图片内容）'
     }
+    const batch = await this.eventBatchNo(sessionId)
     return this.addMemory({
       kind: 'image',
       text,
       meta: {
-        sessionId: String(sessionId ?? ''),
-        cwd: String(cwd ?? ''),
         turn: Number(turn) || 0,
         image: imageMeta,
         caption,
+        batch,
       },
     })
   }
@@ -3882,11 +4018,8 @@ class MemoryService {
     const filter =
       options.filter ??
       this.buildFilter({
-        mode: options.mode ?? 'global',
-        sessionId: options.sessionId ?? '',
-        cwd: options.cwd ?? '',
-        includeCurrentSession: options.includeCurrentSession === true,
         kind: options.kind ?? '',
+        recentTurnCutoff: Number(options.recentTurnCutoff) || 0,
       })
     const points = await qdrant.search(
       storage.collection,
@@ -3911,8 +4044,6 @@ class MemoryService {
         ts,
         time: info.time,
         relative: info.relative,
-        sessionId: payload.sessionId ? String(payload.sessionId) : '',
-        cwd: payload.cwd ? String(payload.cwd) : '',
         tags: Array.isArray(payload.tags) ? payload.tags.map(String) : [],
         provider: payload.provider ? String(payload.provider) : '',
         level: Number(payload.level) || 0,
@@ -4014,15 +4145,14 @@ class MemoryService {
     return rankRecallHits(hits ?? [], policy, Date.now())
   }
 
-  async recall(query, { signal, sessionId = '', cwd = '' } = {}) {
+  async recall(query, { signal } = {}) {
     const options = this.recallOptions()
+    const recentTurnCutoff =
+      options.recallMinAgeMinutes > 0 ? Date.now() - options.recallMinAgeMinutes * 60000 : 0
     const { hits } = await this.search(query, {
       limit: options.ageGateEnabled ? options.candidates : options.recallTopK,
       minScore: options.ageGateEnabled ? undefined : options.recallMinScore,
-      mode: options.memoryScope,
-      sessionId,
-      cwd,
-      includeCurrentSession: options.recallIncludeCurrentSession,
+      recentTurnCutoff,
       signal,
     })
     let candidates = hits.filter((hit) => hit.text.length > 0 && hit.enhanced !== true)
@@ -4089,8 +4219,6 @@ class MemoryService {
       ts,
       time: info.time,
       relative: info.relative,
-      sessionId: payload.sessionId ? String(payload.sessionId) : '',
-      cwd: payload.cwd ? String(payload.cwd) : '',
       tags: Array.isArray(payload.tags) ? payload.tags.map(String) : [],
       provider: payload.provider ? String(payload.provider) : '',
       level: Number(payload.level) || 0,
@@ -4211,7 +4339,7 @@ class MemoryService {
       ok: true,
       app: {
         name: 'dsh-memory',
-        version: '0.7.0',
+        version: '0.8.0',
         startedAt: this.stats.startedAt,
       },
       time: (() => {
@@ -4310,11 +4438,10 @@ class MemoryService {
         },
         autoCapture: capture.autoCapture,
         autoRecall: recall.autoRecall,
-        memoryScope: recall.memoryScope,
         recallTopK: recall.recallTopK,
         recallMinScore: recall.recallMinScore,
         recallMaxChars: recall.recallMaxChars,
-        recallIncludeCurrentSession: recall.recallIncludeCurrentSession,
+        recallMinAgeMinutes: recall.recallMinAgeMinutes,
         recallTimeoutMs: recall.recallTimeoutMs,
         imageMode: this.cfg().imageMode ?? 'caption',
         toolsEnabled: toolOptions.toolsEnabled,
@@ -4478,6 +4605,522 @@ class MemoryService {
   }
 
 }
+// ===== src/lib/app/queue-service.js =====
+/**
+ * 整理队列（批次台账）服务：记忆片段压缩状态的唯一事实源。
+ *
+ * 设计见 docs/QUEUE.md：
+ * - 事件批次 = 会话 × 日期；同一天不同会话得到不同编号；
+ * - 编号 5 位、顺序分配、批次终态后回收；稳定 key 只留在台账历史里；
+ * - 状态：collecting → sealed → running → waiting → merged/final（失败 failed 可重试）；
+ * - L1 事件片段 → L2 周片段 → L3 长期片段，后两层为 N:1 合并。
+ *
+ * 持久化：$DSH_HOME/storages/dsh-memory/queue.json
+ * 旧版任务列表 consolidation.json 会在启动时一次性迁移（旧文件保留）。
+ */
+
+
+
+
+const STATE_VERSION = 2
+const MAX_TERMINAL_BATCHES = 800
+const MAX_HISTORY = 60
+const MAX_ACTIVE_ROWS = 40
+
+/** 把批次行转成给 UI 的轻量视图。 */
+function batchView(batch) {
+  const no = batch.status === BATCH_STATUS.MERGED || batch.status === BATCH_STATUS.FINAL ? '' : formatBatchNo(batch.no)
+  return {
+    key: batch.key,
+    no,
+    level: batch.level,
+    status: batch.status,
+    dayKey: batch.dayKey ?? '',
+    weekKey: batch.weekKey ?? '',
+    monthKey: batch.monthKey ?? '',
+    createdAt: batch.createdAt ?? 0,
+    sealedAt: batch.sealedAt ?? 0,
+    dueAt: batch.dueAt ?? 0,
+    finishedAt: batch.finishedAt ?? 0,
+    sourceCount: batch.inputCount ?? 0,
+    outputCount: batch.outputCount ?? 0,
+    attempts: batch.attempts ?? 0,
+    lastError: batch.lastError ?? null,
+    sourceKeys: batch.sourceKeys ?? [],
+  }
+}
+
+class QueueService {
+  /** @param {import('./memory-service.js').MemoryService} service */
+  constructor(service) {
+    this.service = service
+    this.logger = service.logger
+    this.statePath = join(dshHome(), 'storages', 'dsh-memory', 'queue.json')
+    this.legacyPath = join(dshHome(), 'storages', 'dsh-memory', 'consolidation.json')
+    this.state = { version: STATE_VERSION, lastNo: 0, batches: [], history: [], lastRun: null }
+    this.loaded = false
+    this.loading = null
+  }
+
+  // ------------------------------------------------------------------
+  // 持久化
+  // ------------------------------------------------------------------
+
+  async load() {
+    if (this.loaded) return this.state
+    if (this.loading) return this.loading
+    this.loading = this.#loadInner().finally(() => {
+      this.loading = null
+    })
+    return this.loading
+  }
+
+  async #loadInner() {
+    const data = readJsonFile(this.statePath, null)
+    if (data && typeof data === 'object' && Array.isArray(data.batches)) {
+      this.state = {
+        version: STATE_VERSION,
+        lastNo: Number(data.lastNo) || 0,
+        batches: data.batches.filter(Boolean),
+        history: Array.isArray(data.history) ? data.history : [],
+        lastRun: data.lastRun ?? null,
+      }
+      this.loaded = true
+      return this.state
+    }
+    await this.#migrateLegacy()
+    this.loaded = true
+    await this.save()
+    return this.state
+  }
+
+  /** 从旧 consolidation.json 迁移批次（幂等：只在 queue.json 不存在时调用）。 */
+  async #migrateLegacy() {
+    const legacy = readJsonFile(this.legacyPath, null)
+    if (!legacy || !Array.isArray(legacy.batches) || legacy.batches.length === 0) return
+    const tz = this.service.timeOptions().timeZone
+    const cfg = this.service.cfg()
+    const level2AfterDays = Math.max(1, Number(cfg.level2AfterDays) || 7)
+    const now = Date.now()
+    const usedNos = new Set()
+    const batches = []
+    for (const old of legacy.batches) {
+      if (!old || old.id === undefined) continue
+      const oldNo = String(old.id)
+      const level = Number(old.level) || 1
+      const inFlight = old.status === 'pending' || old.status === 'processing'
+      const isFinal = old.status === 'final'
+      const status = inFlight ? BATCH_STATUS.WAITING : isFinal ? BATCH_STATUS.FINAL : BATCH_STATUS.MERGED
+      const dayKey = String(old.dayKey ?? '')
+      const weekKey = dayKey ? weekKeyOf(dayKey) : ''
+      const monthKey = weekKey ? monthKeyOfWeek(weekKey) : ''
+      let no = null
+      if (inFlight && /^\d{5}$/.test(oldNo) && !usedNos.has(oldNo)) {
+        no = oldNo
+        usedNos.add(oldNo)
+      }
+      const dueAt =
+        Number(old.dueAt) > 0
+          ? Number(old.dueAt)
+          : inFlight && weekKey
+            ? weekEndMs(weekKey, tz) + level2AfterDays * 86400000
+            : 0
+      batches.push({
+        key: dayKey ? `${dayKey}#legacy-${oldNo}` : `legacy-${oldNo}`,
+        no,
+        level,
+        status,
+        dayKey,
+        weekKey,
+        monthKey,
+        sessionId: '',
+        createdAt: Number(old.createdAt) || now,
+        sealedAt: Number(old.createdAt) || now,
+        startedAt: 0,
+        finishedAt: status === BATCH_STATUS.WAITING ? 0 : Number(old.updatedAt) || now,
+        dueAt: status === BATCH_STATUS.WAITING ? dueAt : 0,
+        inputCount: Number(old.inputCount) || Number(old.sourceCount) || 0,
+        outputCount: Number(old.outputCount) || 0,
+        deleted: 0,
+        attempts: Number(old.attempts) || 0,
+        lastError: old.error ? String(old.error) : null,
+        sourceKeys: Array.isArray(old.sourceBatchIds) ? old.sourceBatchIds.map((id) => `legacy-${id}`) : [],
+        legacy: true,
+      })
+    }
+    let lastNo = 0
+    for (const batch of batches) {
+      if (batch.no) lastNo = Math.max(lastNo, Number(batch.no) || 0)
+    }
+    const history = Array.isArray(legacy.history)
+      ? legacy.history.slice(-MAX_HISTORY).map((entry) => ({
+          at: Number(entry.at) || 0,
+          manual: entry.manual === true,
+          durationMs: Number(entry.durationMs) || 0,
+          levels: entry.levels ?? {},
+          errors: Array.isArray(entry.errors) ? entry.errors : [],
+          legacy: true,
+        }))
+      : []
+    this.state = { version: STATE_VERSION, lastNo, batches, history, lastRun: legacy.lastRun ?? null }
+    this.service.debugLog?.(`[dsh-memory] 已从旧任务列表迁移 ${batches.length} 个批次到 queue.json`)
+  }
+
+  async save() {
+    const terminal = this.state.batches.filter((batch) => !isActiveBatch(batch))
+    const active = this.state.batches.filter((batch) => isActiveBatch(batch))
+    if (terminal.length > MAX_TERMINAL_BATCHES) {
+      terminal.sort((a, b) => (a.finishedAt ?? a.createdAt ?? 0) - (b.finishedAt ?? b.createdAt ?? 0))
+      terminal.splice(0, terminal.length - MAX_TERMINAL_BATCHES)
+    }
+    const batches = [...terminal, ...active].sort((a, b) => (a.createdAt ?? 0) - (b.createdAt ?? 0))
+    if (this.state.history.length > MAX_HISTORY) this.state.history = this.state.history.slice(-MAX_HISTORY)
+    const next = { ...this.state, version: STATE_VERSION, batches }
+    try {
+      writeJsonFileAtomic(this.statePath, next)
+    } catch (error) {
+      this.logger.warn?.(`[dsh-memory] 保存整理队列失败：${errorText(error)}`)
+    }
+  }
+
+  // ------------------------------------------------------------------
+  // 查询
+  // ------------------------------------------------------------------
+
+  /** 活跃批次（占用编号）。 */
+  activeBatches() {
+    return this.state.batches.filter((batch) => isActiveBatch(batch))
+  }
+
+  /** 当前占用中的编号集合。 */
+  activeNos() {
+    const set = new Set()
+    for (const batch of this.state.batches) {
+      if (batch.no && isActiveBatch(batch)) set.add(String(batch.no))
+    }
+    return set
+  }
+
+  findByNo(no) {
+    const text = String(no ?? '')
+    return this.state.batches.find((batch) => String(batch.no ?? '') === text) ?? null
+  }
+
+  findByKey(key) {
+    return this.state.batches.find((batch) => batch.key === key) ?? null
+  }
+
+  /** 分配一个编号（不写盘）。 */
+  allocateNo() {
+    const { no, lastNo } = allocateBatchNo(this.activeNos(), this.state.lastNo)
+    if (no) this.state.lastNo = lastNo
+    return no
+  }
+
+  /** 释放编号（终态时调用）。 */
+  releaseNo(batch) {
+    if (!batch) return
+    batch.no = null
+  }
+
+  // ------------------------------------------------------------------
+  // 事件批次（采集时调用）
+  // ------------------------------------------------------------------
+
+  /** 当天该会话的收集中的事件批次；不存在则创建。 */
+  async ensureEventBatch({ dayKey, sessionId }) {
+    const sid = String(sessionId ?? '')
+    if (!dayKey || !sid) return null
+    await this.load()
+    const existing = this.state.batches.find(
+      (batch) =>
+        batch.status === BATCH_STATUS.COLLECTING &&
+        batch.dayKey === dayKey &&
+        String(batch.sessionId ?? '') === sid,
+    )
+    if (existing) return existing
+    const now = Date.now()
+    const seq = this.#nextEventSeq(dayKey)
+    const no = this.allocateNo()
+    const weekKey = weekKeyOf(dayKey)
+    const batch = {
+      key: eventBatchKey(dayKey, seq),
+      no: no || null,
+      level: 1,
+      status: BATCH_STATUS.COLLECTING,
+      dayKey,
+      weekKey,
+      monthKey: monthKeyOfWeek(weekKey),
+      sessionId: sid,
+      createdAt: now,
+      sealedAt: 0,
+      startedAt: 0,
+      finishedAt: 0,
+      dueAt: 0,
+      inputCount: 0,
+      outputCount: 0,
+      deleted: 0,
+      attempts: 0,
+      lastError: null,
+      sourceKeys: [],
+    }
+    this.state.batches.push(batch)
+    await this.save()
+    return batch
+  }
+
+  /** 当天没有会话归属的原始片段（手动保存/旧数据）用的杂项批次。 */
+  async ensureMiscBatch(dayKey) {
+    await this.load()
+    const key = eventBatchKey(dayKey, 'misc')
+    const existing = this.state.batches.find((batch) => batch.key === key && batch.status === BATCH_STATUS.COLLECTING)
+    if (existing) return existing
+    const now = Date.now()
+    const weekKey = weekKeyOf(dayKey)
+    const batch = {
+      key,
+      no: this.allocateNo() || null,
+      level: 1,
+      status: BATCH_STATUS.COLLECTING,
+      dayKey,
+      weekKey,
+      monthKey: monthKeyOfWeek(weekKey),
+      sessionId: '',
+      createdAt: now,
+      sealedAt: 0,
+      startedAt: 0,
+      finishedAt: 0,
+      dueAt: 0,
+      inputCount: 0,
+      outputCount: 0,
+      deleted: 0,
+      attempts: 0,
+      lastError: null,
+      sourceKeys: [],
+    }
+    this.state.batches.push(batch)
+    return batch
+  }
+
+  /** 当天已存在的事件序号最大值 + 1。 */
+  #nextEventSeq(dayKey) {
+    let max = 0
+    for (const batch of this.state.batches) {
+      if (!String(batch.key ?? '').startsWith(`${dayKey}#`)) continue
+      if (batch.key === `${dayKey}#misc`) continue
+      const match = /#(\d+)$/.exec(batch.key)
+      if (match) max = Math.max(max, Number(match[1]))
+    }
+    return max + 1
+  }
+
+  // ------------------------------------------------------------------
+  // 状态流转
+  // ------------------------------------------------------------------
+
+  /** 封存“今天之前”的收集中的批次（睡眠开始时调用）。 */
+  sealCollecting(todayKey) {
+    const now = Date.now()
+    let count = 0
+    for (const batch of this.state.batches) {
+      if (batch.status !== BATCH_STATUS.COLLECTING) continue
+      if (batch.dayKey && batch.dayKey >= todayKey) continue
+      batch.status = BATCH_STATUS.SEALED
+      batch.sealedAt = now
+      count += 1
+    }
+    return count
+  }
+
+  markRunning(batch) {
+    if (!batch) return
+    batch.status = BATCH_STATUS.RUNNING
+    batch.startedAt = Date.now()
+  }
+
+  markWaiting(batch, dueAt) {
+    if (!batch) return
+    batch.status = BATCH_STATUS.WAITING
+    batch.dueAt = Number(dueAt) || 0
+    batch.finishedAt = Date.now()
+    batch.lastError = null
+  }
+
+  markFailed(batch, error) {
+    if (!batch) return
+    batch.attempts = (batch.attempts ?? 0) + 1
+    batch.status = BATCH_STATUS.FAILED
+    batch.lastError = errorText(error) || String(error ?? 'unknown error')
+    batch.finishedAt = Date.now()
+  }
+
+  markMerged(batch) {
+    if (!batch) return
+    batch.status = BATCH_STATUS.MERGED
+    batch.finishedAt = Date.now()
+    batch.dueAt = 0
+    batch.lastError = null
+    this.releaseNo(batch)
+  }
+
+  markFinal(batch) {
+    if (!batch) return
+    batch.status = BATCH_STATUS.FINAL
+    batch.finishedAt = Date.now()
+    batch.dueAt = 0
+    batch.lastError = null
+    this.releaseNo(batch)
+  }
+
+  /** 到期、等待合并的批次按分组键分组（L1 按周、L2 按月）。 */
+  dueGroups(level, now = Date.now()) {
+    const groups = new Map()
+    for (const batch of this.state.batches) {
+      if (batch.status !== BATCH_STATUS.WAITING) continue
+      if (Number(batch.level) !== Number(level)) continue
+      const dueAt = Number(batch.dueAt) || 0
+      if (dueAt <= 0 || dueAt > now) continue
+      const groupKey = level === 1 ? batch.weekKey : batch.monthKey
+      if (!groupKey) continue
+      if (!groups.has(groupKey)) groups.set(groupKey, [])
+      groups.get(groupKey).push(batch)
+    }
+    return groups
+  }
+
+  /** 创建 L2/L3 合并批次（分配编号、running 状态）。 */
+  createMergeBatch({ level, weekKey = '', monthKey = '', sourceKeys = [] }) {
+    const now = Date.now()
+    const groupKey = weekKey || monthKey
+    const prefix = level === 2 ? 'week:' : 'month:'
+    let key = `${prefix}${groupKey}`
+    let suffix = 1
+    while (this.state.batches.some((batch) => batch.key === key)) {
+      suffix += 1
+      key = `${prefix}${groupKey}#${suffix}`
+    }
+    const batch = {
+      key,
+      no: this.allocateNo() || null,
+      level,
+      status: BATCH_STATUS.RUNNING,
+      dayKey: weekKey,
+      weekKey,
+      monthKey,
+      sessionId: '',
+      createdAt: now,
+      sealedAt: now,
+      startedAt: now,
+      finishedAt: 0,
+      dueAt: 0,
+      inputCount: 0,
+      outputCount: 0,
+      deleted: 0,
+      attempts: 0,
+      lastError: null,
+      sourceKeys: [...sourceKeys],
+    }
+    this.state.batches.push(batch)
+    return batch
+  }
+
+  // ------------------------------------------------------------------
+  // 摘要（UI）
+  // ------------------------------------------------------------------
+
+  /** 给状态接口/设置页的队列摘要。 */
+  summary() {
+    const batches = this.state.batches
+    const active = batches.filter((batch) => isActiveBatch(batch))
+    const byStatus = {}
+    const byLevel = {}
+    for (const batch of active) {
+      byStatus[batch.status] = (byStatus[batch.status] ?? 0) + 1
+      byLevel[batch.level] = (byLevel[batch.level] ?? 0) + 1
+    }
+    const waiting = active.filter((batch) => batch.status === BATCH_STATUS.WAITING && Number(batch.dueAt) > 0)
+    const nextDue = waiting.sort((a, b) => a.dueAt - b.dueAt)[0]
+    const activeRows = active
+      .slice()
+      .sort((a, b) => {
+        const weight = (batch) =>
+          batch.status === BATCH_STATUS.RUNNING
+            ? 0
+            : batch.status === BATCH_STATUS.FAILED
+              ? 1
+              : batch.status === BATCH_STATUS.SEALED
+                ? 2
+                : batch.status === BATCH_STATUS.COLLECTING
+                  ? 3
+                  : 4
+        const diff = weight(a) - weight(b)
+        if (diff !== 0) return diff
+        return (Number(a.dueAt) || Number(a.createdAt) || 0) - (Number(b.dueAt) || Number(b.createdAt) || 0)
+      })
+      .slice(0, MAX_ACTIVE_ROWS)
+      .map((batch) => ({
+        ...batchView(batch),
+        createdTime: batch.createdAt ? this.service.formatTs(batch.createdAt) : '',
+        dueTime: batch.dueAt ? this.service.formatTs(batch.dueAt) : '',
+      }))
+    const terminal = batches
+      .filter((batch) => !isActiveBatch(batch))
+      .sort((a, b) => (b.finishedAt ?? b.createdAt ?? 0) - (a.finishedAt ?? a.createdAt ?? 0))
+      .slice(0, 10)
+      .map((batch) => ({
+        ...batchView(batch),
+        finishedTime: batch.finishedAt ? this.service.formatTs(batch.finishedAt) : '',
+      }))
+    return {
+      enabled: this.service.cfg().consolidationEnabled === true,
+      pendingTotal: active.length,
+      pendingByLevel: byLevel,
+      byStatus,
+      nextDueAt: nextDue?.dueAt ?? null,
+      nextDueTime: nextDue?.dueAt ? this.service.formatTs(nextDue.dueAt) : '',
+      active: activeRows,
+      recent: terminal,
+      history: (this.state.history ?? []).slice(-6).map((entry) => ({
+        at: entry.at,
+        time: entry.at ? this.service.formatTs(entry.at) : '',
+        manual: entry.manual === true,
+        durationMs: entry.durationMs ?? 0,
+        levels: entry.levels ?? {},
+        errors: entry.errors ?? [],
+        legacy: entry.legacy === true,
+      })),
+      lastRun: this.state.lastRun,
+      statePath: this.statePath,
+    }
+  }
+
+  /** 记录一次整理运行（供摘要/历史）。 */
+  async recordRun(result) {
+    const levels = {}
+    for (const [level, stat] of Object.entries(result?.levels ?? {})) {
+      levels[level] = { batches: stat.batches ?? 0, input: stat.input ?? 0, output: stat.output ?? 0 }
+    }
+    this.state.lastRun = {
+      at: Date.now(),
+      manual: result?.manual === true,
+      reason: result?.reason ?? '',
+      ok: result?.ok !== false,
+      durationMs: result?.durationMs ?? 0,
+      levels,
+      deleted: result?.deleted ?? 0,
+      errors: result?.errors ?? [],
+    }
+    this.state.history.push({
+      at: result?.startedAt ?? Date.now(),
+      manual: result?.manual === true,
+      reason: result?.reason ?? '',
+      durationMs: result?.durationMs ?? 0,
+      levels,
+      errors: result?.errors ?? [],
+    })
+    await this.save()
+  }
+}
 // ===== src/lib/entry/capture-controller.js =====
 /**
  * 自动记录：监听 session/event，在每轮结束时把“用户要点 + 助手回答要点”
@@ -4507,7 +5150,7 @@ class CaptureController {
     this.service = service
     this.ctx = service.ctx
     this.logger = service.logger
-    /** sessionId -> { turn, users: string[], assistant: string, images: ImageAttachmentRef[], cwd } */
+    /** sessionId -> { turn, users: string[], assistant: string, images: ImageAttachmentRef[] } */
     this.buffers = new Map()
   }
 
@@ -4550,7 +5193,6 @@ class CaptureController {
           users: [],
           assistant: '',
           images: [],
-          cwd: String(header?.cwd ?? ''),
         })
         break
       }
@@ -4606,7 +5248,6 @@ class CaptureController {
             userText,
             assistantText,
             sessionId,
-            cwd: buffer.cwd,
             turn: buffer.turn,
             imageCount,
           }),
@@ -4625,7 +5266,6 @@ class CaptureController {
           service.addImageMemory({
             ref,
             sessionId,
-            cwd: buffer.cwd,
             turn: buffer.turn,
           }),
         { retries: 0 },
@@ -5154,14 +5794,9 @@ class RecallController {
     this.service.stats.lastRecallQuery = query.slice(0, 120)
     this.service.stats.lastRecallError = ''
     if (!query || query.length < 2) return decision
-    const context = this.service.sessionContext(agentId)
     const timeout = AbortSignal.timeout(options.recallTimeoutMs)
     const signal = payload?.signal === undefined ? timeout : AbortSignal.any([payload.signal, timeout])
-    const { block, hits } = await this.service.recall(query, {
-      signal,
-      sessionId: context.sessionId,
-      cwd: context.cwd,
-    })
+    const { block, hits } = await this.service.recall(query, { signal })
     if (!block || hits.length === 0) return decision
     this.service.stats.lastRecallInjectAt = Date.now()
     this.service.debugLog(`自动召回 ${hits.length} 条记忆（score ${Number(hits[0].score).toFixed(3)}）`)
@@ -5559,19 +6194,6 @@ function assertEnabled(service) {
   return options
 }
 
-/** 按记忆范围构造检索上下文。 */
-function scopeFor(service, agentId) {
-  const recall = service.recallOptions()
-  const context = service.sessionContext(agentId)
-  return {
-    mode: recall.memoryScope,
-    sessionId: context.sessionId,
-    cwd: context.cwd,
-    // 工具是模型主动查询，允许包含当前会话
-    includeCurrentSession: true,
-  }
-}
-
 function searchTool(service) {
   return {
     name: 'memory_search',
@@ -5598,7 +6220,6 @@ function searchTool(service) {
         additionalProperties: false,
         properties: {
           count: { type: 'integer' },
-          scope: { type: 'string' },
           results: {
             type: 'array',
             items: {
@@ -5611,8 +6232,6 @@ function searchTool(service) {
                 time: { type: 'string' },
                 relative: { type: 'string' },
                 score: { type: 'number' },
-                sessionId: { type: 'string' },
-                cwd: { type: 'string' },
                 tags: { type: 'array', items: { type: 'string' } },
                 importance: { type: 'number' },
                 confidence: { type: 'number' },
@@ -5635,11 +6254,9 @@ function searchTool(service) {
       const limit = Number.isInteger(args?.limit)
         ? Math.min(20, Math.max(1, args.limit))
         : options.searchLimit
-      const scope = scopeFor(service, exec?.agent?.id)
       const { hits } = await service.search(query, {
         limit,
         signal: exec?.signal,
-        ...scope,
       })
       const recallOptions = service.recallOptions()
       const ranked = recallOptions.ageGateEnabled ? service.rankHits(hits, 'tool').pass : hits
@@ -5650,7 +6267,6 @@ function searchTool(service) {
       }
       return {
         count: selected.length,
-        scope: scope.mode,
         results: selected.map((hit) => ({
           id: hit.id,
           text: hit.text,
@@ -5658,8 +6274,6 @@ function searchTool(service) {
           time: hit.time,
           relative: hit.relative ?? '',
           score: Number(hit.score.toFixed(4)),
-          sessionId: hit.sessionId,
-          cwd: hit.cwd,
           tags: hit.tags,
           importance: Number.isFinite(hit.importance) ? Number(hit.importance.toFixed(3)) : undefined,
           confidence: Number.isFinite(hit.confidence) ? Number(hit.confidence.toFixed(3)) : undefined,
@@ -5720,15 +6334,12 @@ function saveTool(service) {
       const tags = Array.isArray(args?.tags)
         ? args.tags.filter((tag) => typeof tag === 'string').slice(0, 12)
         : []
-      const context = service.sessionContext(exec?.agent?.id)
       const saved = await service.addMemory({
         kind,
         text: content,
         meta: {
           tags,
           source: 'memory_save',
-          sessionId: context.sessionId,
-          cwd: context.cwd,
           importance: MANUAL_SAVE.importance,
           confidence: MANUAL_SAVE.confidence,
         },
@@ -5804,6 +6415,7 @@ function registerMemoryTools(service) {
 
 
 
+
 /**
  * @param {object} ctx DSH 插件上下文
  * @param {object} config schemastery Config 实例
@@ -5812,7 +6424,9 @@ function applyPlugin(ctx, config) {
   const service = new MemoryService(ctx, config)
   const logger = service.logger
 
-  // 睡眠整理引擎 + 控制器
+  // 整理队列（批次台账）+ 睡眠整理引擎 + 控制器
+  const taskBoard = new QueueService(service)
+  service.taskBoard = taskBoard
   const consolidation = new ConsolidationEngine(service)
   const sleep = new SleepController(service, consolidation)
   service.consolidation = consolidation
@@ -5833,7 +6447,7 @@ function applyPlugin(ctx, config) {
 
   const provider = service.activeProvider()
   logger.info?.(
-    `[dsh-memory] 已加载 v0.7.0：provider=${provider.id}（${provider.embedModel}，${provider.dimensions} 维）→ Qdrant ${service.storage().qdrantUrl} / ${service.storage().collection}`,
+    `[dsh-memory] 已加载 v0.8.0：provider=${provider.id}（${provider.embedModel}，${provider.dimensions} 维）→ Qdrant ${service.storage().qdrantUrl} / ${service.storage().collection}`,
   )
 
   // 启动自检：确保 collection 存在，并补齐旧记忆标签（失败只告警）
@@ -5841,7 +6455,13 @@ function applyPlugin(ctx, config) {
     .then(() => service.ensureReady())
     .then((info) => {
       if (info?.created) logger.info?.(`[dsh-memory] 已创建 Qdrant 集合 ${service.storage().collection}`)
-      return service.migrateLegacyMemories().then(() => service.migrateDynamicFields())
+      return service
+        .migrateLegacyMemories()
+        .then(() => service.migrateDynamicFields())
+        .then(async () => {
+          await taskBoard.load()
+          return service.migrateQueueBatchFields(taskBoard.activeNos())
+        })
     })
     .catch((error) => {
       logger.warn?.(`[dsh-memory] 启动自检失败：${errorText(error)}`)

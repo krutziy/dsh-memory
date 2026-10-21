@@ -124,11 +124,6 @@ export const Config = z.object({
     .default(true)
     .volatile()
     .description('每轮开始时自动检索相关长期记忆并注入上下文'),
-  memoryScope: z
-    .union([z.const('global'), z.const('workspace'), z.const('session')])
-    .default('global')
-    .volatile()
-    .description('记忆范围：global=全局共享；workspace=按工作目录隔离；session=按会话隔离'),
   recallTopK: z
     .number()
     .default(3)
@@ -153,11 +148,14 @@ export const Config = z.object({
     .max(4000)
     .volatile()
     .description('自动召回内容注入上下文时的最大字符数'),
-  recallIncludeCurrentSession: z
-    .boolean()
-    .default(false)
+  recallMinAgeMinutes: z
+    .number()
+    .default(10)
+    .step(1)
+    .min(0)
+    .max(1440)
     .volatile()
-    .description('自动召回时是否包含当前会话自身的记忆'),
+    .description('自动召回时排除最近 N 分钟内自动记录的对话片段（0=不排除），避免重复注入'),
   recallTimeoutMs: z
     .number()
     .default(3000)

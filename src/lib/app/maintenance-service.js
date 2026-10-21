@@ -204,6 +204,54 @@ export class MaintenanceService {
     }
   }
 
+  /**
+   * v0.8 迁移：把 payload.batch 里“不再对应活跃批次”的旧编号清空。
+   * 编号只在待整理期间存在；终态批次的记忆不应再带编号。
+   */
+  async migrateQueueBatchFields(activeNos) {
+    try {
+      const active = activeNos instanceof Set ? activeNos : new Set(activeNos ?? [])
+      await this.ensureReady()
+      const qdrant = await this.qdrant()
+      const storage = this.storage()
+      const stale = []
+      const legacyFields = []
+      let offset
+      for (let page = 0; page < 100; page += 1) {
+        const { points, nextOffset } = await qdrant.scroll(storage.collection, {
+          limit: 256,
+          offset,
+          withPayload: true,
+          withVector: false,
+        })
+        for (const point of points) {
+          const payload = point.payload ?? {}
+          const batch = String(payload.batch ?? '')
+          if (batch && !active.has(batch)) stale.push(String(point.id))
+          if (payload.sessionId !== undefined || payload.cwd !== undefined) legacyFields.push(String(point.id))
+        }
+        if (!nextOffset || points.length === 0) break
+        offset = nextOffset
+      }
+      if (stale.length > 0) {
+        for (let index = 0; index < stale.length; index += 200) {
+          await qdrant.setPayload(storage.collection, { batch: '' }, stale.slice(index, index + 200))
+        }
+        this.logger.info?.(`[dsh-memory] 已清理 ${stale.length} 条旧记忆的过期批次编号`)
+      }
+      if (legacyFields.length > 0 && typeof qdrant.deletePayloadKeys === 'function') {
+        for (let index = 0; index < legacyFields.length; index += 200) {
+          await qdrant.deletePayloadKeys(storage.collection, ['sessionId', 'cwd'], legacyFields.slice(index, index + 200))
+        }
+        this.logger.info?.(`[dsh-memory] 已从 ${legacyFields.length} 条旧记忆移除 sessionId/cwd`)
+      }
+      return stale.length + legacyFields.length
+    } catch (error) {
+      this.logger.warn?.(`[dsh-memory] 批次编号迁移失败：${errorText(error)}`)
+      return 0
+    }
+  }
+
   /** 给 v0.6 旧记忆补齐动态召回字段（anchorTs/importance/confidence/accessEvents/exposureCount）。 */
   async migrateDynamicFields() {
     try {

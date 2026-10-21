@@ -92,7 +92,7 @@ export class QdrantClient {
       })
       const info = { name: collection, points: 0, size, distance: 'Cosine', payloadIndexes: [] }
       await this.ensurePayloadIndexes(collection)
-      return { ok: true, created: true, info: { ...info, payloadIndexes: ['kind', 'sessionId', 'cwd', 'ts'] } }
+      return { ok: true, created: true, info: { ...info, payloadIndexes: ['kind', 'level', 'batch', 'ts'] } }
     }
     if (existing.size !== null && existing.size !== size) {
       return {
@@ -110,8 +110,8 @@ export class QdrantClient {
   async ensurePayloadIndexes(collection) {
     const indexes = [
       { field_name: 'kind', field_schema: 'keyword' },
-      { field_name: 'sessionId', field_schema: 'keyword' },
-      { field_name: 'cwd', field_schema: 'keyword' },
+      { field_name: 'level', field_schema: 'integer' },
+      { field_name: 'batch', field_schema: 'keyword' },
       { field_name: 'ts', field_schema: 'integer' },
     ]
     for (const index of indexes) {
@@ -123,6 +123,20 @@ export class QdrantClient {
         this.logger?.warn?.(`[dsh-memory] 创建 Qdrant 索引 ${index.field_name} 失败：${errorText(error)}`)
       }
     }
+  }
+
+  /** 删除若干 point 上的指定 payload 字段（去会话痕迹用）。 */
+  async deletePayloadKeys(collection, keys, ids) {
+    const list = (ids ?? []).map(String).filter(Boolean)
+    const fields = (keys ?? []).map(String).filter(Boolean)
+    if (list.length === 0 || fields.length === 0) return 0
+    await this.request(
+      'POST',
+      `/collections/${encodeURIComponent(collection)}/points/payload/delete`,
+      { keys: fields, points: list, wait: true },
+      { timeoutMs: 30000 },
+    )
+    return list.length
   }
 
   /** 写入/覆盖 points。 */

@@ -125,13 +125,12 @@ window.__ModuleLoader__.load({
       { key: 'qdrantUrl', type: 'text', tab: 'model' },
       { key: 'collection', type: 'text', tab: 'model' },
       { key: 'qdrantApiKeyEnv', type: 'text', tab: 'model' },
-      { key: 'memoryScope', type: 'select', tab: 'behavior', options: ['global', 'workspace', 'session'] },
       { key: 'autoCapture', type: 'switch', tab: 'behavior' },
       { key: 'autoRecall', type: 'switch', tab: 'behavior' },
       { key: 'recallTopK', type: 'number', tab: 'behavior' },
       { key: 'recallMinScore', type: 'number', tab: 'behavior', float: true },
       { key: 'recallMaxChars', type: 'number', tab: 'behavior' },
-      { key: 'recallIncludeCurrentSession', type: 'switch', tab: 'behavior' },
+      { key: 'recallMinAgeMinutes', type: 'number', tab: 'behavior' },
       { key: 'recallTimeoutMs', type: 'number', tab: 'behavior' },
       { key: 'recallAgeGateEnabled', type: 'switch', tab: 'behavior' },
       { key: 'recallStrictness', type: 'number', tab: 'behavior', float: true },
@@ -155,6 +154,8 @@ window.__ModuleLoader__.load({
       { key: 'sleepAt', type: 'text', tab: 'behavior' },
       { key: 'sleepRetryMinutes', type: 'number', tab: 'behavior' },
       { key: 'idleMinutes', type: 'number', tab: 'behavior' },
+      { key: 'level2AfterDays', type: 'number', tab: 'behavior' },
+      { key: 'level3AfterDays', type: 'number', tab: 'behavior' },
       { key: 'consolidationProviderId', type: 'text', tab: 'behavior' },
       { key: 'consolidationModel', type: 'text', tab: 'behavior' },
       { key: 'experimentalEventMergeEnabled', type: 'switch', tab: 'behavior' },
@@ -1199,6 +1200,22 @@ window.__ModuleLoader__.load({
 .dsm-toolbar .dsm-select{flex:none;width:auto;min-width:96px}
 .dsm-danger{border-top:.5px solid var(--dsw-alias-border-l2);padding-top:14px;display:flex;flex-direction:column;gap:10px}
 .dsm-dangerTitle{margin:0;font-size:13px;font-weight:500;color:var(--dsw-alias-state-error-primary)}
+.dsm-queue{display:flex;flex-direction:column;gap:6px;margin-top:2px}
+.dsm-queueTitle{font-size:12px;font-weight:500;color:var(--dsw-alias-label-secondary);margin:0}
+.dsm-queueTable{display:flex;flex-direction:column;gap:4px}
+.dsm-queueRow{display:grid;grid-template-columns:64px 1fr 76px 64px 108px;gap:8px;align-items:baseline;font-size:12px;line-height:18px;padding:3px 0;border-bottom:.5px solid var(--dsw-alias-border-l2)}
+.dsm-queueRow:last-child{border-bottom:0}
+.dsm-queueNo{font-variant-numeric:tabular-nums;color:var(--dsw-alias-label-secondary)}
+.dsm-queueEvent{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.dsm-queueStatus{color:var(--dsw-alias-label-secondary)}
+.dsm-q-collecting{color:var(--dsw-alias-label-tertiary)}
+.dsm-q-sealed{color:var(--dsw-alias-label-secondary)}
+.dsm-q-running{color:var(--dsw-alias-state-business-primary)}
+.dsm-q-waiting{color:var(--dsw-alias-label-tertiary)}
+.dsm-q-failed{color:var(--dsw-alias-state-error-primary)}
+.dsm-queueCounts,.dsm-queueDue{color:var(--dsw-alias-label-tertiary);font-variant-numeric:tabular-nums;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.dsm-queueEmpty{padding:10px 0}
+.dsm-emptySmall{padding:12px}
 `
 
     function StyleTag() {
@@ -1525,12 +1542,6 @@ window.__ModuleLoader__.load({
           ),
           h(
             'div',
-            { className: 'dsm-statusRow', key: 'scope' },
-            h('span', { className: 'dsm-statusLabel' }, t('statusScope')),
-            h('span', { className: 'dsm-statusValue' }, t('option.memoryScope.' + (behavior.memoryScope ?? 'global'))),
-          ),
-          h(
-            'div',
             { className: 'dsm-statusRow', key: 'timezone' },
             h('span', { className: 'dsm-statusLabel' }, t('statusTimezone')),
             h(
@@ -1559,7 +1570,7 @@ window.__ModuleLoader__.load({
               'span',
               { className: 'dsm-statusValue' },
               data.levels
-                ? `L0 ${data.levels[0] ?? 0} · L1 ${data.levels[1] ?? 0} · L2 ${data.levels[2] ?? 0} · L3 ${data.levels[3] ?? 0}`
+                ? `${t('levelRaw')} ${data.levels[0] ?? 0} · ${t('level1')} ${data.levels[1] ?? 0} · ${t('level2')} ${data.levels[2] ?? 0} · ${t('level3')} ${data.levels[3] ?? 0}`
                 : t('statusNoData'),
             ),
           ),
@@ -1609,6 +1620,21 @@ window.__ModuleLoader__.load({
                 done: data.queue?.done ?? 0,
                 failed: data.queue?.failed ?? 0,
               }),
+            ),
+          ),
+          h(
+            'div',
+            { className: 'dsm-statusRow', key: 'taskQueue' },
+            h('span', { className: 'dsm-statusLabel' }, t('statusTaskQueue')),
+            h(
+              'span',
+              { className: 'dsm-statusValue' },
+              data.consolidation
+                ? t('statusTaskQueueValue', {
+                    pending: data.consolidation.pendingTotal ?? 0,
+                    due: data.consolidation.nextDueTime || '—',
+                  })
+                : t('statusNoData'),
             ),
           ),
         )
@@ -1833,7 +1859,7 @@ window.__ModuleLoader__.load({
       const running = state.sleepRun?.phase === 'running'
       const levelsText = (levels) =>
         Object.entries(levels ?? {})
-          .map(([level, stat]) => `L${level}:${stat.batches ?? 0} 批/${stat.input ?? 0}→${stat.output ?? 0}`)
+          .map(([level, stat]) => `${levelName(t, level)}：${stat.batches ?? 0} 批/${stat.input ?? 0}→${stat.output ?? 0}`)
           .join(' · ')
       const lastRun = sleep?.lastResult
       const statusRows = [
@@ -1897,6 +1923,8 @@ window.__ModuleLoader__.load({
           h(ScalarField, { field: SCALAR_BY_KEY.get('sleepAt'), state, actions, t, disabled }),
           h(ScalarField, { field: SCALAR_BY_KEY.get('sleepRetryMinutes'), state, actions, t, disabled }),
           h(ScalarField, { field: SCALAR_BY_KEY.get('idleMinutes'), state, actions, t, disabled }),
+          h(ScalarField, { field: SCALAR_BY_KEY.get('level2AfterDays'), state, actions, t, disabled }),
+          h(ScalarField, { field: SCALAR_BY_KEY.get('level3AfterDays'), state, actions, t, disabled }),
         ),
         h(
           'div',
@@ -1914,7 +1942,62 @@ window.__ModuleLoader__.load({
           h('p', { className: 'dsm-hint' }, t('sleepModelHint')),
         ),
         h('div', { className: 'dsm-statusList' }, statusRows),
+        h(QueueTable, { summary: consolidation ?? data?.consolidation ?? null, t }),
       )
+    }
+
+    /** 整理队列（编号只在待整理期间存在）。 */
+    function QueueTable({ summary, t }) {
+      const rows = (summary?.active ?? []).slice(0, 8)
+      const byStatus = summary?.byStatus ?? {}
+      const statusLine = ['collecting', 'sealed', 'running', 'waiting', 'failed']
+        .map((status) => `${t('queueStatus.' + status)} ${byStatus[status] ?? 0}`)
+        .join(' · ')
+      return h(
+        'div',
+        { className: 'dsm-queue' },
+        h('p', { className: 'dsm-queueTitle' }, `${t('sleepQueueTitle')} · ${statusLine}`),
+        rows.length === 0
+          ? h('div', { className: 'dsm-empty dsm-emptySmall' }, t('sleepQueueEmpty'))
+          : h(
+              'div',
+              { className: 'dsm-queueTable' },
+              rows.map((batch) =>
+                h(
+                  'div',
+                  { className: 'dsm-queueRow', key: batch.key },
+                  h('span', { className: 'dsm-queueNo' }, batch.no ? '#' + batch.no : '—'),
+                  h('span', { className: 'dsm-queueEvent', title: batch.key }, queueTitle(batch, t)),
+                  h('span', { className: 'dsm-queueStatus dsm-q-' + (batch.status || 'sealed') }, t('queueStatus.' + (batch.status || 'sealed'))),
+                  h('span', { className: 'dsm-queueCounts', title: t('sleepQueueCountsHint') }, `${batch.sourceCount ?? 0} → ${batch.outputCount || '—'}`),
+                  h('span', { className: 'dsm-queueDue', title: batch.lastError ?? '' }, batch.status === 'failed' ? (batch.lastError || t('queueStatus.failed')) : batch.dueTime ? batch.dueTime : batch.attempts ? t('sleepQueueAttempts', { n: batch.attempts }) : ''),
+                ),
+              ),
+              (summary?.active?.length ?? 0) > rows.length
+                ? h('p', { className: 'dsm-hint' }, t('sleepQueueMore', { n: summary.active.length - rows.length }))
+                : null,
+            ),
+      )
+    }
+
+    /** 层级人话名称。 */
+    function levelName(t, level) {
+      const n = Number(level)
+      if (n === 0) return t('levelRaw')
+      if (n === 1) return t('level1')
+      if (n === 2) return t('level2')
+      if (n === 3) return t('level3')
+      return `L${n}`
+    }
+
+    /** 队列行标题：事件 / 周 / 长期。 */
+    function queueTitle(batch, t) {
+      if (Number(batch.level) === 2) return `${batch.weekKey} · ${t('level2')}`
+      if (Number(batch.level) >= 3) return `${batch.monthKey} · ${t('level3')}`
+      const key = String(batch.key ?? '')
+      if (key.endsWith('#misc')) return `${batch.dayKey} · ${t('queueMisc')}`
+      const seq = (/#(\d+)$/.exec(key) ?? [])[1]
+      return `${batch.dayKey} · ${t('queueEvent')}${seq ? ' ' + Number(seq) : ''}`
     }
 
     /** 实验功能卡。 */
@@ -2265,7 +2348,7 @@ window.__ModuleLoader__.load({
     }
 
     function BehaviorTab({ state, actions, t, disabled }) {
-      const behaviorKeys = ['memoryScope', 'autoCapture', 'autoRecall', 'recallIncludeCurrentSession', 'recallTopK', 'recallMinScore', 'recallMaxChars', 'recallTimeoutMs']
+      const behaviorKeys = ['autoCapture', 'autoRecall', 'recallTopK', 'recallMinScore', 'recallMaxChars', 'recallMinAgeMinutes', 'recallTimeoutMs']
       const imageKeys = ['imageMode', 'captionPrompt', 'captionMaxTokens']
       const toolKeys = ['toolsEnabled', 'toolSearchLimit']
       return h(
@@ -2384,7 +2467,7 @@ window.__ModuleLoader__.load({
       const sleepRunning = state.sleepRun?.phase === 'running'
       const levelsText = (levels) =>
         Object.entries(levels ?? {})
-          .map(([level, stat]) => `L${level}:${stat.batches ?? 0} 批/${stat.input ?? 0}→${stat.output ?? 0}`)
+          .map(([level, stat]) => `${levelName(t, level)}：${stat.batches ?? 0} 批/${stat.input ?? 0}→${stat.output ?? 0}`)
           .join(' · ')
       const historyRows = (engineSummary?.history ?? []).slice().reverse().map((entry, index) =>
         h(
@@ -2412,7 +2495,7 @@ window.__ModuleLoader__.load({
               'div',
               { className: 'dsm-memMeta' },
               h(Badge, null, t('kind.' + (item.kind || 'note'))),
-              h(Badge, null, 'L' + (item.level ?? 0)),
+              h(Badge, null, levelName(t, item.level ?? 0)),
               Number.isFinite(Number(item.importance)) ? h(Badge, null, 'I' + Math.round(Number(item.importance) * 100)) : null,
               Number.isFinite(Number(item.confidence)) ? h(Badge, null, 'C' + Math.round(Number(item.confidence) * 100)) : null,
               item.batch ? h('span', { title: t('memoryBatch') }, '#' + item.batch) : null,
@@ -2420,7 +2503,6 @@ window.__ModuleLoader__.load({
               h('span', null, item.time),
               item.relative ? h('span', null, `(${item.relative})`) : null,
               item.score !== undefined ? h('span', null, t('memoryScore', { score: item.score.toFixed(3) })) : null,
-              item.cwd ? h('span', { title: item.cwd }, item.cwd) : null,
             ),
             h('div', { className: 'dsm-memText' }, item.text),
           ),
@@ -2551,6 +2633,7 @@ window.__ModuleLoader__.load({
             sleepStatus?.lastError
               ? h('div', { className: 'dsm-statusRow', key: 'sleep-err' }, h('span', { className: 'dsm-statusLabel' }, t('sleepLastError')), h('span', { className: 'dsm-statusValue dsm-err' }, sleepStatus.lastError))
               : null,
+            h(QueueTable, { key: 'sleep-queue', summary: engineSummary, t }),
             h('div', { className: 'dsm-statusRow', key: 'sleep-history-title' }, h('span', { className: 'dsm-statusLabel' }, t('sleepHistory')), h('span', { className: 'dsm-statusValue dsm-muted' }, historyRows.length === 0 ? t('sleepHistoryEmpty') : '')),
             ...historyRows,
           ),
@@ -2912,7 +2995,7 @@ window.__ModuleLoader__.load({
       sleepStateOff: '未开启',
       sleepStateWaiting: '待机中（等待空闲入睡）',
       sleepStateSleeping: '睡觉整理中 💤',
-      sleepPendingBatches: '待处理批次',
+      sleepPendingBatches: '待整理片段',
       sleepNextDue: '最近到期 {time}',
       sleepLastRun: '最近整理',
       sleepNoLastRun: '还没有整理记录',
@@ -2923,21 +3006,33 @@ window.__ModuleLoader__.load({
       sleepRunConfirm: '立即执行一次记忆整理？整理会压缩记忆并删除已处理的原始记忆。',
       sleepProviderAuto: '跟随当前激活 provider',
       sectionSleep: '睡眠整理（记忆巩固）',
-      sectionSleepHint: '开启后每天在睡眠时间检查：最近 1 小时无人类消息且无运行中会话才入睡；原始记忆按天压缩成批次，之后按 7/30 天逐级压缩（类似 100→约 20→约 5 条）。睡眠中发消息会收到 zzzZZ，醒后自动继续处理。',
+      sectionSleepHint: '开启后每天到睡眠时间检查：最近 1 小时没有人类消息、也没有运行中的会话才入睡。睡觉时把当天的片段按会话合并成事件片段；一周后合并成周片段；一个月后合并成长期片段。睡眠中发消息会收到 zzzZZ，醒后自动继续处理。',
       sectionExperimental: '实验功能',
       sectionExperimentalHint: '两个实验功能默认关闭：①跨天相似事件合并（只把相关簇给模型，不塞整库）；②增强记忆（保留 1 级记忆若干天，仅事件/按需召回使用，到期删除）。',
       sectionLevels: '整理级别参数',
-      sectionLevelsHint: '第 1 级按天压缩原始记忆；第 2 级在第 1 级批次创建 7 天后压缩；第 3 级在第 2 级 30 天后压缩；内部结构支持将来增加更多级别。ratio 是输出条数占输入条数的比例，maxItems 是输出上限。',
+      sectionLevelsHint: '原始片段 → 事件片段（每次会话一段）→ 周片段（一周合并一次）→ 长期片段（一月合并一次）。每次合并后片段更少、更抽象；编号只在待整理期间存在。',
       sectionSleepTasks: '整理任务与睡眠状态',
-      sectionSleepTasksHint: '查看睡眠状态、待处理批次与整理历史，也可以立即执行一次整理。整理期间会自动跳过记录与召回。',
+      sectionSleepTasksHint: '查看睡眠状态、整理队列与整理历史，也可以立即执行一次整理。队列编号只在片段等待整理期间存在；整理期间会自动跳过记录与召回。',
       sleepHistory: '整理历史',
       sleepHistoryEmpty: '暂无整理记录',
-      levelAll: '全部层级',
-      levelRaw: '原始（L0）',
-      level1: '1 级',
-      level2: '2 级',
-      level3: '3 级',
-      memoryBatch: '整理批次',
+      levelAll: '全部',
+      levelRaw: '原始片段',
+      level1: '事件片段',
+      level2: '周片段',
+      level3: '长期片段',
+      memoryBatch: '待整理编号',
+      sleepQueueTitle: '整理队列',
+      sleepQueueEmpty: '还没有待整理的片段',
+      sleepQueueMore: '还有 {n} 个未显示',
+      sleepQueueAttempts: '已重试 {n} 次',
+      sleepQueueCountsHint: '来源条数 → 产出条数',
+      queueEvent: '事件',
+      queueMisc: '手动片段',
+      'queueStatus.collecting': '收集中',
+      'queueStatus.sealed': '待整理',
+      'queueStatus.running': '整理中',
+      'queueStatus.waiting': '等待合并',
+      'queueStatus.failed': '失败',
       memoryEnhanced: '增强记忆',
       'field.consolidationEnabled': '开启睡眠整理',
       'field.consolidationEnabledHint': '按天压缩原始记忆，并按任务列表逐级继续压缩',
@@ -2983,14 +3078,14 @@ window.__ModuleLoader__.load({
       'field.level1RatioHint': '输出条数约等于输入条数 × 比例（含摘要），默认 0.2',
       'field.level1MaxItems': '1 级输出上限',
       'field.level1MaxItemsHint': '第 1 级最多保留多少条',
-      'field.level2AfterDays': '2 级触发天数',
-      'field.level2AfterDaysHint': '第 1 级批次创建后多少天进行第 2 级压缩',
+      'field.level2AfterDays': '周合并等待天数',
+      'field.level2AfterDaysHint': '一周结束后再等多少天，把这一周的事件片段合并成周片段',
       'field.level2Ratio': '2 级压缩比例',
       'field.level2RatioHint': '第 2 级输出条数比例',
       'field.level2MaxItems': '2 级输出上限',
       'field.level2MaxItemsHint': '第 2 级最多保留多少条',
-      'field.level3AfterDays': '3 级触发天数',
-      'field.level3AfterDaysHint': '第 2 级批次创建后多少天进行第 3 级压缩',
+      'field.level3AfterDays': '长期合并等待天数',
+      'field.level3AfterDaysHint': '一个月结束后再等多少天，把这一月的周片段合并成长期片段',
       'field.level3Ratio': '3 级压缩比例',
       'field.level3RatioHint': '第 3 级输出条数比例',
       'field.level3MaxItems': '3 级输出上限',
@@ -3031,7 +3126,6 @@ window.__ModuleLoader__.load({
       statusCollection: '集合',
       statusPoints: '{count} 条记忆',
       statusNotCreated: '尚未创建',
-      statusScope: '记忆范围',
       statusTimezone: '时区',
       statusTools: '模型工具',
       statusToolsOn: '已启用',
@@ -3041,7 +3135,9 @@ window.__ModuleLoader__.load({
       statusNoData: '暂无',
       statusMaintenance: '最近维护',
       statusMaintenanceSummary: '过期 {expired} · 超限 {overflow} · 重复 {duplicates}',
-      statusQueue: '后台队列',
+      statusQueue: '写入队列',
+      statusTaskQueue: '整理队列',
+      statusTaskQueueValue: '{pending} 个待整理 · 最近到期 {due}',
       statusPending: '待处理 {pending} · 完成 {done} · 失败 {failed}',
       statusDimsMismatch: '维度不一致：集合 {size} 维，provider {dims} 维，请重建集合或切换 provider',
       keyLabel: 'API Key',
@@ -3168,8 +3264,6 @@ window.__ModuleLoader__.load({
       'field.collectionHint': '记忆保存到该 Qdrant collection',
       'field.qdrantApiKeyEnv': 'Qdrant Key 引用名',
       'field.qdrantApiKeyEnvHint': '留空表示无鉴权（本机回环推荐）',
-      'field.memoryScope': '记忆范围',
-      'field.memoryScopeHint': 'global=全局共享；workspace=按工作目录隔离；session=按会话隔离',
       'field.autoCapture': '自动记录对话要点',
       'field.autoCaptureHint': '每轮结束后把用户要点与助手回答要点写入记忆库',
       'field.autoRecall': '自动召回相关记忆',
@@ -3180,8 +3274,8 @@ window.__ModuleLoader__.load({
       'field.recallMinScoreHint': '0-1，越高越严格（0.35-0.55 较合适）',
       'field.recallMaxChars': '召回注入字符上限',
       'field.recallMaxCharsHint': '注入上下文的记忆文本最大字符数',
-      'field.recallIncludeCurrentSession': '召回包含当前会话',
-      'field.recallIncludeCurrentSessionHint': '默认只召回其他会话，避免重复注入当前对话',
+      'field.recallMinAgeMinutes': '忽略最近对话（分钟）',
+      'field.recallMinAgeMinutesHint': '自动召回时，最近 N 分钟内自动记录的对话片段不参与（0=关闭），避免把刚说过的话再注入一遍',
       'field.recallTimeoutMs': '召回超时（毫秒）',
       'field.recallTimeoutMsHint': '超时则本轮跳过召回，避免拖慢回复',
       'field.timezone': '时区',
@@ -3225,9 +3319,6 @@ window.__ModuleLoader__.load({
       'field.includeSubagentsHint': '是否也记录 subagent 会话的要点',
       'field.debug': '调试日志',
       'field.debugHint': '在 DSH 日志中输出插件调试信息',
-      'option.memoryScope.global': '全局共享',
-      'option.memoryScope.workspace': '按工作区隔离',
-      'option.memoryScope.session': '按会话隔离',
       'option.imageMode.caption': '生成一句话概览（推荐）',
       'option.imageMode.placeholder': '只记录发过图片',
       'option.imageMode.off': '忽略图片',
@@ -3324,7 +3415,7 @@ window.__ModuleLoader__.load({
       sleepStateOff: 'Off',
       sleepStateWaiting: 'Idle (waiting to sleep)',
       sleepStateSleeping: 'Sleeping / consolidating 💤',
-      sleepPendingBatches: 'Pending batches',
+      sleepPendingBatches: 'Pending fragments',
       sleepNextDue: 'next due {time}',
       sleepLastRun: 'Last consolidation',
       sleepNoLastRun: 'No consolidation yet',
@@ -3335,21 +3426,33 @@ window.__ModuleLoader__.load({
       sleepRunConfirm: 'Run one consolidation pass now? Processed source memories will be compressed and deleted.',
       sleepProviderAuto: 'Follow active provider',
       sectionSleep: 'Sleep consolidation (memory consolidation)',
-      sectionSleepHint: 'When enabled, each day at the sleep time the plugin checks: no human message and no running session in the last hour, then consolidates raw memories per day into batches and compresses them further after 7/30 days (like 100 → ~20 → ~5). Messages sent while sleeping get zzzZZ and are resumed automatically after waking.',
+      sectionSleepHint: 'At the sleep time the plugin checks that no human message and no running session appeared in the last hour, then sleeps. It merges the day\'s fragments per session into event fragments, merges them into week fragments after a week and into long-term fragments after a month. Messages sent while sleeping get zzzZZ and are resumed automatically after waking.',
       sectionExperimental: 'Experimental features',
       sectionExperimentalHint: 'Two experimental features, off by default: (1) cross-day similar-event merging (only related clusters go to the model, never the whole DB); (2) enhanced memories — keep level-1 memories for N days, used only by event/on-demand recall, then deleted.',
       sectionLevels: 'Consolidation level parameters',
-      sectionLevelsHint: 'Level 1 compresses raw memories per day; level 2 runs N days after a level-1 batch; level 3 runs N days after a level-2 batch. ratio is the output/input count ratio, maxItems caps the output. The internal structure supports adding more levels later.',
+      sectionLevelsHint: 'Raw fragments → event fragments (one per session) → week fragments (merged weekly) → long-term fragments (merged monthly). Each merge keeps fewer, more abstract fragments; the number only exists while a fragment is waiting to be consolidated.',
       sectionSleepTasks: 'Consolidation tasks & sleep state',
-      sectionSleepTasksHint: 'View sleep state, pending batches and history, or run a consolidation pass now. Capture and recall are skipped while sleeping.',
+      sectionSleepTasksHint: 'View sleep state, the consolidation queue and history, or run a consolidation pass now. Queue numbers exist only while a fragment is waiting; capture and recall are skipped while sleeping.',
       sleepHistory: 'History',
       sleepHistoryEmpty: 'No consolidation yet',
-      levelAll: 'All levels',
-      levelRaw: 'Raw (L0)',
-      level1: 'Level 1',
-      level2: 'Level 2',
-      level3: 'Level 3',
-      memoryBatch: 'Consolidation batch',
+      levelAll: 'All',
+      levelRaw: 'Raw fragments',
+      level1: 'Event fragments',
+      level2: 'Week fragments',
+      level3: 'Long-term fragments',
+      memoryBatch: 'Pending number',
+      sleepQueueTitle: 'Consolidation queue',
+      sleepQueueEmpty: 'Nothing waiting to be consolidated',
+      sleepQueueMore: '{n} more not shown',
+      sleepQueueAttempts: 'retried {n}×',
+      sleepQueueCountsHint: 'sources → outputs',
+      queueEvent: 'event',
+      queueMisc: 'manual',
+      'queueStatus.collecting': 'collecting',
+      'queueStatus.sealed': 'ready',
+      'queueStatus.running': 'consolidating',
+      'queueStatus.waiting': 'waiting to merge',
+      'queueStatus.failed': 'failed',
       memoryEnhanced: 'Enhanced memory',
       'field.consolidationEnabled': 'Enable sleep consolidation',
       'field.consolidationEnabledHint': 'Compress raw memories per day and continue compressing via the task list',
@@ -3395,14 +3498,14 @@ window.__ModuleLoader__.load({
       'field.level1RatioHint': 'Output ≈ input × ratio (including summary); default 0.2',
       'field.level1MaxItems': 'Level 1 max items',
       'field.level1MaxItemsHint': 'Maximum items after level 1',
-      'field.level2AfterDays': 'Level 2 after days',
-      'field.level2AfterDaysHint': 'Days after a level-1 batch before level 2 compression',
+      'field.level2AfterDays': 'Week merge wait (days)',
+      'field.level2AfterDaysHint': 'Days after a week ends before its event fragments are merged into week fragments',
       'field.level2Ratio': 'Level 2 ratio',
       'field.level2RatioHint': 'Level 2 output/input ratio',
       'field.level2MaxItems': 'Level 2 max items',
       'field.level2MaxItemsHint': 'Maximum items after level 2',
-      'field.level3AfterDays': 'Level 3 after days',
-      'field.level3AfterDaysHint': 'Days after a level-2 batch before level 3 compression',
+      'field.level3AfterDays': 'Long-term merge wait (days)',
+      'field.level3AfterDaysHint': 'Days after a month ends before its week fragments are merged into long-term fragments',
       'field.level3Ratio': 'Level 3 ratio',
       'field.level3RatioHint': 'Level 3 output/input ratio',
       'field.level3MaxItems': 'Level 3 max items',
@@ -3443,7 +3546,6 @@ window.__ModuleLoader__.load({
       statusCollection: 'Collection',
       statusPoints: '{count} memories',
       statusNotCreated: 'not created yet',
-      statusScope: 'Memory scope',
       statusTimezone: 'Timezone',
       statusTools: 'Model tools',
       statusToolsOn: 'enabled',
@@ -3453,7 +3555,9 @@ window.__ModuleLoader__.load({
       statusNoData: 'none yet',
       statusMaintenance: 'Last maintenance',
       statusMaintenanceSummary: 'expired {expired} · overflow {overflow} · duplicates {duplicates}',
-      statusQueue: 'Background queue',
+      statusQueue: 'Write queue',
+      statusTaskQueue: 'Consolidation queue',
+      statusTaskQueueValue: '{pending} pending · next due {due}',
       statusPending: 'pending {pending} · done {done} · failed {failed}',
       statusDimsMismatch: 'Dimension mismatch: collection {size}, provider {dims}. Rebuild the collection or switch provider.',
       keyLabel: 'API key',
@@ -3580,8 +3684,6 @@ window.__ModuleLoader__.load({
       'field.collectionHint': 'Qdrant collection storing the memories',
       'field.qdrantApiKeyEnv': 'Qdrant key ref',
       'field.qdrantApiKeyEnvHint': 'Blank means no auth (recommended for loopback)',
-      'field.memoryScope': 'Memory scope',
-      'field.memoryScopeHint': 'global=shared; workspace=isolated by working directory; session=isolated by session',
       'field.autoCapture': 'Auto-record turn highlights',
       'field.autoCaptureHint': 'Store user request and assistant answer highlights after every turn',
       'field.autoRecall': 'Auto-recall relevant memories',
@@ -3592,8 +3694,8 @@ window.__ModuleLoader__.load({
       'field.recallMinScoreHint': '0-1, higher is stricter (0.35-0.55 works well)',
       'field.recallMaxChars': 'Recall character limit',
       'field.recallMaxCharsHint': 'Max characters of injected memory text',
-      'field.recallIncludeCurrentSession': 'Include current session',
-      'field.recallIncludeCurrentSessionHint': 'By default only other sessions are recalled',
+      'field.recallMinAgeMinutes': 'Ignore recent turns (minutes)',
+      'field.recallMinAgeMinutesHint': 'Auto recall skips auto-recorded turns from the last N minutes (0=off), avoiding re-injecting what was just said',
       'field.recallTimeoutMs': 'Recall timeout (ms)',
       'field.recallTimeoutMsHint': 'Skip recall for this turn when timed out',
       'field.timezone': 'Timezone',
@@ -3637,9 +3739,6 @@ window.__ModuleLoader__.load({
       'field.includeSubagentsHint': 'Also record highlights from subagent sessions',
       'field.debug': 'Debug logging',
       'field.debugHint': 'Print plugin debug information to the DSH log',
-      'option.memoryScope.global': 'Global (shared)',
-      'option.memoryScope.workspace': 'Per workspace',
-      'option.memoryScope.session': 'Per session',
       'option.imageMode.caption': 'One-sentence summary (recommended)',
       'option.imageMode.placeholder': 'Only record that an image was sent',
       'option.imageMode.off': 'Ignore images',

@@ -3,8 +3,10 @@
  * provider 解析、写入/检索/范围过滤、记忆列表/导出/删除、保留与维护、HTTP 路由、工具、capture/recall。
  */
 import { EventEmitter } from 'node:events'
+import { rm } from 'node:fs/promises'
 import { CaptureController } from '../src/lib/entry/capture-controller.js'
 import { MemoryService } from '../src/lib/app/memory-service.js'
+import { QueueService } from '../src/lib/app/queue-service.js'
 import { RecallController } from '../src/lib/entry/recall-controller.js'
 import { registerHttpRoutes } from '../src/lib/entry/http/routes.js'
 import { registerMemoryTools } from '../src/lib/entry/tools.js'
@@ -89,11 +91,10 @@ const baseConfig = {
   captureMinChars: 12,
   includeSubagents: false,
   autoRecall: true,
-  memoryScope: 'global',
   recallTopK: 3,
   recallMinScore: 0.3,
   recallMaxChars: 600,
-  recallIncludeCurrentSession: false,
+  recallMinAgeMinutes: 0,
   recallTimeoutMs: 3000,
   imageMode: 'caption',
   captionPrompt: '',
@@ -110,7 +111,12 @@ const baseConfig = {
 }
 
 const config = JSON.parse(JSON.stringify(baseConfig))
+process.env.DSH_HOME = '/tmp/memtest-home-host'
+await rm(process.env.DSH_HOME, { recursive: true, force: true })
 const service = new MemoryService(ctx, config)
+const taskBoard = new QueueService(service)
+service.taskBoard = taskBoard
+await taskBoard.load()
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms))
 
 let passed = 0
@@ -176,7 +182,7 @@ check('active provider switched', service.activeProvider().id === 'alt', service
 config.activeProvider = 'siliconflow'
 service.collectionState.checkedAt = 0
 
-console.log('\n=== 2. 写入 / 检索 / 范围 ===')
+console.log('\n=== 2. 写入 / 检索 / 事件批次 ===')
 sessions.set('session-A', { header: { cwd: '/home/ubuntu/mem' } })
 sessions.set('session-B', { header: { cwd: '/home/ubuntu/mem' } })
 sessions.set('session-C', { header: { cwd: '/tmp/other-project' } })
@@ -185,64 +191,75 @@ const turn = await service.addTurnMemory({
   userText: '我的名字是测试用户，我住在杭州，喜欢喝美式咖啡。',
   assistantText: '好的，已记住：你叫测试用户，住在杭州，喜欢美式咖啡。',
   sessionId: 'session-A',
-  cwd: '/home/ubuntu/mem',
   turn: 1,
 })
 check('addTurnMemory ok', turn.ok === true, turn)
+await waitQueue()
+
+const turnList = await service.listMemories({ query: '我的名字是测试用户', limit: 5 })
+const turnItem = turnList.items.find((item) => item.kind === 'turn' && item.text.includes('杭州'))
+check('turn memory carries pending batch number', /^\d{5}$/.test(String(turnItem?.batch ?? '')), turnItem?.batch)
+check('memory no longer stores sessionId/cwd', turnItem !== undefined && turnItem.sessionId === undefined && turnItem.cwd === undefined, turnItem)
+
+const queueSummary = taskBoard.summary()
+check('queue has one collecting event batch', queueSummary.byStatus?.collecting === 1, queueSummary.byStatus)
+check('event batch key is day#seq', /^\d{4}-\d{2}-\d{2}#\d+$/.test(queueSummary.active[0]?.key ?? ''), queueSummary.active[0]?.key)
+
+const turnB = await service.addTurnMemory({
+  userText: '另一个会话里聊到：我喜欢在周末去爬山。',
+  assistantText: '好的，已记住你喜欢周末爬山。',
+  sessionId: 'session-B',
+  turn: 1,
+})
+check('addTurnMemory second session ok', turnB.ok === true, turnB)
+await waitQueue()
+const queueSummary2 = taskBoard.summary()
+check('two sessions same day get distinct numbers', new Set(queueSummary2.active.map((batch) => batch.no)).size === 2, queueSummary2.active.map((batch) => batch.no))
 
 const fact = await service.addMemory({
   kind: 'fact',
   text: '用户偏好：回答使用简体中文，并且尽量简洁。',
-  meta: { tags: ['偏好', '语言'], sessionId: 'session-A', cwd: '/home/ubuntu/mem' },
+  meta: { tags: ['偏好', '语言'] },
 })
 check('addMemory fact ok', fact.ok === true, fact)
 
 const otherProject = await service.addMemory({
   kind: 'fact',
   text: '另一个项目的暗号是红色鹦鹉-77。',
-  meta: { sessionId: 'session-C', cwd: '/tmp/other-project' },
 })
 check('addMemory other project ok', otherProject.ok === true)
 
 const image = await service.addImageMemory({
   ref: { attachmentId: 'att-1', mediaType: 'image/png', width: 64, height: 64 },
   sessionId: 'session-A',
-  cwd: '/home/ubuntu/mem',
   turn: 2,
 })
 check('image memory caption stored', image.ok === true && String(image.text).startsWith('图片概览：'), image)
 
 const collection = await service.qdrant().then((q) => q.collectionInfo(COLLECTION))
 check('collection created with dims 1024', collection !== null && collection.size === 1024, collection)
-check('payload indexes created', ['ts', 'kind', 'sessionId', 'cwd'].every((name) => collection.payloadIndexes.includes(name)), collection.payloadIndexes)
+check('payload indexes created', ['ts', 'kind', 'level', 'batch'].every((name) => collection.payloadIndexes.includes(name)), collection.payloadIndexes)
 
 const globalSearch = await service.search('我叫什么名字，住在哪里', { limit: 5 })
 check('global search hits', globalSearch.hits.length > 0, globalSearch.hits.length)
 check('global search contains expected memory', globalSearch.hits.some((hit) => hit.text.includes('杭州')), globalSearch.hits.map((h) => h.text.slice(0, 30)))
 
-// 回忆（默认全局 + 排除当前会话）
-config.memoryScope = 'global'
-const recall = await service.recall('我喜欢喝什么咖啡', { sessionId: 'session-B', cwd: '/home/ubuntu/mem' })
-check('global recall block', recall.block.includes('美式'), recall.block.slice(0, 120))
-const sameSessionRecall = await service.recall('我的名字', { sessionId: 'session-A', cwd: '/home/ubuntu/mem' })
-check('global recall excludes current session', !sameSessionRecall.hits.some((hit) => hit.sessionId === 'session-A'), sameSessionRecall.hits.map((h) => h.sessionId))
-
-// 工作区范围
-config.memoryScope = 'workspace'
-const workspaceRecall = await service.recall('另一个项目的暗号', { sessionId: 'session-B', cwd: '/home/ubuntu/mem' })
-check('workspace recall excludes other cwd', !workspaceRecall.hits.some((hit) => hit.text.includes('红色鹦鹉')), workspaceRecall.hits.map((h) => h.text.slice(0, 30)))
-config.recallIncludeCurrentSession = true
-const workspaceRecall2 = await service.recall('另一个项目的暗号', { sessionId: 'session-C', cwd: '/tmp/other-project' })
-check('workspace recall includes same cwd', workspaceRecall2.hits.some((hit) => hit.text.includes('红色鹦鹉')), workspaceRecall2.hits.map((h) => h.text.slice(0, 30)))
-config.recallIncludeCurrentSession = false
-
-// 会话范围
-config.memoryScope = 'session'
-const sessionRecall = await service.recall('我的名字', { sessionId: 'session-A', cwd: '/home/ubuntu/mem' })
-check('session recall includes own session', sessionRecall.hits.some((hit) => hit.sessionId === 'session-A'), sessionRecall.hits.map((h) => h.sessionId))
-const sessionRecallB = await service.recall('我的名字', { sessionId: 'session-B', cwd: '/home/ubuntu/mem' })
-check('session recall excludes other session', sessionRecallB.hits.length === 0, sessionRecallB.hits.length)
-config.memoryScope = 'global'
+// v0.8：用“最近 N 分钟”时间窗替代“排除当前会话”
+config.recallAgeGateEnabled = false
+config.recallMinAgeMinutes = 10
+const recentRecall = await service.recall('我的名字是测试用户，住在杭州，喜欢美式咖啡')
+check('recent auto-recorded turns are skipped', !recentRecall.hits.some((hit) => hit.kind === 'turn'), recentRecall.hits.map((hit) => ({ kind: hit.kind, text: hit.text.slice(0, 20) })))
+const factRecall = await service.recall('回答使用简体中文，并且尽量简洁')
+check('facts are not affected by the time window', factRecall.hits.some((hit) => hit.text.includes('简体中文')), factRecall.hits.map((hit) => hit.text.slice(0, 20)))
+await service.addMemory({
+  kind: 'turn',
+  text: '较早的记录：用户的名字是测试用户，现居杭州，爱喝美式咖啡。',
+  meta: { ts: Date.now() - 20 * 60000 },
+})
+const oldTurnRecall = await service.recall('用户的名字是测试用户，现居杭州，爱喝美式咖啡')
+check('older turns are still recalled', oldTurnRecall.hits.some((hit) => hit.kind === 'turn'), oldTurnRecall.hits.map((hit) => ({ kind: hit.kind, text: hit.text.slice(0, 20) })))
+config.recallMinAgeMinutes = 0
+config.recallAgeGateEnabled = true
 
 console.log('\n=== 3. 记忆管理（列表 / 导出 / 删除） ===')
 const list = await service.listMemories({ limit: 10 })
@@ -264,7 +281,7 @@ if (exportedData) {
   const afterDelete = await service.listMemories({ limit: 20 })
   check('forget deletes memory', !afterDelete.items.some((item) => item.text.includes('红色鹦鹉')), afterDelete.items.map((i) => i.text.slice(0, 20)))
   // 加回来用于后续维护测试
-  await service.addMemory({ kind: 'fact', text: '另一个项目的暗号是红色鹦鹉-77。', meta: { sessionId: 'session-C', cwd: '/tmp/other-project' } })
+  await service.addMemory({ kind: 'fact', text: '另一个项目的暗号是红色鹦鹉-77。' })
 }
 
 console.log('\n=== 3.5 时间与时区 ===')
@@ -290,16 +307,16 @@ check('utc list times differ from shanghai list', utcList.items[0]?.time !== tod
 
 // 召回上下文包含当前时间
 config.timezone = 'Asia/Shanghai'
-const timeRecall = await service.recall('我的名字', { sessionId: 'session-Z', cwd: '/home/ubuntu/mem' })
+const timeRecall = await service.recall('我的名字')
 check('recall block includes current time', timeRecall.block.includes('当前时间：'), timeRecall.block.slice(0, 200))
 check('recall block mentions timezone', timeRecall.block.includes('Asia/Shanghai'), timeRecall.block.slice(0, 200))
 check('recall block includes relative time', /\d+ (分钟|小时|天)前|刚刚/.test(timeRecall.block), timeRecall.block.slice(0, 300))
 config.injectCurrentTime = false
-const noTimeRecall = await service.recall('我的名字', { sessionId: 'session-Z', cwd: '/home/ubuntu/mem' })
+const noTimeRecall = await service.recall('我的名字')
 check('injectCurrentTime=false omits current time', !noTimeRecall.block.includes('当前时间：'), noTimeRecall.block.slice(0, 120))
 config.injectCurrentTime = true
 config.relativeTime = false
-const noRelativeRecall = await service.recall('我的名字', { sessionId: 'session-Z', cwd: '/home/ubuntu/mem' })
+const noRelativeRecall = await service.recall('我的名字')
 check('relativeTime=false omits relative labels', !/\d+ 天前|\d+ 小时前|\d+ 分钟前/.test(noRelativeRecall.block), noRelativeRecall.block.slice(0, 300))
 config.relativeTime = true
 
@@ -324,7 +341,7 @@ await qdrant.upsert(COLLECTION, [
   {
     id: oldMemory.id,
     vector: oldVector,
-    payload: { text: oldMemory.text, kind: 'note', ts: Date.now() - 30 * 86400000, sessionId: '', cwd: '' },
+    payload: { text: oldMemory.text, kind: 'note', ts: Date.now() - 30 * 86400000, level: 0, batch: '' },
   },
 ])
 config.retentionDays = 7

@@ -85,6 +85,22 @@
 .dsm-toolbar .dsm-select{flex:none;width:auto;min-width:96px}
 .dsm-danger{border-top:.5px solid var(--dsw-alias-border-l2);padding-top:14px;display:flex;flex-direction:column;gap:10px}
 .dsm-dangerTitle{margin:0;font-size:13px;font-weight:500;color:var(--dsw-alias-state-error-primary)}
+.dsm-queue{display:flex;flex-direction:column;gap:6px;margin-top:2px}
+.dsm-queueTitle{font-size:12px;font-weight:500;color:var(--dsw-alias-label-secondary);margin:0}
+.dsm-queueTable{display:flex;flex-direction:column;gap:4px}
+.dsm-queueRow{display:grid;grid-template-columns:64px 1fr 76px 64px 108px;gap:8px;align-items:baseline;font-size:12px;line-height:18px;padding:3px 0;border-bottom:.5px solid var(--dsw-alias-border-l2)}
+.dsm-queueRow:last-child{border-bottom:0}
+.dsm-queueNo{font-variant-numeric:tabular-nums;color:var(--dsw-alias-label-secondary)}
+.dsm-queueEvent{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.dsm-queueStatus{color:var(--dsw-alias-label-secondary)}
+.dsm-q-collecting{color:var(--dsw-alias-label-tertiary)}
+.dsm-q-sealed{color:var(--dsw-alias-label-secondary)}
+.dsm-q-running{color:var(--dsw-alias-state-business-primary)}
+.dsm-q-waiting{color:var(--dsw-alias-label-tertiary)}
+.dsm-q-failed{color:var(--dsw-alias-state-error-primary)}
+.dsm-queueCounts,.dsm-queueDue{color:var(--dsw-alias-label-tertiary);font-variant-numeric:tabular-nums;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.dsm-queueEmpty{padding:10px 0}
+.dsm-emptySmall{padding:12px}
 `
 
     function StyleTag() {
@@ -411,12 +427,6 @@
           ),
           h(
             'div',
-            { className: 'dsm-statusRow', key: 'scope' },
-            h('span', { className: 'dsm-statusLabel' }, t('statusScope')),
-            h('span', { className: 'dsm-statusValue' }, t('option.memoryScope.' + (behavior.memoryScope ?? 'global'))),
-          ),
-          h(
-            'div',
             { className: 'dsm-statusRow', key: 'timezone' },
             h('span', { className: 'dsm-statusLabel' }, t('statusTimezone')),
             h(
@@ -445,7 +455,7 @@
               'span',
               { className: 'dsm-statusValue' },
               data.levels
-                ? `L0 ${data.levels[0] ?? 0} · L1 ${data.levels[1] ?? 0} · L2 ${data.levels[2] ?? 0} · L3 ${data.levels[3] ?? 0}`
+                ? `${t('levelRaw')} ${data.levels[0] ?? 0} · ${t('level1')} ${data.levels[1] ?? 0} · ${t('level2')} ${data.levels[2] ?? 0} · ${t('level3')} ${data.levels[3] ?? 0}`
                 : t('statusNoData'),
             ),
           ),
@@ -495,6 +505,21 @@
                 done: data.queue?.done ?? 0,
                 failed: data.queue?.failed ?? 0,
               }),
+            ),
+          ),
+          h(
+            'div',
+            { className: 'dsm-statusRow', key: 'taskQueue' },
+            h('span', { className: 'dsm-statusLabel' }, t('statusTaskQueue')),
+            h(
+              'span',
+              { className: 'dsm-statusValue' },
+              data.consolidation
+                ? t('statusTaskQueueValue', {
+                    pending: data.consolidation.pendingTotal ?? 0,
+                    due: data.consolidation.nextDueTime || '—',
+                  })
+                : t('statusNoData'),
             ),
           ),
         )
@@ -719,7 +744,7 @@
       const running = state.sleepRun?.phase === 'running'
       const levelsText = (levels) =>
         Object.entries(levels ?? {})
-          .map(([level, stat]) => `L${level}:${stat.batches ?? 0} 批/${stat.input ?? 0}→${stat.output ?? 0}`)
+          .map(([level, stat]) => `${levelName(t, level)}：${stat.batches ?? 0} 批/${stat.input ?? 0}→${stat.output ?? 0}`)
           .join(' · ')
       const lastRun = sleep?.lastResult
       const statusRows = [
@@ -783,6 +808,8 @@
           h(ScalarField, { field: SCALAR_BY_KEY.get('sleepAt'), state, actions, t, disabled }),
           h(ScalarField, { field: SCALAR_BY_KEY.get('sleepRetryMinutes'), state, actions, t, disabled }),
           h(ScalarField, { field: SCALAR_BY_KEY.get('idleMinutes'), state, actions, t, disabled }),
+          h(ScalarField, { field: SCALAR_BY_KEY.get('level2AfterDays'), state, actions, t, disabled }),
+          h(ScalarField, { field: SCALAR_BY_KEY.get('level3AfterDays'), state, actions, t, disabled }),
         ),
         h(
           'div',
@@ -800,7 +827,62 @@
           h('p', { className: 'dsm-hint' }, t('sleepModelHint')),
         ),
         h('div', { className: 'dsm-statusList' }, statusRows),
+        h(QueueTable, { summary: consolidation ?? data?.consolidation ?? null, t }),
       )
+    }
+
+    /** 整理队列（编号只在待整理期间存在）。 */
+    function QueueTable({ summary, t }) {
+      const rows = (summary?.active ?? []).slice(0, 8)
+      const byStatus = summary?.byStatus ?? {}
+      const statusLine = ['collecting', 'sealed', 'running', 'waiting', 'failed']
+        .map((status) => `${t('queueStatus.' + status)} ${byStatus[status] ?? 0}`)
+        .join(' · ')
+      return h(
+        'div',
+        { className: 'dsm-queue' },
+        h('p', { className: 'dsm-queueTitle' }, `${t('sleepQueueTitle')} · ${statusLine}`),
+        rows.length === 0
+          ? h('div', { className: 'dsm-empty dsm-emptySmall' }, t('sleepQueueEmpty'))
+          : h(
+              'div',
+              { className: 'dsm-queueTable' },
+              rows.map((batch) =>
+                h(
+                  'div',
+                  { className: 'dsm-queueRow', key: batch.key },
+                  h('span', { className: 'dsm-queueNo' }, batch.no ? '#' + batch.no : '—'),
+                  h('span', { className: 'dsm-queueEvent', title: batch.key }, queueTitle(batch, t)),
+                  h('span', { className: 'dsm-queueStatus dsm-q-' + (batch.status || 'sealed') }, t('queueStatus.' + (batch.status || 'sealed'))),
+                  h('span', { className: 'dsm-queueCounts', title: t('sleepQueueCountsHint') }, `${batch.sourceCount ?? 0} → ${batch.outputCount || '—'}`),
+                  h('span', { className: 'dsm-queueDue', title: batch.lastError ?? '' }, batch.status === 'failed' ? (batch.lastError || t('queueStatus.failed')) : batch.dueTime ? batch.dueTime : batch.attempts ? t('sleepQueueAttempts', { n: batch.attempts }) : ''),
+                ),
+              ),
+              (summary?.active?.length ?? 0) > rows.length
+                ? h('p', { className: 'dsm-hint' }, t('sleepQueueMore', { n: summary.active.length - rows.length }))
+                : null,
+            ),
+      )
+    }
+
+    /** 层级人话名称。 */
+    function levelName(t, level) {
+      const n = Number(level)
+      if (n === 0) return t('levelRaw')
+      if (n === 1) return t('level1')
+      if (n === 2) return t('level2')
+      if (n === 3) return t('level3')
+      return `L${n}`
+    }
+
+    /** 队列行标题：事件 / 周 / 长期。 */
+    function queueTitle(batch, t) {
+      if (Number(batch.level) === 2) return `${batch.weekKey} · ${t('level2')}`
+      if (Number(batch.level) >= 3) return `${batch.monthKey} · ${t('level3')}`
+      const key = String(batch.key ?? '')
+      if (key.endsWith('#misc')) return `${batch.dayKey} · ${t('queueMisc')}`
+      const seq = (/#(\d+)$/.exec(key) ?? [])[1]
+      return `${batch.dayKey} · ${t('queueEvent')}${seq ? ' ' + Number(seq) : ''}`
     }
 
     /** 实验功能卡。 */
@@ -1151,7 +1233,7 @@
     }
 
     function BehaviorTab({ state, actions, t, disabled }) {
-      const behaviorKeys = ['memoryScope', 'autoCapture', 'autoRecall', 'recallIncludeCurrentSession', 'recallTopK', 'recallMinScore', 'recallMaxChars', 'recallTimeoutMs']
+      const behaviorKeys = ['autoCapture', 'autoRecall', 'recallTopK', 'recallMinScore', 'recallMaxChars', 'recallMinAgeMinutes', 'recallTimeoutMs']
       const imageKeys = ['imageMode', 'captionPrompt', 'captionMaxTokens']
       const toolKeys = ['toolsEnabled', 'toolSearchLimit']
       return h(
@@ -1270,7 +1352,7 @@
       const sleepRunning = state.sleepRun?.phase === 'running'
       const levelsText = (levels) =>
         Object.entries(levels ?? {})
-          .map(([level, stat]) => `L${level}:${stat.batches ?? 0} 批/${stat.input ?? 0}→${stat.output ?? 0}`)
+          .map(([level, stat]) => `${levelName(t, level)}：${stat.batches ?? 0} 批/${stat.input ?? 0}→${stat.output ?? 0}`)
           .join(' · ')
       const historyRows = (engineSummary?.history ?? []).slice().reverse().map((entry, index) =>
         h(
@@ -1298,7 +1380,7 @@
               'div',
               { className: 'dsm-memMeta' },
               h(Badge, null, t('kind.' + (item.kind || 'note'))),
-              h(Badge, null, 'L' + (item.level ?? 0)),
+              h(Badge, null, levelName(t, item.level ?? 0)),
               Number.isFinite(Number(item.importance)) ? h(Badge, null, 'I' + Math.round(Number(item.importance) * 100)) : null,
               Number.isFinite(Number(item.confidence)) ? h(Badge, null, 'C' + Math.round(Number(item.confidence) * 100)) : null,
               item.batch ? h('span', { title: t('memoryBatch') }, '#' + item.batch) : null,
@@ -1306,7 +1388,6 @@
               h('span', null, item.time),
               item.relative ? h('span', null, `(${item.relative})`) : null,
               item.score !== undefined ? h('span', null, t('memoryScore', { score: item.score.toFixed(3) })) : null,
-              item.cwd ? h('span', { title: item.cwd }, item.cwd) : null,
             ),
             h('div', { className: 'dsm-memText' }, item.text),
           ),
@@ -1437,6 +1518,7 @@
             sleepStatus?.lastError
               ? h('div', { className: 'dsm-statusRow', key: 'sleep-err' }, h('span', { className: 'dsm-statusLabel' }, t('sleepLastError')), h('span', { className: 'dsm-statusValue dsm-err' }, sleepStatus.lastError))
               : null,
+            h(QueueTable, { key: 'sleep-queue', summary: engineSummary, t }),
             h('div', { className: 'dsm-statusRow', key: 'sleep-history-title' }, h('span', { className: 'dsm-statusLabel' }, t('sleepHistory')), h('span', { className: 'dsm-statusValue dsm-muted' }, historyRows.length === 0 ? t('sleepHistoryEmpty') : '')),
             ...historyRows,
           ),

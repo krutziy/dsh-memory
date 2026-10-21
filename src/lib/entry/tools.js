@@ -23,19 +23,6 @@ function assertEnabled(service) {
   return options
 }
 
-/** 按记忆范围构造检索上下文。 */
-function scopeFor(service, agentId) {
-  const recall = service.recallOptions()
-  const context = service.sessionContext(agentId)
-  return {
-    mode: recall.memoryScope,
-    sessionId: context.sessionId,
-    cwd: context.cwd,
-    // 工具是模型主动查询，允许包含当前会话
-    includeCurrentSession: true,
-  }
-}
-
 function searchTool(service) {
   return {
     name: 'memory_search',
@@ -62,7 +49,6 @@ function searchTool(service) {
         additionalProperties: false,
         properties: {
           count: { type: 'integer' },
-          scope: { type: 'string' },
           results: {
             type: 'array',
             items: {
@@ -75,8 +61,6 @@ function searchTool(service) {
                 time: { type: 'string' },
                 relative: { type: 'string' },
                 score: { type: 'number' },
-                sessionId: { type: 'string' },
-                cwd: { type: 'string' },
                 tags: { type: 'array', items: { type: 'string' } },
                 importance: { type: 'number' },
                 confidence: { type: 'number' },
@@ -99,11 +83,9 @@ function searchTool(service) {
       const limit = Number.isInteger(args?.limit)
         ? Math.min(20, Math.max(1, args.limit))
         : options.searchLimit
-      const scope = scopeFor(service, exec?.agent?.id)
       const { hits } = await service.search(query, {
         limit,
         signal: exec?.signal,
-        ...scope,
       })
       const recallOptions = service.recallOptions()
       const ranked = recallOptions.ageGateEnabled ? service.rankHits(hits, 'tool').pass : hits
@@ -114,7 +96,6 @@ function searchTool(service) {
       }
       return {
         count: selected.length,
-        scope: scope.mode,
         results: selected.map((hit) => ({
           id: hit.id,
           text: hit.text,
@@ -122,8 +103,6 @@ function searchTool(service) {
           time: hit.time,
           relative: hit.relative ?? '',
           score: Number(hit.score.toFixed(4)),
-          sessionId: hit.sessionId,
-          cwd: hit.cwd,
           tags: hit.tags,
           importance: Number.isFinite(hit.importance) ? Number(hit.importance.toFixed(3)) : undefined,
           confidence: Number.isFinite(hit.confidence) ? Number(hit.confidence.toFixed(3)) : undefined,
@@ -184,15 +163,12 @@ function saveTool(service) {
       const tags = Array.isArray(args?.tags)
         ? args.tags.filter((tag) => typeof tag === 'string').slice(0, 12)
         : []
-      const context = service.sessionContext(exec?.agent?.id)
       const saved = await service.addMemory({
         kind,
         text: content,
         meta: {
           tags,
           source: 'memory_save',
-          sessionId: context.sessionId,
-          cwd: context.cwd,
           importance: MANUAL_SAVE.importance,
           confidence: MANUAL_SAVE.confidence,
         },

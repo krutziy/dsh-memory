@@ -4,6 +4,7 @@
  */
 import { ConsolidationEngine } from '../app/consolidation-service.js'
 import { MemoryService } from '../app/memory-service.js'
+import { QueueService } from '../app/queue-service.js'
 import { errorText } from '../util/index.js'
 import { CaptureController } from './capture-controller.js'
 import { registerHttpRoutes } from './http/routes.js'
@@ -21,7 +22,9 @@ export function applyPlugin(ctx, config) {
   const service = new MemoryService(ctx, config)
   const logger = service.logger
 
-  // 睡眠整理引擎 + 控制器
+  // 整理队列（批次台账）+ 睡眠整理引擎 + 控制器
+  const taskBoard = new QueueService(service)
+  service.taskBoard = taskBoard
   const consolidation = new ConsolidationEngine(service)
   const sleep = new SleepController(service, consolidation)
   service.consolidation = consolidation
@@ -42,7 +45,7 @@ export function applyPlugin(ctx, config) {
 
   const provider = service.activeProvider()
   logger.info?.(
-    `[dsh-memory] 已加载 v0.7.0：provider=${provider.id}（${provider.embedModel}，${provider.dimensions} 维）→ Qdrant ${service.storage().qdrantUrl} / ${service.storage().collection}`,
+    `[dsh-memory] 已加载 v0.8.0：provider=${provider.id}（${provider.embedModel}，${provider.dimensions} 维）→ Qdrant ${service.storage().qdrantUrl} / ${service.storage().collection}`,
   )
 
   // 启动自检：确保 collection 存在，并补齐旧记忆标签（失败只告警）
@@ -50,7 +53,13 @@ export function applyPlugin(ctx, config) {
     .then(() => service.ensureReady())
     .then((info) => {
       if (info?.created) logger.info?.(`[dsh-memory] 已创建 Qdrant 集合 ${service.storage().collection}`)
-      return service.migrateLegacyMemories().then(() => service.migrateDynamicFields())
+      return service
+        .migrateLegacyMemories()
+        .then(() => service.migrateDynamicFields())
+        .then(async () => {
+          await taskBoard.load()
+          return service.migrateQueueBatchFields(taskBoard.activeNos())
+        })
     })
     .catch((error) => {
       logger.warn?.(`[dsh-memory] 启动自检失败：${errorText(error)}`)

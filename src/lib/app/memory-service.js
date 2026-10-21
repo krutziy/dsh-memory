@@ -25,7 +25,7 @@ import {
   normalizeImportance,
 } from '../domain/memory-values.js'
 import { RECALL_POLICY_DEFAULTS, rankHits as rankRecallHits } from '../domain/recall-policy.js'
-import { rangeBounds, resolveTimeZone, timeInfo } from '../domain/time.js'
+import { dayKey, rangeBounds, resolveTimeZone, timeInfo } from '../domain/time.js'
 import {
   SerialQueue,
   asBool,
@@ -94,9 +94,10 @@ export class MemoryService {
       checkedAt: 0,
       info: null,
     }
-    /** 由 index.js 注入的睡眠控制器与整理引擎（避免循环依赖）。 */
+    /** 由 index.js 注入的睡眠控制器、整理引擎与整理队列（避免循环依赖）。 */
     this.sleep = null
     this.consolidation = null
+    this.taskBoard = null
   }
 
   // ------------------------------------------------------------------
@@ -136,6 +137,7 @@ export class MemoryService {
   searchSimilar(vector, options) { return this.maintenanceService.searchSimilar(vector, options) }
   migrateLegacyMemories() { return this.maintenanceService.migrateLegacyMemories() }
   migrateDynamicFields() { return this.maintenanceService.migrateDynamicFields() }
+  migrateQueueBatchFields(activeNos) { return this.maintenanceService.migrateQueueBatchFields(activeNos) }
   maintenance(options) { return this.maintenanceService.maintenance(options) }
 
   // ------------------------------------------------------------------
@@ -169,17 +171,31 @@ export class MemoryService {
     }
   }
 
+  /** 采集时确保当天该会话的事件批次存在，返回编号（待整理期间的凭证）。 */
+  async eventBatchNo(sessionId, ts = Date.now()) {
+    if (!this.taskBoard || !sessionId) return ''
+    try {
+      const batch = await this.taskBoard.ensureEventBatch({
+        dayKey: dayKey(ts, this.timeOptions().timeZone),
+        sessionId: String(sessionId),
+      })
+      return batch?.no ?? ''
+    } catch (error) {
+      this.debugLog(`分配事件批次失败：${errorText(error)}`)
+      return ''
+    }
+  }
+
   /** 自动召回配置。 */
   recallOptions() {
     const cfg = this.cfg()
-    const scope = cfg.memoryScope === 'workspace' || cfg.memoryScope === 'session' ? cfg.memoryScope : 'global'
     return {
       autoRecall: cfg.autoRecall !== false,
-      memoryScope: scope,
       recallTopK: clampInt(cfg.recallTopK, 3, 1, 20),
       recallMinScore: clampNumber(cfg.recallMinScore, 0.42, 0, 1),
       recallMaxChars: clampInt(cfg.recallMaxChars, 600, 100, 4000),
-      recallIncludeCurrentSession: cfg.recallIncludeCurrentSession === true,
+      // 自动召回排除最近 N 分钟内自动记录的对话片段，避免把刚说过的话再注入一遍
+      recallMinAgeMinutes: Math.max(0, clampInt(cfg.recallMinAgeMinutes, 10, 0, 1440)),
       recallTimeoutMs: clampInt(cfg.recallTimeoutMs, 3000, 500, 20000),
       // 动态相关度（v0.7）
       ageGateEnabled: cfg.recallAgeGateEnabled !== false,
@@ -259,42 +275,24 @@ export class MemoryService {
     return timeInfo(ts, options.timeZone, options.relativeTime)
   }
 
-  /** 当前 agent 的会话上下文（用于作用域过滤）。 */
-  sessionContext(agentId) {
-    const id = String(agentId ?? '')
-    let cwd = ''
-    try {
-      const session = this.ctx.sessions?.get?.(id)
-      cwd = String(session?.header?.cwd ?? '')
-    } catch {
-      /* ignore */
-    }
-    return { sessionId: id, cwd }
-  }
-
   /**
-   * 构造 Qdrant 过滤条件。
+   * 构造 Qdrant 过滤条件（v0.8：只按类型过滤；记忆不再是“某个会话的容器”）。
    * @param {object} options
-   * @param {'global'|'workspace'|'session'} [options.mode]
-   * @param {string} [options.sessionId] 当前会话
-   * @param {string} [options.cwd] 当前工作目录
-   * @param {boolean} [options.includeCurrentSession] 是否包含当前会话
    * @param {string} [options.kind] 只查某类记忆
+   * @param {number} [options.recentTurnCutoff] 排除该时间点之后自动记录的对话片段
    */
-  buildFilter({ mode = 'global', sessionId = '', cwd = '', includeCurrentSession = false, kind = '' } = {}) {
+  buildFilter({ kind = '', recentTurnCutoff = 0 } = {}) {
     const must = []
     const mustNot = []
-    if (mode === 'session') {
-      if (sessionId) must.push({ key: 'sessionId', match: { value: sessionId } })
-    } else if (mode === 'workspace') {
-      if (cwd) must.push({ key: 'cwd', match: { value: cwd } })
-      if (!includeCurrentSession && sessionId) {
-        mustNot.push({ key: 'sessionId', match: { value: sessionId } })
-      }
-    } else if (!includeCurrentSession && sessionId) {
-      mustNot.push({ key: 'sessionId', match: { value: sessionId } })
-    }
     if (kind) must.push({ key: 'kind', match: { value: kind } })
+    if (Number(recentTurnCutoff) > 0) {
+      mustNot.push({
+        must: [
+          { key: 'kind', match: { value: 'turn' } },
+          { key: 'ts', range: { gt: Number(recentTurnCutoff) } },
+        ],
+      })
+    }
     const filter = {}
     if (must.length > 0) filter.must = must
     if (mustNot.length > 0) filter.must_not = mustNot
@@ -370,7 +368,8 @@ export class MemoryService {
     await this.ensureReady()
     const qdrant = await this.qdrant()
     const storage = this.storage()
-    const { idSeed, ...payloadMeta } = meta ?? {}
+    // v0.8：记忆不属于某个会话；sessionId/cwd 只用于采集阶段，不写入长期记忆
+    const { idSeed, sessionId: _sessionId, cwd: _cwd, ...payloadMeta } = meta ?? {}
     const id = memoryPointId(idSeed ? `${kind}|${idSeed}|${body}` : `${kind}|${body}`)
     const baseTs = Number(meta?.ts) > 0 ? Number(meta.ts) : Date.now()
     const payload = sanitizeMeta({
@@ -430,7 +429,7 @@ export class MemoryService {
   }
 
   /** 记录一轮对话要点。 */
-  async addTurnMemory({ userText, assistantText, sessionId, cwd, turn, imageCount = 0 }) {
+  async addTurnMemory({ userText, assistantText, sessionId, turn, imageCount = 0 }) {
     const options = this.captureOptions()
     const user = truncate(cleanText(userText), options.captureUserChars)
     const assistant = truncate(cleanText(assistantText), options.captureAssistantChars)
@@ -439,20 +438,20 @@ export class MemoryService {
     if (user) parts.push(`用户：${user}`)
     if (assistant) parts.push(`助手：${assistant}`)
     if (imageCount > 0) parts.push(`（本轮附有 ${imageCount} 张图片）`)
+    const batch = await this.eventBatchNo(sessionId)
     return this.addMemory({
       kind: 'turn',
       text: parts.join('\n'),
       meta: {
-        sessionId: String(sessionId ?? ''),
-        cwd: String(cwd ?? ''),
         turn: Number(turn) || 0,
         hasImages: imageCount > 0,
+        batch,
       },
     })
   }
 
   /** 记录一张图片：只存一句话概览，永不存原图。 */
-  async addImageMemory({ ref, sessionId, cwd, turn }) {
+  async addImageMemory({ ref, sessionId, turn }) {
     const image = this.imageOptions()
     if (image.imageMode === 'off') return { ok: false, skipped: 'image-mode-off' }
     const cfg = this.cfg()
@@ -513,15 +512,15 @@ export class MemoryService {
     } else {
       text = '用户发送了一张图片（未解析图片内容）'
     }
+    const batch = await this.eventBatchNo(sessionId)
     return this.addMemory({
       kind: 'image',
       text,
       meta: {
-        sessionId: String(sessionId ?? ''),
-        cwd: String(cwd ?? ''),
         turn: Number(turn) || 0,
         image: imageMeta,
         caption,
+        batch,
       },
     })
   }
@@ -543,11 +542,8 @@ export class MemoryService {
     const filter =
       options.filter ??
       this.buildFilter({
-        mode: options.mode ?? 'global',
-        sessionId: options.sessionId ?? '',
-        cwd: options.cwd ?? '',
-        includeCurrentSession: options.includeCurrentSession === true,
         kind: options.kind ?? '',
+        recentTurnCutoff: Number(options.recentTurnCutoff) || 0,
       })
     const points = await qdrant.search(
       storage.collection,
@@ -572,8 +568,6 @@ export class MemoryService {
         ts,
         time: info.time,
         relative: info.relative,
-        sessionId: payload.sessionId ? String(payload.sessionId) : '',
-        cwd: payload.cwd ? String(payload.cwd) : '',
         tags: Array.isArray(payload.tags) ? payload.tags.map(String) : [],
         provider: payload.provider ? String(payload.provider) : '',
         level: Number(payload.level) || 0,
@@ -675,15 +669,14 @@ export class MemoryService {
     return rankRecallHits(hits ?? [], policy, Date.now())
   }
 
-  async recall(query, { signal, sessionId = '', cwd = '' } = {}) {
+  async recall(query, { signal } = {}) {
     const options = this.recallOptions()
+    const recentTurnCutoff =
+      options.recallMinAgeMinutes > 0 ? Date.now() - options.recallMinAgeMinutes * 60000 : 0
     const { hits } = await this.search(query, {
       limit: options.ageGateEnabled ? options.candidates : options.recallTopK,
       minScore: options.ageGateEnabled ? undefined : options.recallMinScore,
-      mode: options.memoryScope,
-      sessionId,
-      cwd,
-      includeCurrentSession: options.recallIncludeCurrentSession,
+      recentTurnCutoff,
       signal,
     })
     let candidates = hits.filter((hit) => hit.text.length > 0 && hit.enhanced !== true)
@@ -750,8 +743,6 @@ export class MemoryService {
       ts,
       time: info.time,
       relative: info.relative,
-      sessionId: payload.sessionId ? String(payload.sessionId) : '',
-      cwd: payload.cwd ? String(payload.cwd) : '',
       tags: Array.isArray(payload.tags) ? payload.tags.map(String) : [],
       provider: payload.provider ? String(payload.provider) : '',
       level: Number(payload.level) || 0,
@@ -872,7 +863,7 @@ export class MemoryService {
       ok: true,
       app: {
         name: 'dsh-memory',
-        version: '0.7.0',
+        version: '0.8.0',
         startedAt: this.stats.startedAt,
       },
       time: (() => {
@@ -971,11 +962,10 @@ export class MemoryService {
         },
         autoCapture: capture.autoCapture,
         autoRecall: recall.autoRecall,
-        memoryScope: recall.memoryScope,
         recallTopK: recall.recallTopK,
         recallMinScore: recall.recallMinScore,
         recallMaxChars: recall.recallMaxChars,
-        recallIncludeCurrentSession: recall.recallIncludeCurrentSession,
+        recallMinAgeMinutes: recall.recallMinAgeMinutes,
         recallTimeoutMs: recall.recallTimeoutMs,
         imageMode: this.cfg().imageMode ?? 'caption',
         toolsEnabled: toolOptions.toolsEnabled,

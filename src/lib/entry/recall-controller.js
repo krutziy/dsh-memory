@@ -118,14 +118,9 @@ export class RecallController {
     this.service.stats.lastRecallQuery = query.slice(0, 120)
     this.service.stats.lastRecallError = ''
     if (!query || query.length < 2) return decision
-    const context = this.service.sessionContext(agentId)
     const timeout = AbortSignal.timeout(options.recallTimeoutMs)
     const signal = payload?.signal === undefined ? timeout : AbortSignal.any([payload.signal, timeout])
-    const { block, hits } = await this.service.recall(query, {
-      signal,
-      sessionId: context.sessionId,
-      cwd: context.cwd,
-    })
+    const { block, hits } = await this.service.recall(query, { signal })
     if (!block || hits.length === 0) return decision
     this.service.stats.lastRecallInjectAt = Date.now()
     this.service.debugLog(`自动召回 ${hits.length} 条记忆（score ${Number(hits[0].score).toFixed(3)}）`)

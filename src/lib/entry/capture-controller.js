@@ -26,7 +26,7 @@ export class CaptureController {
     this.service = service
     this.ctx = service.ctx
     this.logger = service.logger
-    /** sessionId -> { turn, users: string[], assistant: string, images: ImageAttachmentRef[], cwd } */
+    /** sessionId -> { turn, users: string[], assistant: string, images: ImageAttachmentRef[] } */
     this.buffers = new Map()
   }
 
@@ -69,7 +69,6 @@ export class CaptureController {
           users: [],
           assistant: '',
           images: [],
-          cwd: String(header?.cwd ?? ''),
         })
         break
       }
@@ -125,7 +124,6 @@ export class CaptureController {
             userText,
             assistantText,
             sessionId,
-            cwd: buffer.cwd,
             turn: buffer.turn,
             imageCount,
           }),
@@ -144,7 +142,6 @@ export class CaptureController {
           service.addImageMemory({
             ref,
             sessionId,
-            cwd: buffer.cwd,
             turn: buffer.turn,
           }),
         { retries: 0 },
